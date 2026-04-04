@@ -129,6 +129,22 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_full_pipeline_cardano() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let address = derive_address_for_chain(&mnemonic, ChainType::Cardano);
+        assert!(
+            address.starts_with("addr1"),
+            "Cardano mainnet enterprise address must start with 'addr1', got: {}",
+            address
+        );
+        assert!(
+            address.len() > 50,
+            "Cardano address length must be > 50, got: {}",
+            address.len()
+        );
+    }
+
+    #[test]
     fn test_full_pipeline_filecoin() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
         let address = derive_address_for_chain(&mnemonic, ChainType::Filecoin);
@@ -182,6 +198,7 @@ mod integration_tests {
         let spark_addr = derive_address_for_chain(&mnemonic, ChainType::Spark);
         let fil_addr = derive_address_for_chain(&mnemonic, ChainType::Filecoin);
         let xrpl_addr = derive_address_for_chain(&mnemonic, ChainType::Xrpl);
+        let ada_addr = derive_address_for_chain(&mnemonic, ChainType::Cardano);
 
         // All addresses should be different
         let addrs = [
@@ -194,6 +211,7 @@ mod integration_tests {
             &spark_addr,
             &fil_addr,
             &xrpl_addr,
+            &ada_addr,
         ];
         for i in 0..addrs.len() {
             for j in (i + 1)..addrs.len() {
@@ -252,6 +270,22 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_sign_roundtrip_cardano() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let signer = signer_for_chain(ChainType::Cardano);
+        let path = signer.default_derivation_path(0);
+        let key =
+            HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, Curve::Ed25519Bip32).unwrap();
+
+        let result = signer
+            .sign(key.expose(), b"test message for cardano")
+            .unwrap();
+        assert_eq!(result.signature.len(), 64);
+        assert!(result.recovery_id.is_none());
+        assert_eq!(result.public_key.as_ref().unwrap().len(), 32);
+    }
+
+    #[test]
     fn test_signer_for_chain_registry() {
         // Verify all chain types are supported
         for chain in [
@@ -264,6 +298,7 @@ mod integration_tests {
             ChainType::Spark,
             ChainType::Filecoin,
             ChainType::Xrpl,
+            ChainType::Cardano,
         ] {
             let signer = signer_for_chain(chain);
             assert_eq!(signer.chain_type(), chain);

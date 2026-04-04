@@ -3,6 +3,9 @@
 pub enum Curve {
     Secp256k1,
     Ed25519,
+    /// Ed25519-BIP32 extended keys (Cardano CIP-1852 / BIP32-Ed25519).
+    /// Private keys are 64 bytes: 32-byte scalar || 32-byte extension.
+    Ed25519Bip32,
 }
 
 impl Curve {
@@ -11,6 +14,7 @@ impl Curve {
         match self {
             Curve::Secp256k1 => 32,
             Curve::Ed25519 => 32,
+            Curve::Ed25519Bip32 => 64,
         }
     }
 
@@ -19,6 +23,7 @@ impl Curve {
         match self {
             Curve::Secp256k1 => 33, // compressed
             Curve::Ed25519 => 32,
+            Curve::Ed25519Bip32 => 32,
         }
     }
 }

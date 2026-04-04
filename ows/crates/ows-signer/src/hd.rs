@@ -36,6 +36,7 @@ impl HdDeriver {
         match curve {
             Curve::Secp256k1 => Self::derive_secp256k1(seed, path),
             Curve::Ed25519 => Self::derive_ed25519(seed, path),
+            Curve::Ed25519Bip32 => Self::derive_cardano_cip1852(seed, path),
         }
     }
 
@@ -72,6 +73,7 @@ impl HdDeriver {
         hasher.update(match curve {
             Curve::Secp256k1 => b"secp256k1" as &[u8],
             Curve::Ed25519 => b"ed25519",
+            Curve::Ed25519Bip32 => b"ed25519-bip32",
         });
         let cache_key = hex::encode(hasher.finalize());
 
@@ -189,6 +191,92 @@ impl HdDeriver {
         data.zeroize();
         chain_code.zeroize();
         Ok(SecretBytes::new(key))
+    }
+
+    /// CIP-1852 / BIP32-Ed25519 derivation for Cardano.
+    ///
+    /// Derives an extended private key (64 bytes: scalar || extension) from a BIP-39 seed
+    /// using the Cardano key derivation scheme and the `ed25519-bip32` crate.
+    ///
+    /// Root key construction from seed (Shelley variant):
+    /// - Apply HMAC-SHA512 with key `"ed25519 cardano seed"` to the BIP-39 seed
+    /// - Bit-tweak the first 32 bytes to produce a valid Ed25519 scalar
+    /// - Second HMAC-SHA512 (with `0x01` prefix) gives the chain code
+    ///
+    /// Note: Lucid Evolution derives from BIP-39 *entropy* using the Icarus algorithm.
+    /// This implementation uses the BIP-39 *seed* (PBKDF2 output) which is deterministic
+    /// but produces different addresses than Lucid for the same mnemonic.
+    fn derive_cardano_cip1852(seed: &[u8], path: &str) -> Result<SecretBytes, HdError> {
+        use ed25519_bip32::{DerivationScheme, XPrv};
+        use zeroize::Zeroize;
+
+        // --- Root key from BIP-39 seed ---
+        // Pass 1: HMAC-SHA512(key="ed25519 cardano seed", data=seed) → 64 bytes
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(b"ed25519 cardano seed")
+            .expect("HMAC can take key of any size");
+        mac.update(seed);
+        let i: [u8; 64] = mac.finalize().into_bytes().into();
+
+        // Bit-tweak the left 32 bytes to produce a valid Ed25519 extended scalar (kL):
+        //   - Clear bottom 3 bits of byte 0 (multiple of cofactor 8)
+        //   - Clear top 3 bits of byte 31 (prevent overflow past curve order)
+        //   - Set bit 254 (0x40 in byte 31) as required by BIP32-Ed25519
+        let mut kl: [u8; 32] = i[..32].try_into().unwrap();
+        kl[0] &= 0b1111_1000;
+        kl[31] &= 0b0001_1111;
+        kl[31] |= 0b0100_0000;
+        let kr: [u8; 32] = i[32..64].try_into().unwrap();
+
+        // Pass 2: HMAC-SHA512(key="ed25519 cardano seed", data=[0x01] || seed) → chain code
+        let mut mac2 = HmacSha512::new_from_slice(b"ed25519 cardano seed")
+            .expect("HMAC can take key of any size");
+        mac2.update(&[0x01]);
+        mac2.update(seed);
+        let chain_code_full: [u8; 64] = mac2.finalize().into_bytes().into();
+        let chain_code: [u8; 32] = chain_code_full[..32].try_into().unwrap();
+
+        // Build root XPrv from the extended key (kL || kR) and chain code
+        let mut extended_key: [u8; 64] = [0u8; 64];
+        extended_key[..32].copy_from_slice(&kl);
+        extended_key[32..64].copy_from_slice(&kr);
+
+        let mut root = XPrv::from_extended_and_chaincode(&extended_key, &chain_code);
+        extended_key.zeroize();
+
+        // --- Child derivation following CIP-1852 path ---
+        // Path format: m/purpose'/coin_type'/account'/role/index
+        // Example: m/1852'/1815'/0'/0/0
+        // DerivationIndex is u32; hardened indices have bit 31 set (0x80000000)
+        let components: Vec<(u32, bool)> = if path == "m" {
+            vec![]
+        } else {
+            path[2..]
+                .split('/')
+                .map(|c| {
+                    let hardened = c.ends_with('\'');
+                    let index_str = c.trim_end_matches('\'');
+                    let index: u32 = index_str
+                        .parse()
+                        .map_err(|_| HdError::InvalidPath(format!("invalid index: {}", c)))?;
+                    Ok((index, hardened))
+                })
+                .collect::<Result<Vec<_>, HdError>>()?
+        };
+
+        for (index, hardened) in &components {
+            let di: u32 = if *hardened {
+                0x8000_0000u32 | index
+            } else {
+                *index
+            };
+            let child = root.derive(DerivationScheme::V2, di);
+            root = child;
+        }
+
+        // Return the 64-byte extended private key (kL || kR), without chain code
+        let secret_bytes = root.extended_secret_key_bytes().to_vec();
+        Ok(SecretBytes::new(secret_bytes))
     }
 }
 
