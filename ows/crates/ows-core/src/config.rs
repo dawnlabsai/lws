@@ -81,6 +81,18 @@ impl Config {
             "eip155:999".into(),
             "https://rpc.hyperliquid.xyz/evm".into(),
         );
+        rpc.insert(
+            "cardano:mainnet".into(),
+            "https://api.koios.rest/api/v1".into(),
+        );
+        rpc.insert(
+            "cardano:preprod".into(),
+            "https://preprod.koios.rest/api/v1".into(),
+        );
+        rpc.insert(
+            "cardano:preview".into(),
+            "https://preview.koios.rest/api/v1".into(),
+        );
         rpc
     }
 }
@@ -223,6 +235,18 @@ mod tests {
         assert_eq!(
             config.rpc_url("eip155:999"),
             Some("https://rpc.hyperliquid.xyz/evm")
+        );
+        assert_eq!(
+            config.rpc_url("cardano:mainnet"),
+            Some("https://api.koios.rest/api/v1")
+        );
+        assert_eq!(
+            config.rpc_url("cardano:preprod"),
+            Some("https://preprod.koios.rest/api/v1")
+        );
+        assert_eq!(
+            config.rpc_url("cardano:preview"),
+            Some("https://preview.koios.rest/api/v1")
         );
     }
 

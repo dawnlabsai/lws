@@ -864,9 +864,7 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
         ChainType::Xrpl => broadcast_xrpl(rpc_url, signed_bytes),
         ChainType::Nano => broadcast_nano(rpc_url, signed_bytes),
         ChainType::Near => crate::near_rpc::broadcast_tx_commit(rpc_url, signed_bytes),
-        ChainType::Cardano => Err(OwsLibError::InvalidInput(
-            "broadcast not yet supported for Cardano".into(),
-        )),
+        ChainType::Cardano => broadcast_cardano(rpc_url, signed_bytes),
     }
 }
 
@@ -995,6 +993,66 @@ fn broadcast_ton(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibErr
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| OwsLibError::BroadcastFailed(format!("no hash in response: {resp}")))
+}
+
+/// Submit a signed Cardano transaction to a Koios-compatible node.
+///
+/// Sends raw CBOR bytes with `Content-Type: application/cbor` to `{rpc_url}/submittx`.
+/// On success Koios returns the transaction hash as a JSON-quoted string.
+fn broadcast_cardano(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let url = format!("{}/submittx", rpc_url.trim_end_matches('/'));
+
+    // Pipe raw CBOR bytes into curl via stdin so binary content is preserved exactly.
+    let mut child = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/cbor",
+            "-H",
+            "Accept: application/json",
+            "--data-binary",
+            "@-",
+            &url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| OwsLibError::BroadcastFailed(format!("failed to spawn curl: {e}")))?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(signed_bytes)
+        .map_err(|e| OwsLibError::BroadcastFailed(format!("failed to write CBOR to curl: {e}")))?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| OwsLibError::BroadcastFailed(format!("curl wait failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(OwsLibError::BroadcastFailed(format!(
+            "Cardano broadcast failed: {stderr}{stdout}"
+        )));
+    }
+
+    // Koios returns the tx hash as a quoted JSON string, e.g. "\"abc123...\""
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let tx_hash = response.trim_matches('"').to_string();
+    if tx_hash.is_empty() {
+        return Err(OwsLibError::BroadcastFailed(
+            "empty tx hash in Cardano node response".into(),
+        ));
+    }
+    Ok(tx_hash)
 }
 
 fn broadcast_sui(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
