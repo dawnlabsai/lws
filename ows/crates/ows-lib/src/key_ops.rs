@@ -87,13 +87,15 @@ pub fn sign_with_api_key(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
-    let (key, _) = enforce_policy_and_decrypt_key_with_raw_hex(
-        token,
-        wallet_name_or_id,
-        chain,
-        &hex::encode(tx_bytes),
-        index,
-        vault_path,
+    let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
+    let transaction = ows_core::policy::TransactionContext {
+        to: None,
+        value: None,
+        raw_hex: hex::encode(tx_bytes),
+        data: None,
+    };
+    let (key, _) = enforce_policies_and_decrypt_key(
+        token, key_file, wallet, chain, transaction, None, index, vault_path,
     )?;
 
     // 7. Sign (extract signable portion first — e.g. strips Solana sig-slot headers)
@@ -116,13 +118,15 @@ pub fn sign_message_with_api_key(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
-    let (key, _) = enforce_policy_and_decrypt_key_with_raw_hex(
-        token,
-        wallet_name_or_id,
-        chain,
-        &hex::encode(msg_bytes),
-        index,
-        vault_path,
+    let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
+    let transaction = ows_core::policy::TransactionContext {
+        to: None,
+        value: None,
+        raw_hex: hex::encode(msg_bytes),
+        data: None,
+    };
+    let (key, _) = enforce_policies_and_decrypt_key(
+        token, key_file, wallet, chain, transaction, None, index, vault_path,
     )?;
     let signer = signer_for_chain(chain.chain_type);
     let output = signer.sign_message(key.expose(), msg_bytes)?;
@@ -143,13 +147,15 @@ pub fn sign_hash_with_api_key(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
-    let (key, _) = enforce_policy_and_decrypt_key_with_raw_hex(
-        token,
-        wallet_name_or_id,
-        chain,
-        &hex::encode(policy_bytes),
-        index,
-        vault_path,
+    let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
+    let transaction = ows_core::policy::TransactionContext {
+        to: None,
+        value: None,
+        raw_hex: hex::encode(policy_bytes),
+        data: None,
+    };
+    let (key, _) = enforce_policies_and_decrypt_key(
+        token, key_file, wallet, chain, transaction, None, index, vault_path,
     )?;
 
     let signer = signer_for_chain(chain.chain_type);
@@ -181,26 +187,13 @@ pub fn sign_typed_data_with_api_key(
         ));
     }
 
-    // 2. Token lookup
-    let token_hash = key_store::hash_token(token);
-    let key_file = key_store::load_api_key_by_token_hash(&token_hash, vault_path)?;
+    // 2. Token lookup + expiry + wallet scope
+    let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
 
-    // 3. Expiry check
-    check_expiry(&key_file)?;
-
-    // 4. Wallet scope check
-    let wallet = vault::load_wallet_by_name_or_id(wallet_name_or_id, vault_path)?;
-    if !key_file.wallet_ids.contains(&wallet.id) {
-        return Err(OwsLibError::InvalidInput(format!(
-            "API key '{}' does not have access to wallet '{}'",
-            key_file.name, wallet.id,
-        )));
-    }
-
-    // 5. Parse typed data early — validates JSON and extracts domain fields
+    // 3. Parse typed data early — validates JSON and extracts domain fields
     let parsed = eip712::parse_typed_data(typed_data_json)?;
 
-    // 5b. Validate domain.chainId matches the requested chain (if present)
+    // 3b. Validate domain.chainId matches the requested chain (if present)
     // Prevents bypassing AllowedChains by submitting typed data with a different chainId
     if let Some(domain_chain_id) = parsed.domain.get("chainId").and_then(parse_domain_chain_id) {
         let expected_chain_id = chain
@@ -214,11 +207,7 @@ pub fn sign_typed_data_with_api_key(
         }
     }
 
-    // 6. Build PolicyContext with TypedDataContext
-    let policies = load_policies_for_key(&key_file, vault_path)?;
-    let now = chrono::Utc::now();
-    let date = now.format("%Y-%m-%d").to_string();
-
+    // 4. Build TypedDataContext + placeholder TransactionContext
     let typed_data_ctx = ows_core::policy::TypedDataContext {
         verifying_contract: parsed
             .domain
@@ -239,33 +228,26 @@ pub fn sign_typed_data_with_api_key(
             .map(String::from),
         raw_json: typed_data_json.to_string(),
     };
-
-    let context = ows_core::PolicyContext {
-        chain_id: chain.chain_id.to_string(),
-        wallet_id: wallet.id.clone(),
-        api_key_id: key_file.id.clone(),
-        transaction: ows_core::policy::TransactionContext {
-            to: None,
-            value: None,
-            raw_hex: String::new(),
-            data: None,
-        },
-        spending: noop_spending_context(&date),
-        timestamp: now.to_rfc3339(),
-        typed_data: Some(typed_data_ctx),
+    let transaction = ows_core::policy::TransactionContext {
+        to: None,
+        value: None,
+        raw_hex: String::new(),
+        data: None,
     };
 
-    // 7. Evaluate policies
-    let result = policy_engine::evaluate_policies(&policies, &context);
-    if !result.allow {
-        return Err(OwsLibError::Core(OwsError::PolicyDenied {
-            policy_id: result.policy_id.unwrap_or_default(),
-            reason: result.reason.unwrap_or_else(|| "denied".into()),
-        }));
-    }
+    // 5. Evaluate policies
+    let (key, _) = enforce_policies_and_decrypt_key(
+        token,
+        key_file,
+        wallet,
+        chain,
+        transaction,
+        Some(typed_data_ctx),
+        index,
+        vault_path,
+    )?;
 
-    // 8. Decrypt key and sign
-    let key = decrypt_key_from_api_key(&key_file, &wallet, token, chain.chain_type, index)?;
+    // 6. Sign
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
@@ -275,34 +257,13 @@ pub fn sign_typed_data_with_api_key(
     })
 }
 
-/// Enforce policies for a token-based transaction and return the decrypted
-/// signing key. Used by `sign_and_send` which needs the raw key for broadcast.
-pub fn enforce_policy_and_decrypt_key(
+/// Token → key file lookup, expiry check, wallet load + scope check.
+/// Shared by every API-key-authorized flow.
+pub fn load_authorized_wallet(
     token: &str,
     wallet_name_or_id: &str,
-    chain: &ows_core::Chain,
-    tx_bytes: &[u8],
-    index: Option<u32>,
     vault_path: Option<&Path>,
-) -> Result<(SecretBytes, ApiKeyFile), OwsLibError> {
-    enforce_policy_and_decrypt_key_with_raw_hex(
-        token,
-        wallet_name_or_id,
-        chain,
-        &hex::encode(tx_bytes),
-        index,
-        vault_path,
-    )
-}
-
-fn enforce_policy_and_decrypt_key_with_raw_hex(
-    token: &str,
-    wallet_name_or_id: &str,
-    chain: &ows_core::Chain,
-    raw_hex: &str,
-    index: Option<u32>,
-    vault_path: Option<&Path>,
-) -> Result<(SecretBytes, ApiKeyFile), OwsLibError> {
+) -> Result<(ApiKeyFile, EncryptedWallet), OwsLibError> {
     let token_hash = key_store::hash_token(token);
     let key_file = key_store::load_api_key_by_token_hash(&token_hash, vault_path)?;
     check_expiry(&key_file)?;
@@ -314,7 +275,25 @@ fn enforce_policy_and_decrypt_key_with_raw_hex(
             key_file.name, wallet.id,
         )));
     }
+    Ok((key_file, wallet))
+}
 
+/// Assemble the `PolicyContext` around a caller-built `TransactionContext`
+/// (and optional `TypedDataContext`), run the policy engine, and decrypt
+/// the signing key on allow. Each flow constructs its own
+/// `TransactionContext` — the tx flow via the chain signer, non-tx flows
+/// via a `raw_hex`-only placeholder built from the payload.
+#[allow(clippy::too_many_arguments)]
+pub fn enforce_policies_and_decrypt_key(
+    token: &str,
+    key_file: ApiKeyFile,
+    wallet: EncryptedWallet,
+    chain: &ows_core::Chain,
+    transaction: ows_core::policy::TransactionContext,
+    typed_data: Option<ows_core::policy::TypedDataContext>,
+    index: Option<u32>,
+    vault_path: Option<&Path>,
+) -> Result<(SecretBytes, ApiKeyFile), OwsLibError> {
     let policies = load_policies_for_key(&key_file, vault_path)?;
     let now = chrono::Utc::now();
     let date = now.format("%Y-%m-%d").to_string();
@@ -323,15 +302,10 @@ fn enforce_policy_and_decrypt_key_with_raw_hex(
         chain_id: chain.chain_id.to_string(),
         wallet_id: wallet.id.clone(),
         api_key_id: key_file.id.clone(),
-        transaction: ows_core::policy::TransactionContext {
-            to: None,
-            value: None,
-            raw_hex: raw_hex.to_string(),
-            data: None,
-        },
+        transaction,
         spending: noop_spending_context(&date),
         timestamp: now.to_rfc3339(),
-        typed_data: None,
+        typed_data,
     };
 
     let result = policy_engine::evaluate_policies(&policies, &context);
@@ -343,7 +317,6 @@ fn enforce_policy_and_decrypt_key_with_raw_hex(
     }
 
     let key = decrypt_key_from_api_key(&key_file, &wallet, token, chain.chain_type, index)?;
-
     Ok((key, key_file))
 }
 

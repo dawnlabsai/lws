@@ -692,11 +692,21 @@ pub fn sign_and_send(
     // Agent mode: enforce policies, decrypt key, then sign + broadcast
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let chain_info = parse_chain(chain)?;
-        let (key, _) = crate::key_ops::enforce_policy_and_decrypt_key(
+        let (key_file, wallet_obj) =
+            crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
+        let transaction = ows_core::policy::TransactionContext {
+            to: None,
+            value: None,
+            raw_hex: hex::encode(&tx_bytes),
+            data: None,
+        };
+        let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
-            wallet,
+            key_file,
+            wallet_obj,
             &chain_info,
-            &tx_bytes,
+            transaction,
+            None,
             index,
             vault_path,
         )?;
