@@ -95,7 +95,14 @@ pub fn sign_with_api_key(
         data: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
-        token, key_file, wallet, chain, transaction, None, index, vault_path,
+        token,
+        key_file,
+        wallet,
+        chain,
+        Some(transaction),
+        None,
+        index,
+        vault_path,
     )?;
 
     // 7. Sign (extract signable portion first — e.g. strips Solana sig-slot headers)
@@ -126,7 +133,14 @@ pub fn sign_message_with_api_key(
         data: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
-        token, key_file, wallet, chain, transaction, None, index, vault_path,
+        token,
+        key_file,
+        wallet,
+        chain,
+        Some(transaction),
+        None,
+        index,
+        vault_path,
     )?;
     let signer = signer_for_chain(chain.chain_type);
     let output = signer.sign_message(key.expose(), msg_bytes)?;
@@ -155,7 +169,14 @@ pub fn sign_hash_with_api_key(
         data: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
-        token, key_file, wallet, chain, transaction, None, index, vault_path,
+        token,
+        key_file,
+        wallet,
+        chain,
+        Some(transaction),
+        None,
+        index,
+        vault_path,
     )?;
 
     let signer = signer_for_chain(chain.chain_type);
@@ -207,7 +228,7 @@ pub fn sign_typed_data_with_api_key(
         }
     }
 
-    // 4. Build TypedDataContext + placeholder TransactionContext
+    // 4. Build TypedDataContext (no TransactionContext — typed data is not a transaction)
     let typed_data_ctx = ows_core::policy::TypedDataContext {
         verifying_contract: parsed
             .domain
@@ -228,12 +249,6 @@ pub fn sign_typed_data_with_api_key(
             .map(String::from),
         raw_json: typed_data_json.to_string(),
     };
-    let transaction = ows_core::policy::TransactionContext {
-        to: None,
-        value: None,
-        raw_hex: String::new(),
-        data: None,
-    };
 
     // 5. Evaluate policies
     let (key, _) = enforce_policies_and_decrypt_key(
@@ -241,7 +256,7 @@ pub fn sign_typed_data_with_api_key(
         key_file,
         wallet,
         chain,
-        transaction,
+        None,
         Some(typed_data_ctx),
         index,
         vault_path,
@@ -280,16 +295,16 @@ pub fn load_authorized_wallet(
 
 /// Assemble the `PolicyContext` around a caller-built `TransactionContext`
 /// (and optional `TypedDataContext`), run the policy engine, and decrypt
-/// the signing key on allow. Each flow constructs its own
-/// `TransactionContext` — the tx flow via the chain signer, non-tx flows
-/// via a `raw_hex`-only placeholder built from the payload.
+/// the signing key on allow. `transaction` is `None` for `sign_typed_data`
+/// (the payload is surfaced via `typed_data.raw_json` instead); other
+/// flows pass `Some(...)` with at least `raw_hex` populated.
 #[allow(clippy::too_many_arguments)]
 pub fn enforce_policies_and_decrypt_key(
     token: &str,
     key_file: ApiKeyFile,
     wallet: EncryptedWallet,
     chain: &ows_core::Chain,
-    transaction: ows_core::policy::TransactionContext,
+    transaction: Option<ows_core::policy::TransactionContext>,
     typed_data: Option<ows_core::policy::TypedDataContext>,
     index: Option<u32>,
     vault_path: Option<&Path>,
@@ -1168,7 +1183,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sign_typed_data_with_api_key_executable_policy_receives_raw_json_not_raw_hex() {
+    fn sign_typed_data_with_api_key_executable_policy_receives_raw_json_no_transaction() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1187,12 +1202,11 @@ import sys
 
 payload = json.load(sys.stdin)
 typed_data = payload.get("typed_data") or {{}}
-transaction = payload.get("transaction") or {{}}
 
-if typed_data.get("raw_json") == {typed_data_json:?} and transaction.get("raw_hex") == "":
+if typed_data.get("raw_json") == {typed_data_json:?} and "transaction" not in payload:
     print('{{"allow": true}}')
 else:
-    print(json.dumps({{"allow": False, "reason": f"raw_hex={{transaction.get('raw_hex')}} raw_json={{typed_data.get('raw_json')}}"}}))
+    print(json.dumps({{"allow": False, "reason": f"transaction={{payload.get('transaction')!r}} raw_json={{typed_data.get('raw_json')}}"}}))
 "#
             ),
         )

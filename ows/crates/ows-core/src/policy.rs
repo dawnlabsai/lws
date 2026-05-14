@@ -45,7 +45,12 @@ pub struct PolicyContext {
     pub chain_id: String,
     pub wallet_id: String,
     pub api_key_id: String,
-    pub transaction: TransactionContext,
+    /// Transaction-shaped context for the signing request. Present for
+    /// `sign_transaction`, `sign_message`, and `sign_hash` (the latter two
+    /// surface their payload through `raw_hex`). Omitted for `sign_typed_data`,
+    /// which exposes its payload via [`TypedDataContext::raw_json`] instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<TransactionContext>,
     pub spending: SpendingContext,
     pub timestamp: String,
     /// EIP-712 typed data context (only present for `sign_typed_data` calls).
@@ -62,8 +67,7 @@ pub struct TransactionContext {
     /// Native value in smallest unit (wei, lamports, etc).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-    /// Raw transaction hex. Empty for non-transaction signing requests such as
-    /// typed data, which is instead exposed via [`TypedDataContext::raw_json`].
+    /// Raw transaction hex.
     pub raw_hex: String,
     /// Calldata / input data (EVM).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,12 +213,12 @@ mod tests {
             chain_id: "eip155:8453".into(),
             wallet_id: "3198bc9c-6672-5ab3-d995-4942343ae5b6".into(),
             api_key_id: "7a2f1b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c".into(),
-            transaction: TransactionContext {
+            transaction: Some(TransactionContext {
                 to: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into()),
                 value: Some("100000000000000000".into()),
                 raw_hex: "0x02f8...".into(),
                 data: None,
-            },
+            }),
             spending: SpendingContext {
                 daily_total: "50000000000000000".into(),
                 date: "2026-03-22".into(),
@@ -227,8 +231,8 @@ mod tests {
         let deserialized: PolicyContext = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.chain_id, "eip155:8453");
         assert_eq!(
-            deserialized.transaction.to.unwrap(),
-            "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C"
+            deserialized.transaction.as_ref().unwrap().to.as_deref(),
+            Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C")
         );
         // data was None, should be absent from serialized form
         assert!(!json.contains("\"data\""));
@@ -332,12 +336,12 @@ mod tests {
             chain_id: "eip155:8453".into(),
             wallet_id: "w".into(),
             api_key_id: "k".into(),
-            transaction: TransactionContext {
+            transaction: Some(TransactionContext {
                 to: None,
                 value: None,
                 raw_hex: "0x00".into(),
                 data: None,
-            },
+            }),
             spending: SpendingContext {
                 daily_total: "0".into(),
                 date: "2026-03-30".into(),
@@ -348,5 +352,24 @@ mod tests {
 
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(!json.contains("typed_data"));
+    }
+
+    #[test]
+    fn test_policy_context_transaction_none_omitted() {
+        let ctx = PolicyContext {
+            chain_id: "eip155:8453".into(),
+            wallet_id: "w".into(),
+            api_key_id: "k".into(),
+            transaction: None,
+            spending: SpendingContext {
+                daily_total: "0".into(),
+                date: "2026-03-30".into(),
+            },
+            timestamp: "2026-03-30T12:00:00Z".into(),
+            typed_data: None,
+        };
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains("transaction"));
     }
 }

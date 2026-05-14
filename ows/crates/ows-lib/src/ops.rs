@@ -705,7 +705,7 @@ pub fn sign_and_send(
             key_file,
             wallet_obj,
             &chain_info,
-            transaction,
+            Some(transaction),
             None,
             index,
             vault_path,
