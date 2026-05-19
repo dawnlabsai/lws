@@ -67,12 +67,6 @@ pub struct TransactionEffect {
 /// Signing-request fields available for policy evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionContext {
-    /// Destination address (if applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// Native value in smallest unit (wei, lamports, etc).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
     pub effects: Vec<TransactionEffect>,
     /// Raw transaction hex.
     pub raw_hex: String,
@@ -221,8 +215,6 @@ mod tests {
             wallet_id: "3198bc9c-6672-5ab3-d995-4942343ae5b6".into(),
             api_key_id: "7a2f1b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c".into(),
             transaction: Some(TransactionContext {
-                to: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into()),
-                value: Some("100000000000000000".into()),
                 effects: vec![TransactionEffect {
                     address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
                     diff: vec![("ETH".into(), 100000000000000000)],
@@ -241,10 +233,6 @@ mod tests {
         let json = serde_json::to_string(&ctx).unwrap();
         let deserialized: PolicyContext = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.chain_id, "eip155:8453");
-        assert_eq!(
-            deserialized.transaction.as_ref().unwrap().to.as_deref(),
-            Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C")
-        );
         assert_eq!(
             deserialized.transaction.unwrap().effects.first().unwrap(),
             &TransactionEffect {
@@ -355,8 +343,6 @@ mod tests {
             wallet_id: "w".into(),
             api_key_id: "k".into(),
             transaction: Some(TransactionContext {
-                to: None,
-                value: None,
                 effects: vec![],
                 raw_hex: "0x00".into(),
                 data: None,

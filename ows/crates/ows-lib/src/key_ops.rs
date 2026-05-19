@@ -124,8 +124,6 @@ pub fn sign_message_with_api_key(
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
     let transaction = ows_core::policy::TransactionContext {
-        to: None,
-        value: None,
         effects: vec![],
         raw_hex: hex::encode(msg_bytes),
         data: None,
@@ -161,8 +159,6 @@ pub fn sign_hash_with_api_key(
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
     let transaction = ows_core::policy::TransactionContext {
-        to: None,
-        value: None,
         effects: vec![],
         raw_hex: hex::encode(policy_bytes),
         data: None,

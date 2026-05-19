@@ -84,8 +84,6 @@ pub trait ChainSigner: Send + Sync {
         _rpc_url: Option<&str>,
     ) -> Result<TransactionContext, SignerError> {
         Ok(TransactionContext {
-            to: None,
-            value: None,
             effects: vec![],
             raw_hex: hex::encode(tx_bytes),
             data: None,
