@@ -88,12 +88,10 @@ pub fn sign_with_api_key(
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
-    let transaction = ows_core::policy::TransactionContext {
-        to: None,
-        value: None,
-        raw_hex: hex::encode(tx_bytes),
-        data: None,
-    };
+
+    let signer = signer_for_chain(chain.chain_type);
+    let transaction = signer.make_transaction_context(tx_bytes, None)?;
+
     let (key, _) = enforce_policies_and_decrypt_key(
         token,
         key_file,
@@ -106,7 +104,6 @@ pub fn sign_with_api_key(
     )?;
 
     // 7. Sign (extract signable portion first — e.g. strips Solana sig-slot headers)
-    let signer = signer_for_chain(chain.chain_type);
     let signable = signer.extract_signable_bytes(tx_bytes)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
 

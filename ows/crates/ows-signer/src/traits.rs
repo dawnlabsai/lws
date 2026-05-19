@@ -1,4 +1,5 @@
 use crate::curve::Curve;
+use ows_core::policy::TransactionContext;
 use ows_core::ChainType;
 
 /// Output of a signing operation.
@@ -75,6 +76,19 @@ pub trait ChainSigner: Send + Sync {
             "encode_signed_transaction not implemented for {}",
             self.chain_type()
         )))
+    }
+
+    fn make_transaction_context(
+        &self,
+        tx_bytes: &[u8],
+        _rpc_url: Option<&str>,
+    ) -> Result<TransactionContext, SignerError> {
+        Ok(TransactionContext {
+            to: None,
+            value: None,
+            raw_hex: hex::encode(tx_bytes),
+            data: None,
+        })
     }
 
     /// Returns the default BIP-44 derivation path template for this chain.

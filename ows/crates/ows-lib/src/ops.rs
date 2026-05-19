@@ -694,12 +694,8 @@ pub fn sign_and_send(
         let chain_info = parse_chain(chain)?;
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
-        let transaction = ows_core::policy::TransactionContext {
-            to: None,
-            value: None,
-            raw_hex: hex::encode(&tx_bytes),
-            data: None,
-        };
+        let signer = signer_for_chain(chain_info.chain_type);
+        let transaction = signer.make_transaction_context(&tx_bytes, rpc_url)?;
         let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
             key_file,
