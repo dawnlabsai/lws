@@ -86,6 +86,7 @@ pub trait ChainSigner: Send + Sync {
         Ok(TransactionContext {
             to: None,
             value: None,
+            effects: vec![],
             raw_hex: hex::encode(tx_bytes),
             data: None,
         })

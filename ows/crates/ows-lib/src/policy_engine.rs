@@ -228,7 +228,9 @@ fn wait_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ows_core::policy::{SpendingContext, TransactionContext, TypedDataContext};
+    use ows_core::policy::{
+        SpendingContext, TransactionContext, TransactionEffect, TypedDataContext,
+    };
     use ows_core::PolicyAction;
 
     fn base_context() -> PolicyContext {
@@ -239,6 +241,10 @@ mod tests {
             transaction: Some(TransactionContext {
                 to: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".to_string()),
                 value: Some("100000000000000000".to_string()), // 0.1 ETH
+                effects: vec![TransactionEffect {
+                    address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
+                    diff: vec![("ETH".into(), 100000000000000000)], // 0.1 ETH
+                }],
                 raw_hex: "0x02f8...".to_string(),
                 data: None,
             }),

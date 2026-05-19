@@ -126,6 +126,7 @@ pub fn sign_message_with_api_key(
     let transaction = ows_core::policy::TransactionContext {
         to: None,
         value: None,
+        effects: vec![],
         raw_hex: hex::encode(msg_bytes),
         data: None,
     };
@@ -162,6 +163,7 @@ pub fn sign_hash_with_api_key(
     let transaction = ows_core::policy::TransactionContext {
         to: None,
         value: None,
+        effects: vec![],
         raw_hex: hex::encode(policy_bytes),
         data: None,
     };

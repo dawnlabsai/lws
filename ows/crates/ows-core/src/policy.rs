@@ -58,6 +58,12 @@ pub struct PolicyContext {
     pub typed_data: Option<TypedDataContext>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionEffect {
+    pub address: String,
+    pub diff: Vec<(String, i64)>, // (asset, diff)
+}
+
 /// Signing-request fields available for policy evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionContext {
@@ -67,6 +73,7 @@ pub struct TransactionContext {
     /// Native value in smallest unit (wei, lamports, etc).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    pub effects: Vec<TransactionEffect>,
     /// Raw transaction hex.
     pub raw_hex: String,
     /// Calldata / input data (EVM).
@@ -216,6 +223,10 @@ mod tests {
             transaction: Some(TransactionContext {
                 to: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into()),
                 value: Some("100000000000000000".into()),
+                effects: vec![TransactionEffect {
+                    address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
+                    diff: vec![("ETH".into(), 100000000000000000)],
+                }],
                 raw_hex: "0x02f8...".into(),
                 data: None,
             }),
@@ -233,6 +244,13 @@ mod tests {
         assert_eq!(
             deserialized.transaction.as_ref().unwrap().to.as_deref(),
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C")
+        );
+        assert_eq!(
+            deserialized.transaction.unwrap().effects.first().unwrap(),
+            &TransactionEffect {
+                address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
+                diff: vec![("ETH".into(), 100000000000000000)],
+            }
         );
         // data was None, should be absent from serialized form
         assert!(!json.contains("\"data\""));
@@ -339,6 +357,7 @@ mod tests {
             transaction: Some(TransactionContext {
                 to: None,
                 value: None,
+                effects: vec![],
                 raw_hex: "0x00".into(),
                 data: None,
             }),
