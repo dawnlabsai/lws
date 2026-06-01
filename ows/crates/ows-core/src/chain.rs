@@ -18,6 +18,7 @@ pub enum ChainType {
     Xrpl,
     Nano,
     Near,
+    Midnight,
 }
 
 /// All supported chain families, used for universal wallet derivation.
@@ -194,6 +195,21 @@ pub const KNOWN_CHAINS: &[Chain] = &[
         chain_id: "near:testnet",
     },
     Chain {
+        name: "midnight",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:mainnet",
+    },
+    Chain {
+        name: "midnight-preview",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:preview",
+    },
+    Chain {
+        name: "midnight-preprod",
+        chain_type: ChainType::Midnight,
+        chain_id: "midnight:preprod",
+    },
+    Chain {
         name: "tempo",
         chain_type: ChainType::Evm,
         chain_id: "eip155:4217",
@@ -267,7 +283,7 @@ pub fn parse_chain(s: &str) -> Result<Chain, String> {
            EVM:     ethereum, base, arbitrum, optimism, polygon, bsc, avalanche, plasma, etherlink\n  \
            Solana:  solana\n  \
            Bitcoin: bitcoin\n  \
-           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near\n\n\
+           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near, midnight\n\n\
          Or use a CAIP-2 ID (eip155:8453) or bare EVM chain ID (8453)"
     ))
 }
@@ -293,6 +309,7 @@ impl ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Midnight => "midnight",
         }
     }
 
@@ -311,6 +328,7 @@ impl ChainType {
             ChainType::Xrpl => 144,
             ChainType::Nano => 165,
             ChainType::Near => 397,
+            ChainType::Midnight => 2400,
         }
     }
 
@@ -329,6 +347,7 @@ impl ChainType {
             "xrpl" => Some(ChainType::Xrpl),
             "nano" => Some(ChainType::Nano),
             "near" => Some(ChainType::Near),
+            "midnight" => Some(ChainType::Midnight),
             _ => None,
         }
     }
@@ -349,6 +368,7 @@ impl fmt::Display for ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Midnight => "midnight",
         };
         write!(f, "{}", s)
     }
@@ -371,6 +391,7 @@ impl FromStr for ChainType {
             "xrpl" => Ok(ChainType::Xrpl),
             "nano" => Ok(ChainType::Nano),
             "near" => Ok(ChainType::Near),
+            "midnight" => Ok(ChainType::Midnight),
             _ => Err(format!("unknown chain type: {}", s)),
         }
     }
@@ -404,6 +425,7 @@ mod tests {
             (ChainType::Xrpl, "\"xrpl\""),
             (ChainType::Nano, "\"nano\""),
             (ChainType::Near, "\"near\""),
+            (ChainType::Midnight, "\"midnight\""),
         ] {
             let json = serde_json::to_string(&chain).unwrap();
             assert_eq!(json, expected);
@@ -426,6 +448,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.namespace(), "xrpl");
         assert_eq!(ChainType::Nano.namespace(), "nano");
         assert_eq!(ChainType::Near.namespace(), "near");
+        assert_eq!(ChainType::Midnight.namespace(), "midnight");
     }
 
     #[test]
@@ -442,6 +465,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.default_coin_type(), 144);
         assert_eq!(ChainType::Nano.default_coin_type(), 165);
         assert_eq!(ChainType::Near.default_coin_type(), 397);
+        assert_eq!(ChainType::Midnight.default_coin_type(), 2400);
     }
 
     #[test]
@@ -461,6 +485,10 @@ mod tests {
         assert_eq!(ChainType::from_namespace("xrpl"), Some(ChainType::Xrpl));
         assert_eq!(ChainType::from_namespace("nano"), Some(ChainType::Nano));
         assert_eq!(ChainType::from_namespace("near"), Some(ChainType::Near));
+        assert_eq!(
+            ChainType::from_namespace("midnight"),
+            Some(ChainType::Midnight)
+        );
         assert_eq!(ChainType::from_namespace("unknown"), None);
     }
 
@@ -576,6 +604,29 @@ mod tests {
         let via_caip2 = parse_chain("xrpl:testnet").unwrap();
         assert_eq!(via_caip2.chain_type, ChainType::Xrpl);
         assert_eq!(via_caip2.chain_id, "xrpl:testnet");
+    }
+
+    #[test]
+    fn test_parse_chain_midnight() {
+        let chain = parse_chain("midnight").unwrap();
+        assert_eq!(chain.chain_type, ChainType::Midnight);
+        assert_eq!(chain.chain_id, "midnight:mainnet");
+
+        let preview = parse_chain("midnight:preview").unwrap();
+        assert_eq!(preview.chain_type, ChainType::Midnight);
+        assert_eq!(preview.chain_id, "midnight:preview");
+
+        let preview_alias = parse_chain("midnight-preview").unwrap();
+        assert_eq!(preview_alias.chain_type, ChainType::Midnight);
+        assert_eq!(preview_alias.chain_id, "midnight:preview");
+
+        let preprod = parse_chain("midnight:preprod").unwrap();
+        assert_eq!(preprod.chain_type, ChainType::Midnight);
+        assert_eq!(preprod.chain_id, "midnight:preprod");
+
+        let preprod_alias = parse_chain("midnight-preprod").unwrap();
+        assert_eq!(preprod_alias.chain_type, ChainType::Midnight);
+        assert_eq!(preprod_alias.chain_id, "midnight:preprod");
     }
 
     #[test]

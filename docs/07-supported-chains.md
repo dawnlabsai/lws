@@ -40,6 +40,7 @@ OWS groups chains into families that share a cryptographic curve and address der
 | Spark | secp256k1 | 8797555 | `m/84'/0'/0'/0/{index}` | `spark:` + compressed pubkey hex | `spark` |
 | Filecoin | secp256k1 | 461 | `m/44'/461'/0'/0/{index}` | `f1` + base32(blake2b-160) | `fil` |
 | NEAR | ed25519 | 397 | `m/44'/397'/{index}'` | 64-char lowercase hex of pubkey (implicit account) | `near` |
+| Midnight (unshielded/Night) | secp256k1 (Schnorr) | [2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (BIP-44) | `m/44'/2400'/0'/0/{index}` (unshielded); shielded `.../3/{index}`; dust `.../2/{index}` | Bech32m `mn_addr1...` / `mn_addr_preview1...` / `mn_addr_preprod1...` (SHA-256 of x-only pubkey) | `midnight` |
 
 ## Known Networks
 
@@ -76,6 +77,9 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Filecoin | `fil:mainnet` |
 | NEAR | `near:mainnet` |
 | NEAR (testnet) | `near:testnet` |
+| Midnight | `midnight:mainnet` |
+| Midnight Preview | `midnight:preview` |
+| Midnight Preprod | `midnight:preprod` |
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
@@ -109,6 +113,9 @@ spark     → spark:mainnet
 filecoin  → fil:mainnet
 near          → near:mainnet
 near-testnet  → near:testnet
+midnight  → midnight:mainnet
+midnight-preview → midnight:preview
+midnight-preprod → midnight:preprod
 ```
 
 Aliases MUST be resolved to full CAIP-2 identifiers before any processing. They MUST NOT appear in wallet files, policy files, or audit logs.
@@ -133,7 +140,8 @@ Master Seed (512 bits via PBKDF2)
     ├── m/44'/144'/0'/0/0   → XRPL Account 0
     ├── m/84'/0'/0'/0/0     → Spark Account 0
     ├── m/44'/461'/0'/0/0   → Filecoin Account 0
-    └── m/44'/397'/0'       → NEAR Account 0
+    ├── m/44'/397'/0'       → NEAR Account 0
+    └── m/44'/2400'/0'/0/0  → Midnight Account 0 (unshielded/Night; shielded …/3/0, dust …/2/0)
 ```
 
 For mnemonic-based wallets, a single mnemonic derives accounts across all supported chains. Those wallet files store the encrypted mnemonic, and the signer derives the appropriate private key using each chain's coin type and derivation path. Wallets imported from raw private keys instead store encrypted curve-key material directly.

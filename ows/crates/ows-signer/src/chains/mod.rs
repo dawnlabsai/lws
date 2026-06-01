@@ -43,6 +43,8 @@ pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
+        // Midnight signer is added in the following commit.
+        ChainType::Midnight => unimplemented!("Midnight signer not yet implemented"),
     }
 }
 
