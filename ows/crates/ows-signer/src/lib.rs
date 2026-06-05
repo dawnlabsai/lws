@@ -16,7 +16,7 @@ pub use crypto::{
     KdfParams, KdfParamsVariant,
 };
 pub use curve::Curve;
-pub use hd::HdDeriver;
+pub use hd::{DerivedKey, HdDeriver};
 pub use mnemonic::{Mnemonic, MnemonicStrength};
 pub use traits::{ChainSigner, SignOutput, SignerError};
 pub use zeroizing::SecretBytes;

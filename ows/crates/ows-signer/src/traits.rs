@@ -1,4 +1,6 @@
 use crate::curve::Curve;
+use crate::hd::DerivedKey;
+use crate::zeroizing::SecretBytes;
 use ows_core::policy::TransactionContext;
 use ows_core::ChainType;
 
@@ -92,6 +94,32 @@ pub trait ChainSigner: Send + Sync {
 
     /// Returns the default BIP-44 derivation path template for this chain.
     fn default_derivation_path(&self, index: u32) -> String;
+
+    /// All derivation paths this chain binds to one account at `index`.
+    ///
+    /// Defaults to the single [`ChainSigner::default_derivation_path`] on this
+    /// chain's [`ChainSigner::curve`]. Chains that derive several keys per
+    /// account (e.g. Midnight's unshielded / shielded / dust roles) override
+    /// this; the first path is the primary (address / signing) key.
+    fn default_derivation_paths(&self, index: u32) -> Vec<String> {
+        vec![self.default_derivation_path(index)]
+    }
+
+    /// Collapse a resolved key bundle into the single key-material blob the
+    /// signing methods (`sign`, `sign_message`, `sign_transaction`) consume.
+    ///
+    /// Most chains bind one key per account, so the default returns the primary
+    /// (first) key unchanged — `default_derivation_paths[0]` is the contractual
+    /// primary. Chains that bind several keys per account (e.g. Midnight)
+    /// override this to pack them into one blob; the matching decode lives in
+    /// that chain's signer, which unpacks it inside its signing methods. The
+    /// blob is opaque to the generic signing path — only the producing chain
+    /// interprets it.
+    fn encode_keys(&self, keys: &[DerivedKey]) -> Result<SecretBytes, SignerError> {
+        keys.first()
+            .map(|k| k.secret.clone())
+            .ok_or_else(|| SignerError::InvalidPrivateKey("no derived keys to encode".into()))
+    }
 }
 
 /// Errors that can occur during signing operations.

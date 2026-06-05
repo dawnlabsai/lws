@@ -142,11 +142,13 @@ pub(crate) fn secret_to_signing_key(
             })?;
             let mnemonic = Mnemonic::from_phrase(phrase)?;
             let signer = signer_for_chain(chain_type);
-            let path = signer.default_derivation_path(index.unwrap_or(0));
-            let curve = signer.curve();
-            Ok(HdDeriver::derive_from_mnemonic_cached(
-                &mnemonic, "", &path, curve,
-            )?)
+            let keys = HdDeriver::derive_keys_from_mnemonic_cached(
+                &mnemonic,
+                "",
+                signer.default_derivation_paths(index.unwrap_or(0)),
+                signer.curve(),
+            )?;
+            Ok(signer.encode_keys(&keys)?)
         }
         KeyType::PrivateKey => {
             // JSON key pair — extract the right key for this chain's curve
