@@ -2,6 +2,7 @@ pub mod bitcoin;
 pub mod cosmos;
 pub mod evm;
 pub mod filecoin;
+pub mod midnight;
 pub mod nano;
 pub mod near;
 pub mod solana;
@@ -15,6 +16,7 @@ pub use self::bitcoin::BitcoinSigner;
 pub use self::cosmos::CosmosSigner;
 pub use self::evm::EvmSigner;
 pub use self::filecoin::FilecoinSigner;
+pub use self::midnight::MidnightSigner;
 pub use self::nano::NanoSigner;
 pub use self::near::NearSigner;
 pub use self::solana::SolanaSigner;
@@ -43,8 +45,7 @@ pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
-        // Midnight signer is added in the following commit.
-        ChainType::Midnight => unimplemented!("Midnight signer not yet implemented"),
+        ChainType::Midnight => Box::new(MidnightSigner),
     }
 }
 
