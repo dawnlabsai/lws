@@ -10,7 +10,7 @@ pub mod rlp;
 pub mod traits;
 pub mod zeroizing;
 
-pub use chains::signer_for_chain;
+pub use chains::{signer_for_chain, signer_for_chain_type};
 pub use crypto::{
     decrypt, encrypt, encrypt_with_hkdf, CipherParams, CryptoEnvelope, CryptoError, HkdfKdfParams,
     KdfParams, KdfParamsVariant,
@@ -41,7 +41,7 @@ mod integration_tests {
     const ABANDON_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn derive_address_for_chain(mnemonic: &Mnemonic, chain: ChainType) -> String {
-        let signer = signer_for_chain(chain);
+        let signer = signer_for_chain_type(chain);
         let curve = signer.curve();
         let path = signer.default_derivation_path(0);
 
@@ -142,8 +142,8 @@ mod integration_tests {
     #[test]
     fn test_spark_uses_bitcoin_derivation_path() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
-        let btc_signer = signer_for_chain(ChainType::Bitcoin);
-        let spark_signer = signer_for_chain(ChainType::Spark);
+        let btc_signer = signer_for_chain_type(ChainType::Bitcoin);
+        let spark_signer = signer_for_chain_type(ChainType::Spark);
 
         // Same derivation path
         assert_eq!(
@@ -222,7 +222,7 @@ mod integration_tests {
             ChainType::Spark,
             ChainType::Filecoin,
         ] {
-            let signer = signer_for_chain(chain);
+            let signer = signer_for_chain_type(chain);
             let path = signer.default_derivation_path(0);
             let key =
                 HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, Curve::Secp256k1).unwrap();
@@ -240,7 +240,7 @@ mod integration_tests {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
 
         for chain in [ChainType::Solana, ChainType::Ton] {
-            let signer = signer_for_chain(chain);
+            let signer = signer_for_chain_type(chain);
             let path = signer.default_derivation_path(0);
             let key =
                 HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, Curve::Ed25519).unwrap();
@@ -265,7 +265,7 @@ mod integration_tests {
             ChainType::Filecoin,
             ChainType::Xrpl,
         ] {
-            let signer = signer_for_chain(chain);
+            let signer = signer_for_chain_type(chain);
             assert_eq!(signer.chain_type(), chain);
         }
     }

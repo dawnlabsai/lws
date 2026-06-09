@@ -89,7 +89,7 @@ pub fn sign_with_api_key(
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
 
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(chain);
     let transaction = signer.make_transaction_context(tx_bytes, None)?;
 
     let (key, _) = enforce_policies_and_decrypt_key(
@@ -138,7 +138,7 @@ pub fn sign_message_with_api_key(
         index,
         vault_path,
     )?;
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(chain);
     let output = signer.sign_message(key.expose(), msg_bytes)?;
 
     Ok(crate::types::SignResult {
@@ -174,7 +174,7 @@ pub fn sign_hash_with_api_key(
         vault_path,
     )?;
 
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(chain);
     let output = signer.sign(key.expose(), hash_bytes)?;
 
     Ok(crate::types::SignResult {
