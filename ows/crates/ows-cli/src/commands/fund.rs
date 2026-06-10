@@ -6,14 +6,16 @@ fn find_account_for_chain<'a>(
     accounts: &'a [AccountInfo],
     chain: &str,
 ) -> Result<&'a AccountInfo, CliError> {
-    let chain_prefix = match chain {
-        "solana" => "solana:",
-        _ => "eip155:",
+    // CAIP-2 namespace from the chain registry; funding aliases that aren't
+    // registered chain names settle on EVM.
+    let chain_prefix = match crate::parse_chain(chain) {
+        Ok(c) => format!("{}:", c.chain_type.namespace()),
+        Err(_) => "eip155:".to_string(),
     };
 
     accounts
         .iter()
-        .find(|a| a.chain_id.starts_with(chain_prefix))
+        .find(|a| a.chain_id.starts_with(&chain_prefix))
         .ok_or_else(|| {
             CliError::InvalidArgs(format!("wallet has no account for chain \"{chain}\""))
         })
