@@ -1,6 +1,11 @@
-//! Midnight wallet helpers used by the balance-display path.
+//! Midnight wallet helpers used by the balance-display path: indexer URL and
+//! sync-cache scope resolution.
+
+use std::path::Path;
 
 use ows_core::Config;
+
+use super::cache_io::SyncCacheScope;
 
 fn invalid_input(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
@@ -16,4 +21,20 @@ pub fn resolve_indexer_url(chain_id: &str) -> Result<String, std::io::Error> {
                 "no Midnight indexer URL configured for {chain_id} (set `rpc.{chain_id}` in config)"
             ))
         })
+}
+
+/// Build a sync-cache scope co-located with the wallet's vault entry.
+///
+/// The caller has already resolved the wallet id (it loaded the wallet to read
+/// its accounts), so the scope is always per-wallet isolated.
+pub fn sync_scope_for_wallet(
+    wallet_id: &str,
+    chain_id: Option<&str>,
+    vault_path: Option<&Path>,
+) -> SyncCacheScope {
+    let mut scope = SyncCacheScope::for_wallet(wallet_id, vault_path);
+    if let Some(cid) = chain_id {
+        scope = scope.with_chain_id(cid);
+    }
+    scope
 }

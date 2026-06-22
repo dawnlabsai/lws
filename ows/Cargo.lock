@@ -3414,8 +3414,10 @@ name = "ows-core"
 version = "1.3.2"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "uuid",

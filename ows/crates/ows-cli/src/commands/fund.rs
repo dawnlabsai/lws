@@ -92,7 +92,12 @@ pub fn balance(wallet_name: &str, chain: Option<&str>) -> Result<(), CliError> {
     if let Ok(parsed) = crate::parse_chain(chain_name) {
         if parsed.chain_type == ows_core::ChainType::Midnight {
             let account = find_account_for_chain(&wallet.accounts, chain_name)?;
-            return Ok(ows_midnight::print_fund_balance(&account.address, &parsed)?);
+            return Ok(ows_midnight::print_fund_balance(
+                &wallet.id,
+                &account.address,
+                &parsed,
+                None,
+            )?);
         }
     }
 

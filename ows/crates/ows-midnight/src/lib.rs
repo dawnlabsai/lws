@@ -1,6 +1,7 @@
 //! Midnight integration — unshielded indexer sync + `ows fund balance`.
 
 mod async_runtime;
+mod cache_io;
 mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
