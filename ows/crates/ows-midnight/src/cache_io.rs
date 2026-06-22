@@ -1,8 +1,3 @@
-// Module-wide dead_code allow: this commit introduces the cache adapter and
-// threads the sync scope through (no-op); the unshielded resume that consumes
-// these primitives lands in the next commit.
-#![allow(dead_code)]
-
 //! Midnight-specific wrapper around the generic [`ows_core::sync_cache`] store:
 //! adds Midnight's `{vault}/chains/midnight/cache/{subdir}` directory layout and
 //! the single disk-cache switch on top of the chain-agnostic primitives.
@@ -29,7 +24,9 @@ use std::path::PathBuf;
 
 use ows_core::sync_cache;
 
-pub use ows_core::sync_cache::{snapshot_chain_matches, SyncCacheScope};
+pub use ows_core::sync_cache::{
+    snapshot_chain_id, snapshot_chain_matches, try_load_versioned, try_save, SyncCacheScope,
+};
 
 /// Normalize an indexer URL (trim trailing slash, lowercase) for stable hashing.
 pub fn normalize_indexer_base(indexer_url: &str) -> String {

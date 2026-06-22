@@ -2,7 +2,9 @@
 //! `unshieldedTransactions` GraphQL-over-WebSocket subscription.
 //!
 //! Replay `created` / `spent` events until the indexer reports
-//! `highestTransactionId` matching the last processed transaction id.
+//! `highestTransactionId` matching the last processed transaction id. When a disk
+//! snapshot of a previous run exists, resume from its cursor and apply only the
+//! newer events instead of replaying from genesis.
 
 use futures_util::StreamExt as _;
 
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use super::cache_io::SyncCacheScope;
+use super::cache_io::{self, SyncCacheScope};
 use super::indexer_ws;
 use super::ledger_params::parse_indexer_timestamp_secs;
 use super::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
@@ -33,6 +35,27 @@ pub struct UnshieldedUtxo {
     pub registered_for_dust_generation: bool,
 }
 
+/// On-disk resume snapshot: the indexer cursor plus the unspent UTXO set as of that
+/// cursor. A later run resumes the subscription from `last_seen_tx_id` and applies only
+/// newer events. Stores source state (the UTXO set), never a derived balance — the
+/// balance is recomputed by summing the set on read.
+#[derive(Debug, Serialize, Deserialize)]
+struct UnshieldedSnapshot {
+    version: u32,
+    /// CAIP-2 chain id the snapshot was synced against; guards against reusing a
+    /// snapshot from a different network.
+    chain_id: String,
+    /// Fingerprint of `(indexer_url, chain_id)`; guards against reusing a snapshot
+    /// from a different indexer.
+    site_fp: String,
+    /// Highest indexer transaction id already folded into `utxos`.
+    last_seen_tx_id: i64,
+    /// Unspent UTXO set as of `last_seen_tx_id`.
+    utxos: Vec<UnshieldedUtxo>,
+}
+
+const UNSHIELDED_SNAPSHOT_VERSION: u32 = 1;
+
 /// GraphQL subscription (indexer v4 supports optional `transactionId` resume).
 const UNSHIELDED_SUBSCRIPTION: &str = r#"
 subscription UnshieldedTransactions($address: UnshieldedAddress!, $transactionId: Int) {
@@ -50,7 +73,8 @@ subscription UnshieldedTransactions($address: UnshieldedAddress!, $transactionId
 }
 "#;
 
-/// Unshielded UTXOs for `ows fund balance` — replays the indexer from genesis.
+/// Unshielded UTXOs for `ows fund balance` — resumes from the address's disk snapshot
+/// when one exists, otherwise replays the indexer from genesis.
 pub async fn get_unshielded_utxos_for_display(
     indexer_url: &str,
     address: &str,
@@ -86,6 +110,7 @@ fn process_unshielded_event(
     transaction: TransactionRef,
     created_utxos: Vec<UnshieldedUtxoWire>,
     spent_utxos: Vec<UnshieldedUtxoWire>,
+    resume_last_seen: i64,
     last_seen: &mut i64,
     n_txs: &mut u64,
     utxos: &mut BTreeMap<(String, i64, String), UnshieldedUtxo>,
@@ -98,6 +123,14 @@ fn process_unshielded_event(
         if tx_hashes_match(&transaction.hash, target) {
             *tx_seen = true;
         }
+    }
+    // Anything at or below the resumed cursor is already folded into the seeded UTXO
+    // set, so advance the cursor and skip re-applying its mutations. This keeps the
+    // result correct whether the indexer honors `transactionId` or replays from genesis.
+    if transaction.id <= resume_last_seen {
+        *last_seen = (*last_seen).max(transaction.id);
+        *n_txs = n_txs.saturating_add(1);
+        return Ok(unshielded_sync_done(progress_received, highest, *last_seen));
     }
     *last_seen = (*last_seen).max(transaction.id);
     *n_txs = n_txs.saturating_add(1);
@@ -142,17 +175,128 @@ fn process_unshielded_event(
     Ok(unshielded_sync_done(progress_received, highest, *last_seen))
 }
 
+/// Snapshot-aware unshielded sync: resume from the address's disk snapshot, and if its
+/// cursor is ahead of the indexer (a reset), fall back to a full genesis re-sync. The
+/// resulting set is persisted for the next run.
 async fn get_unshielded_utxos_inner(
     indexer_url: &str,
     address: &str,
-    _scope: &SyncCacheScope,
+    scope: &SyncCacheScope,
     wait_for_tx_hash: Option<&str>,
     tx_seen: &mut bool,
 ) -> Result<Vec<UnshieldedUtxo>, std::io::Error> {
-    let mut utxos: BTreeMap<(String, i64, String), UnshieldedUtxo> = BTreeMap::new();
-    let mut last_seen: i64 = 0;
+    let snapshot_path = cache_io::snapshot_path("unshielded", indexer_url, address, scope);
+    let site_fp = cache_io::sync_site_fingerprint(indexer_url, scope);
 
-    eprintln!("[ows-midnight] unshielded sync: syncing from genesis");
+    // Resume only from a snapshot that belongs to this same indexer site and network;
+    // an absent or mismatched snapshot syncs fresh from genesis.
+    let resume = snapshot_path
+        .as_ref()
+        .and_then(|p| {
+            cache_io::try_load_versioned::<UnshieldedSnapshot>(p, UNSHIELDED_SNAPSHOT_VERSION)
+        })
+        .filter(|snap| {
+            cache_io::snapshot_site_matches(scope, &snap.chain_id, &site_fp, &snap.site_fp)
+        });
+    let (resume_last_seen, seed) = match resume {
+        Some(snap) => (snap.last_seen_tx_id, snap.utxos),
+        None => (0, Vec::new()),
+    };
+
+    let synced = match replay_unshielded(
+        indexer_url,
+        address,
+        resume_last_seen,
+        &seed,
+        wait_for_tx_hash,
+        tx_seen,
+    )
+    .await?
+    {
+        ReplayOutcome::Done(synced) => synced,
+        ReplayOutcome::ResumeUnusable => {
+            eprintln!(
+                "[ows-midnight] unshielded snapshot cursor is ahead of the indexer; re-syncing from genesis"
+            );
+            match replay_unshielded(indexer_url, address, 0, &[], wait_for_tx_hash, tx_seen).await?
+            {
+                ReplayOutcome::Done(synced) => synced,
+                ReplayOutcome::ResumeUnusable => {
+                    return Err(std::io::Error::other(
+                        "unshielded sync reported the indexer behind a genesis cursor",
+                    ));
+                }
+            }
+        }
+    };
+
+    let list: Vec<UnshieldedUtxo> = synced.utxos.into_values().collect();
+    if let Some(path) = snapshot_path {
+        cache_io::try_save(
+            &path,
+            &UnshieldedSnapshot {
+                version: UNSHIELDED_SNAPSHOT_VERSION,
+                chain_id: cache_io::snapshot_chain_id(scope),
+                site_fp,
+                last_seen_tx_id: synced.last_seen,
+                utxos: list.clone(),
+            },
+        );
+    }
+    eprintln!(
+        "[ows-midnight] unshielded sync: finished ({} UTXOs)",
+        list.len()
+    );
+    Ok(list)
+}
+
+/// The synced unshielded state: the unspent UTXO set and the cursor it is current as of.
+struct Synced {
+    last_seen: i64,
+    utxos: BTreeMap<(String, i64, String), UnshieldedUtxo>,
+}
+
+enum ReplayOutcome {
+    Done(Synced),
+    /// The indexer is behind the resume cursor (reset / rollback); the snapshot is stale.
+    ResumeUnusable,
+}
+
+/// Rebuild the working UTXO map (keyed by `(intent_hash, output_index, token_type)`) from a
+/// snapshot's flat UTXO list.
+fn seed_utxo_map(utxos: &[UnshieldedUtxo]) -> BTreeMap<(String, i64, String), UnshieldedUtxo> {
+    utxos
+        .iter()
+        .map(|u| {
+            (
+                (u.intent_hash.clone(), u.output_index, u.token_type.clone()),
+                u.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Run one subscription replay seeded from `resume_last_seen` + `seed`. Resumes from the
+/// cursor when `resume_last_seen > 0`, otherwise replays the whole history from genesis.
+async fn replay_unshielded(
+    indexer_url: &str,
+    address: &str,
+    resume_last_seen: i64,
+    seed: &[UnshieldedUtxo],
+    wait_for_tx_hash: Option<&str>,
+    tx_seen: &mut bool,
+) -> Result<ReplayOutcome, std::io::Error> {
+    let mut utxos = seed_utxo_map(seed);
+    let mut last_seen: i64 = resume_last_seen;
+
+    if resume_last_seen > 0 {
+        eprintln!(
+            "[ows-midnight] unshielded sync: resuming from tx id {resume_last_seen} ({} UTXOs)",
+            utxos.len()
+        );
+    } else {
+        eprintln!("[ows-midnight] unshielded sync: syncing from genesis");
+    }
 
     let stall_timeout = stall_timeout(SyncStream::Unshielded);
     let ws_idle = ws_idle_timeout(SyncStream::Unshielded);
@@ -161,7 +305,13 @@ async fn get_unshielded_utxos_inner(
 
     let mut ws = indexer_ws::connect_and_init(indexer_url, ws_idle, None).await?;
 
-    let sub_vars = serde_json::json!({ "address": address });
+    // Ask the indexer to start after the cursor when resuming; the skip branch in
+    // `process_unshielded_event` keeps us correct even if it ignores the parameter.
+    let sub_vars = if resume_last_seen > 0 {
+        serde_json::json!({ "address": address, "transactionId": resume_last_seen })
+    } else {
+        serde_json::json!({ "address": address })
+    };
     indexer_ws::subscribe(&mut ws, "1", UNSHIELDED_SUBSCRIPTION, sub_vars).await?;
 
     let mut highest: Option<i64> = None;
@@ -228,6 +378,11 @@ indexer may be stalled",
                     } => {
                         highest = Some(highest_transaction_id);
                         progress_received = true;
+                        // Indexer has fewer transactions than our resume cursor — it reset or
+                        // rolled back past our snapshot, so the seeded set can't be trusted.
+                        if resume_last_seen > 0 && highest_transaction_id < resume_last_seen {
+                            return Ok(ReplayOutcome::ResumeUnusable);
+                        }
                         eprintln!(
                             "[ows-midnight] unshielded sync progress: last_seen={last_seen} highest={highest_transaction_id}"
                         );
@@ -247,6 +402,7 @@ indexer may be stalled",
                             transaction,
                             created_utxos,
                             spent_utxos,
+                            resume_last_seen,
                             &mut last_seen,
                             &mut n_txs,
                             &mut utxos,
@@ -279,12 +435,7 @@ try again or check indexer health."
         ));
     }
 
-    let list: Vec<UnshieldedUtxo> = utxos.into_values().collect();
-    eprintln!(
-        "[ows-midnight] unshielded sync: finished ({} UTXOs)",
-        list.len()
-    );
-    Ok(list)
+    Ok(ReplayOutcome::Done(Synced { last_seen, utxos }))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -352,5 +503,34 @@ mod tests {
         assert!(tx_hashes_match("0xAbCd", "abcd"));
         assert!(tx_hashes_match("ABCD", "0xabcd"));
         assert!(!tx_hashes_match("0xaaaa", "0xbbbb"));
+    }
+
+    #[test]
+    fn unshielded_sync_done_requires_progress_and_catching_up_to_highest() {
+        // Without a Progress event we never declare done, even if last_seen looks high.
+        assert!(!unshielded_sync_done(false, Some(500), 500));
+        // With Progress, done only once we've applied everything up to the current highest.
+        assert!(!unshielded_sync_done(true, Some(500), 499));
+        assert!(unshielded_sync_done(true, Some(500), 500));
+        // Empty chain tip (highest == 0) is trivially done.
+        assert!(unshielded_sync_done(true, Some(0), 0));
+    }
+
+    #[test]
+    fn seed_utxo_map_keys_by_intent_output_and_token() {
+        let utxo = |intent: &str, idx: i64, token: &str| UnshieldedUtxo {
+            token_type: token.to_string(),
+            value: 1,
+            intent_hash: intent.to_string(),
+            output_index: idx,
+            owner: "owner".to_string(),
+            ctime_unix_secs: None,
+            registered_for_dust_generation: false,
+        };
+        let seed = vec![utxo("aa", 0, "night"), utxo("aa", 1, "night")];
+        let map = seed_utxo_map(&seed);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&("aa".to_string(), 0, "night".to_string())));
+        assert!(map.contains_key(&("aa".to_string(), 1, "night".to_string())));
     }
 }
