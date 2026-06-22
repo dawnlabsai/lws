@@ -1,0 +1,32 @@
+[package]
+name = "ows-midnight"
+version = "1.3.2"
+edition = "2021"
+license = "MIT"
+description = "Midnight chain integration (indexer sync + fund balance) for the Open Wallet Standard"
+repository = "https://github.com/open-wallet-standard/core"
+
+[dependencies]
+ows-core = { path = "../ows-core", version = "=1.3.2" }
+ows-signer = { path = "../ows-signer", version = "=1.3.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+bech32 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+midnight-ledger = "8.0.3"
+midnight-ledger-static = "9.0.0"
+midnight-zswap = "8.0.3"
+midnight-serialize = "1.0.0"
+midnight-base-crypto = "1.0.0"
+midnight-storage = "2.0.1"
+midnight-coin-structure = "2.0.0"
+transient-crypto = { version = "2.0.0", package = "midnight-transient-crypto" }
+onchain-runtime = { version = "3.0.0", package = "midnight-onchain-runtime" }
+zkir_v2 = { version = "2.1.0", package = "midnight-zkir" }
+subxt = { version = "0.38", default-features = false, features = ["jsonrpsee", "native"] }
+jsonrpsee = { version = "0.24", features = ["ws-client", "macros"] }

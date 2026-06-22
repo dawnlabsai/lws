@@ -1,0 +1,53 @@
+//! Midnight integration — unshielded indexer sync + `ows fund balance`.
+
+mod async_runtime;
+mod fund_balance;
+mod indexer_ws;
+mod ledger_params;
+mod midnight_env;
+mod unshielded_sync;
+mod urls;
+mod wallet;
+
+pub use async_runtime::block_on;
+pub use fund_balance::print_fund_balance;
+pub use ledger_params::fetch_indexer_ledger_parameters;
+pub use unshielded_sync::{get_unshielded_utxos_for_display, UnshieldedUtxo};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenType {
+    Native,
+    Custom([u8; 32]),
+}
+
+impl TokenType {
+    pub fn to_wire_token_type(&self) -> String {
+        match self {
+            TokenType::Native => hex::encode([0u8; 32]),
+            TokenType::Custom(b) => hex::encode(b),
+        }
+    }
+}
+
+pub fn parse_token_type(token: Option<&str>) -> Result<TokenType, std::io::Error> {
+    let t = token.map(str::trim).unwrap_or("");
+    if t.is_empty() || t.eq_ignore_ascii_case("native") || t.eq_ignore_ascii_case("night") {
+        return Ok(TokenType::Native);
+    }
+    let hex_s = t.strip_prefix("0x").unwrap_or(t);
+    let bytes =
+        hex::decode(hex_s).map_err(|e| std::io::Error::other(format!("invalid token hex: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(std::io::Error::other(format!(
+            "token id must be 32 bytes, got {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    if arr == [0u8; 32] {
+        Ok(TokenType::Native)
+    } else {
+        Ok(TokenType::Custom(arr))
+    }
+}

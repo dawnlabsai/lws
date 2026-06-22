@@ -403,6 +403,18 @@ impl MidnightSigner {
     ) -> Result<MidnightCryptoProvider, SignerError> {
         MidnightCryptoProvider::from_credential(credential)
     }
+
+    /// Re-encode a Bech32m unshielded address under this network's HRP. The
+    /// payload (pubkey hash) is network-independent; only the HRP differs.
+    pub fn reencode_unshielded_address(&self, address: &str) -> Result<String, SignerError> {
+        use bech32::primitives::decode::CheckedHrpstring;
+
+        let checked = CheckedHrpstring::new::<Bech32m>(address).map_err(|e| {
+            SignerError::AddressDerivationFailed(format!("invalid midnight address bech32m: {e}"))
+        })?;
+        let payload = checked.byte_iter().collect::<Vec<u8>>();
+        Self::bech32m_encode(&self.network.unshielded_hrp()?, &payload)
+    }
 }
 
 fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
@@ -719,6 +731,17 @@ mod tests {
         assert!(addrs.unshielded.starts_with("mn_addr_preview1"));
         assert!(addrs.shielded.starts_with("mn_shield-addr_preview1"));
         assert!(addrs.dust.starts_with("mn_dust_preview1"));
+    }
+
+    #[test]
+    fn midnight_preview_unshielded_address_matches_reencode() {
+        let key = signing_key_blob();
+        let mainnet_addr = MidnightSigner::mainnet().derive_address(&key).unwrap();
+        let preview_addr = MidnightSigner::preview().derive_address(&key).unwrap();
+        let reencoded = MidnightSigner::preview()
+            .reencode_unshielded_address(&mainnet_addr)
+            .unwrap();
+        assert_eq!(reencoded, preview_addr);
     }
 
     #[test]
