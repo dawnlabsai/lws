@@ -29,7 +29,10 @@ pub trait ChainSigner: Send + Sync {
     /// The BIP-44 coin type for this chain.
     fn coin_type(&self) -> u32;
 
-    /// Derive an on-chain address from a private key.
+    /// Derive an on-chain address from the key material produced by
+    /// [`ChainSigner::encode_keys`] — the primary key for single-key chains, or
+    /// the full encoded bundle for chains that bind several keys per account
+    /// (e.g. Cardano's payment + staking), which decode it here.
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError>;
 
     /// Sign a pre-hashed message (32 bytes for secp256k1, raw message for ed25519).
@@ -105,16 +108,17 @@ pub trait ChainSigner: Send + Sync {
         vec![self.default_derivation_path(index)]
     }
 
-    /// Collapse a resolved key bundle into the single key-material blob the
-    /// signing methods (`sign`, `sign_message`, `sign_transaction`) consume.
+    /// Collapse a resolved key bundle into the single key-material blob that the
+    /// signing methods (`sign`, `sign_message`, `sign_transaction`) and
+    /// `derive_address` consume.
     ///
     /// Most chains bind one key per account, so the default returns the primary
     /// (first) key unchanged — `default_derivation_paths[0]` is the contractual
-    /// primary. Chains that bind several keys per account (e.g. Midnight)
-    /// override this to pack them into one blob; the matching decode lives in
-    /// that chain's signer, which unpacks it inside its signing methods. The
-    /// blob is opaque to the generic signing path — only the producing chain
-    /// interprets it.
+    /// primary. Chains that bind several keys per account (e.g. Midnight,
+    /// Cardano) override this to pack them into one blob; the matching decode
+    /// lives in that chain's signer, which unpacks it inside its signing and
+    /// address methods. The blob is opaque to the generic path — only the
+    /// producing chain interprets it.
     fn encode_keys(&self, keys: &[DerivedKey]) -> Result<SecretBytes, SignerError> {
         keys.first()
             .map(|k| k.secret.clone())

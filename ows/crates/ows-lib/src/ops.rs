@@ -42,16 +42,17 @@ fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAcco
     for ct in &ALL_CHAIN_TYPES {
         let chain = default_chain_for_type(*ct);
         let signer = signer_for_chain(*ct);
-        let path = signer.default_derivation_path(index);
+        let paths = signer.default_derivation_paths(index);
         let curve = signer.curve();
-        let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve)?;
-        let address = signer.derive_address(key.expose())?;
+        let keys = HdDeriver::derive_keys_from_mnemonic(mnemonic, "", paths, curve)?;
+        let signing_key = signer.encode_keys(&keys)?;
+        let address = signer.derive_address(signing_key.expose())?;
         let account_id = format!("{}:{}", chain.chain_id, address);
         accounts.push(WalletAccount {
             account_id,
             address,
             chain_id: chain.chain_id.to_string(),
-            derivation_path: path,
+            derivation_path: signer.default_derivation_path(index),
         });
     }
     Ok(accounts)
@@ -182,11 +183,12 @@ pub fn derive_address(
     let chain = parse_chain(chain)?;
     let mnemonic = Mnemonic::from_phrase(mnemonic_phrase)?;
     let signer = signer_for_chain(chain.chain_type);
-    let path = signer.default_derivation_path(index.unwrap_or(0));
+    let paths = signer.default_derivation_paths(index.unwrap_or(0));
     let curve = signer.curve();
 
-    let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, curve)?;
-    let address = signer.derive_address(key.expose())?;
+    let keys = HdDeriver::derive_keys_from_mnemonic(&mnemonic, "", paths, curve)?;
+    let signing_key = signer.encode_keys(&keys)?;
+    let address = signer.derive_address(signing_key.expose())?;
     Ok(address)
 }
 

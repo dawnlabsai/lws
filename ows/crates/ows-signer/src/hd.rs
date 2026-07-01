@@ -87,6 +87,28 @@ impl HdDeriver {
 
     /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
     ///
+    /// The non-cached sibling of [`Self::derive_keys_from_mnemonic_cached`]:
+    /// every path goes through the non-cached singular, so no derived secret is
+    /// retained in the global key cache. Address derivation uses this — it only
+    /// needs the public address, not to warm the cache — while the signing path
+    /// uses the cached variant.
+    pub fn derive_keys_from_mnemonic(
+        mnemonic: &Mnemonic,
+        passphrase: &str,
+        paths: Vec<String>,
+        curve: Curve,
+    ) -> Result<Vec<DerivedKey>, HdError> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let secret = Self::derive_from_mnemonic(mnemonic, passphrase, &path, curve)?;
+                Ok(DerivedKey { path, secret })
+            })
+            .collect()
+    }
+
+    /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
+    ///
     /// Same interface as [`Self::derive_from_mnemonic_cached`] but plural in the
     /// path: every path goes through the cached singular under the hood, and the
     /// returned bundle pairs each secret with the path it came from so chains
