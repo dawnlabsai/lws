@@ -114,6 +114,8 @@ pub struct X402Response {
     pub accepts: Vec<PaymentRequirements>,
     #[serde(default)]
     pub resource: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<serde_json::Value>,
 }
 
 /// The signed payment payload sent to the server in the payment header.
@@ -142,6 +144,8 @@ pub struct PaymentPayloadV2 {
     pub accepted: PaymentRequirements,
     pub resource: Option<serde_json::Value>,
     pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
