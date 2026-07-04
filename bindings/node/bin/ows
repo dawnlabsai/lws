@@ -22,6 +22,10 @@ const PLATFORM_MAP = {
     pkg: "@open-wallet-standard/core-linux-arm64-gnu",
     bin: "ows",
   },
+  "win32-x64": {
+    pkg: "@open-wallet-standard/core-win32-x64-msvc",
+    bin: "ows.exe",
+  },
 };
 
 const key = `${platform}-${arch}`;

@@ -1,0 +1,16 @@
+{
+  "name": "@open-wallet-standard/core-win32-x64-msvc",
+  "version": "1.3.2",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "ows-node.win32-x64-msvc.node",
+  "files": [
+    "ows-node.win32-x64-msvc.node",
+    "ows.exe"
+  ],
+  "license": "MIT"
+}

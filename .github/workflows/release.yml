@@ -25,6 +25,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             asset: ows-darwin-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset: ows-windows-x86_64
 
     runs-on: ${{ matrix.os }}
 
@@ -57,17 +60,34 @@ jobs:
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.17
 
       - name: Build (macOS)
-        if: "!contains(matrix.target, 'linux')"
+        if: contains(matrix.target, 'apple')
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Build (Windows)
+        if: contains(matrix.target, 'windows')
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
         run: cp target/${{ matrix.target }}/release/ows ${{ matrix.asset }}
 
-      - name: Upload artifact
+      - name: Rename binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: cp target/${{ matrix.target }}/release/ows.exe ${{ matrix.asset }}.exe
+
+      - name: Upload artifact (Unix)
+        if: "!contains(matrix.target, 'windows')"
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: ${{ matrix.asset }}
           path: ows/${{ matrix.asset }}
+
+      - name: Upload artifact (Windows)
+        if: contains(matrix.target, 'windows')
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: ${{ matrix.asset }}
+          path: ows/${{ matrix.asset }}.exe
 
   python-wheels:
     strategy:
@@ -81,6 +101,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -97,6 +119,7 @@ jobs:
             3.13
 
       - name: Set version from tag
+        shell: bash
         run: |
           V="${GITHUB_REF_NAME#v}"
           "$GITHUB_WORKSPACE/scripts/set-version.sh" "$V" --python
@@ -145,6 +168,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -176,7 +201,15 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: Set version from tag
+      - name: Set version from tag (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          "$GITHUB_WORKSPACE/scripts/set-version.sh" "$V" --node
+
+      - name: Set version from tag (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: bash
         run: |
           V="${GITHUB_REF_NAME#v}"
           "$GITHUB_WORKSPACE/scripts/set-version.sh" "$V" --node
@@ -199,7 +232,11 @@ jobs:
         run: npx napi build --platform --release --target ${{ matrix.target }} --zig --zig-abi-suffix 2.17
 
       - name: Build native addon (macOS)
-        if: "!contains(matrix.target, 'linux')"
+        if: contains(matrix.target, 'apple')
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Build native addon (Windows)
+        if: contains(matrix.target, 'windows')
         run: npx napi build --platform --release --target ${{ matrix.target }}
 
       - name: Upload artifact
@@ -272,6 +309,7 @@ jobs:
           cp cli-binaries/ows-darwin-x86_64  npm/darwin-x64/ows     && chmod +x npm/darwin-x64/ows
           cp cli-binaries/ows-linux-x86_64   npm/linux-x64-gnu/ows  && chmod +x npm/linux-x64-gnu/ows
           cp cli-binaries/ows-linux-aarch64  npm/linux-arm64-gnu/ows && chmod +x npm/linux-arm64-gnu/ows
+          cp cli-binaries/ows-windows-x86_64.exe npm/win32-x64-msvc/ows.exe
 
       - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
         run: npm install --global npm@latest
