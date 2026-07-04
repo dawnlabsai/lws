@@ -69,7 +69,14 @@ pub fn run(
     };
 
     print_result(
-        &hex::encode(&output.signature),
+        &{
+            let mut sig = output.signature.clone();
+            if let Some(rid) = output.recovery_id {
+                let v = if rid < 27 { rid + 27 } else { rid };
+                sig.push(v);
+            }
+            hex::encode(&sig)
+        },
         output.recovery_id,
         json_output,
     )
