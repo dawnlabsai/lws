@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "open-wallet-standard"
-version = "1.3.2"
+version = "1.4.1"
 description = "Python native bindings for the Open Wallet Standard"
 requires-python = ">=3.8"
 license = { text = "MIT" }
