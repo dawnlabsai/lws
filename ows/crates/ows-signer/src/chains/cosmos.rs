@@ -66,6 +66,13 @@ impl ChainSigner for CosmosSigner {
 
         Ok(address)
     }
+    fn derive_public_key(&self, private_key: &[u8]) -> Result<Vec<u8>, SignerError> {
+        let signing_key = Self::signing_key(private_key)?;
+        let verifying_key = signing_key.verifying_key();
+        let compressed = verifying_key.to_encoded_point(true);
+        Ok(compressed.as_bytes().to_vec())
+    }
+
 
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
         if message.len() != 32 {

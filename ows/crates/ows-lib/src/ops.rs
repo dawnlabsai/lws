@@ -3436,3 +3436,112 @@ mod tests {
         }
     }
 }
+
+/// Return the raw public key bytes for a wallet on a given chain.
+///
+/// Public keys are not secret — exposing them does not weaken the security
+/// model. This eliminates the need to export the mnemonic just to derive
+/// the public key externally (e.g. for TON wallet contract initialization).
+///
+/// Returns:
+/// - secp256k1 chains (EVM, Bitcoin, Cosmos, Tron, XRPL, Filecoin, Spark):
+///   33-byte compressed SEC1 public key, hex-encoded.
+/// - Ed25519 chains (TON, Solana, Sui):
+///   32-byte public key, hex-encoded.
+///
+/// # Example
+/// ```no_run
+/// # use ows_lib::get_public_key;
+/// let pubkey = get_public_key("my-wallet", "ton", None, None).unwrap();
+/// // pubkey = "a1b2c3..." (32-byte hex for Ed25519)
+/// ```
+pub fn get_public_key(
+    wallet: &str,
+    chain: &str,
+    index: Option<u32>,
+    vault_path: Option<&std::path::Path>,
+) -> Result<String, OwsLibError> {
+    let chain_parsed = parse_chain(chain)?;
+    let key = decrypt_signing_key(wallet, chain_parsed.chain_type, "", index, vault_path)?;
+    let signer = signer_for_chain(chain_parsed.chain_type);
+    let pubkey_bytes = signer.derive_public_key(key.expose())?;
+    Ok(hex::encode(pubkey_bytes))
+}
+
+#[cfg(test)]
+mod pubkey_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_wallet(name: &str, vault: &std::path::Path) -> WalletInfo {
+        create_wallet(name, Some(12), None, Some(vault)).unwrap()
+    }
+
+    #[test]
+    fn get_public_key_evm_returns_33_bytes() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-evm", dir.path());
+        let hex = get_public_key("pk-evm", "evm", None, Some(dir.path())).unwrap();
+        assert_eq!(hex.len(), 66, "33 bytes = 66 hex chars");
+        assert!(hex.starts_with("02") || hex.starts_with("03"), "compressed secp256k1");
+    }
+
+    #[test]
+    fn get_public_key_ton_returns_32_bytes() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-ton", dir.path());
+        let hex = get_public_key("pk-ton", "ton", None, Some(dir.path())).unwrap();
+        assert_eq!(hex.len(), 64, "32 bytes = 64 hex chars");
+    }
+
+    #[test]
+    fn get_public_key_solana_returns_32_bytes() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-sol", dir.path());
+        let hex = get_public_key("pk-sol", "solana", None, Some(dir.path())).unwrap();
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[test]
+    fn get_public_key_bitcoin_returns_33_bytes() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-btc", dir.path());
+        let hex = get_public_key("pk-btc", "bitcoin", None, Some(dir.path())).unwrap();
+        assert_eq!(hex.len(), 66);
+        assert!(hex.starts_with("02") || hex.starts_with("03"));
+    }
+
+    #[test]
+    fn get_public_key_is_deterministic() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-det", dir.path());
+        let pk1 = get_public_key("pk-det", "evm", None, Some(dir.path())).unwrap();
+        let pk2 = get_public_key("pk-det", "evm", None, Some(dir.path())).unwrap();
+        assert_eq!(pk1, pk2);
+    }
+
+    #[test]
+    fn get_public_key_different_index_yields_different_key() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-idx", dir.path());
+        let pk0 = get_public_key("pk-idx", "evm", Some(0), Some(dir.path())).unwrap();
+        let pk1 = get_public_key("pk-idx", "evm", Some(1), Some(dir.path())).unwrap();
+        assert_ne!(pk0, pk1);
+    }
+
+    #[test]
+    fn get_public_key_fails_for_nonexistent_wallet() {
+        let dir = tempdir().unwrap();
+        assert!(get_public_key("no-such-wallet", "evm", None, Some(dir.path())).is_err());
+    }
+
+    #[test]
+    fn get_public_key_all_chains() {
+        let dir = tempdir().unwrap();
+        make_wallet("pk-all", dir.path());
+        for chain in &["evm", "solana", "ton", "bitcoin", "cosmos", "tron", "sui", "filecoin"] {
+            let hex = get_public_key("pk-all", chain, None, Some(dir.path())).unwrap();
+            assert!(hex.len() == 64 || hex.len() == 66, "chain {chain}: unexpected key length {}", hex.len());
+        }
+    }
+}

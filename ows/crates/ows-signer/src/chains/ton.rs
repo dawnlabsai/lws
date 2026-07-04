@@ -174,6 +174,12 @@ impl ChainSigner for TonSigner {
 
         Ok(Self::encode_address(0, &state_hash, false))
     }
+    fn derive_public_key(&self, private_key: &[u8]) -> Result<Vec<u8>, SignerError> {
+        let signing_key = Self::signing_key(private_key)?;
+        let verifying_key = signing_key.verifying_key();
+        Ok(verifying_key.as_bytes().to_vec())
+    }
+
 
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
         let signing_key = Self::signing_key(private_key)?;

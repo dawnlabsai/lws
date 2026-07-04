@@ -99,6 +99,13 @@ impl ChainSigner for XrplSigner {
             public_key: Some(public_key),
         })
     }
+    fn derive_public_key(&self, private_key: &[u8]) -> Result<Vec<u8>, SignerError> {
+        let signing_key = SigningKey::from_slice(private_key)
+            .map_err(|e| SignerError::InvalidPrivateKey(e.to_string()))?;
+        let compressed = signing_key.verifying_key().to_encoded_point(true);
+        Ok(compressed.as_bytes().to_vec())
+    }
+
 
     /// Sign a binary-encoded unsigned XRPL transaction.
     ///

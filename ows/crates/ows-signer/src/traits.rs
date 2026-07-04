@@ -29,6 +29,15 @@ pub trait ChainSigner: Send + Sync {
     /// Derive an on-chain address from a private key.
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError>;
 
+    /// Derive the raw public key bytes from a private key.
+    ///
+    /// Returns the canonical public key encoding for this chain's curve:
+    /// - secp256k1 chains: 33-byte compressed public key (SEC1)
+    /// - Ed25519 chains: 32-byte public key
+    ///
+    /// Public keys are not secret — exposing them does not weaken the security model.
+    fn derive_public_key(&self, private_key: &[u8]) -> Result<Vec<u8>, SignerError>;
+
     /// Sign a pre-hashed message (32 bytes for secp256k1, raw message for ed25519).
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
 

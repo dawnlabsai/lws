@@ -447,3 +447,19 @@ pub fn sign_and_send(
     .map(|r| SendResult { tx_hash: r.tx_hash })
     .map_err(map_err)
 }
+
+#[napi]
+pub fn get_public_key(
+    wallet: String,
+    chain: String,
+    index: Option<u32>,
+    vault_path_opt: Option<String>,
+) -> Result<String> {
+    ows_lib::get_public_key(
+        &wallet,
+        &chain,
+        index,
+        vault_path(vault_path_opt).as_deref(),
+    )
+    .map_err(map_err)
+}

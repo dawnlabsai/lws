@@ -132,6 +132,21 @@ enum WalletCommands {
     List,
     /// Show vault path and supported chains
     Info,
+    /// Show the raw public key for a wallet on a given chain
+    PublicKey {
+        /// Wallet name or ID
+        #[arg(long, env = "OWS_WALLET")]
+        wallet: String,
+        /// Chain name or CAIP-2 ID (e.g. "ton", "evm", "solana")
+        #[arg(long)]
+        chain: String,
+        /// Account index
+        #[arg(long, default_value = "0")]
+        index: u32,
+        /// Output structured JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -419,6 +434,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             WalletCommands::List => commands::wallet::list(),
             WalletCommands::Info => commands::info::run(),
+            WalletCommands::PublicKey { wallet, chain, index, json } => {
+                commands::wallet::public_key(&wallet, &chain, index, json)
+            }
         },
         Commands::Sign { subcommand } => match subcommand {
             SignCommands::Message {
