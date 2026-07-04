@@ -42,6 +42,7 @@ impl Config {
             "eip155:43114".into(),
             "https://api.avax.network/ext/bc/C/rpc".into(),
         );
+        rpc.insert("eip155:143".into(), "https://rpc.monad.xyz".into());
         rpc.insert(
             "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into(),
             "https://api.mainnet-beta.solana.com".into(),
@@ -199,6 +200,7 @@ mod tests {
             Some("https://polygon-rpc.com")
         );
         assert_eq!(config.rpc_url("eip155:9745"), Some("https://rpc.plasma.to"));
+        assert_eq!(config.rpc_url("eip155:143"), Some("https://rpc.monad.xyz"));
         assert_eq!(
             config.rpc_url("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
             Some("https://api.mainnet-beta.solana.com")
@@ -266,7 +268,7 @@ mod tests {
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default_from(std::path::Path::new("/nonexistent/config.json"));
         // Should have all default RPCs
-        assert_eq!(config.rpc.len(), 23);
+        assert_eq!(config.rpc.len(), 24);
         assert_eq!(config.rpc_url("eip155:1"), Some("https://eth.llamarpc.com"));
         assert_eq!(
             config.rpc_url("near:mainnet"),

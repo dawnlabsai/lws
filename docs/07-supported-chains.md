@@ -58,6 +58,7 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | BSC | `eip155:56` |
 | Avalanche | `eip155:43114` |
 | Etherlink | `eip155:42793` |
+| Monad | `eip155:143` |
 | Tempo | `eip155:4217` |
 | Hyperliquid | `eip155:999` |
 
@@ -93,6 +94,7 @@ optimism  → eip155:10
 bsc       → eip155:56
 avalanche → eip155:43114
 etherlink → eip155:42793
+monad     → eip155:143
 tempo       → eip155:4217
 hyperliquid → eip155:999
 solana    → solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp

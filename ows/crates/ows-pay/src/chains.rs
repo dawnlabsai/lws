@@ -47,6 +47,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_monad_name() {
+        assert_eq!(resolve_chain_type("monad"), Some(ChainType::Evm));
+    }
+
+    #[test]
+    fn resolve_monad_caip2() {
+        assert_eq!(resolve_chain_type("eip155:143"), Some(ChainType::Evm));
+    }
+
+    #[test]
+    fn display_monad() {
+        assert_eq!(display_name("monad"), "monad");
+        assert_eq!(display_name("eip155:143"), "monad");
+    }
+
+    #[test]
     fn resolve_unknown_caip2_known_namespace() {
         // Chain not in KNOWN_CHAINS but namespace is recognized.
         assert_eq!(resolve_chain_type("eip155:999999"), Some(ChainType::Evm));
