@@ -60,6 +60,11 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Etherlink | `eip155:42793` |
 | Tempo | `eip155:4217` |
 | Hyperliquid | `eip155:999` |
+| Sepolia | `eip155:11155111` |
+| Base Sepolia | `eip155:84532` |
+| Arbitrum Sepolia | `eip155:421614` |
+| Optimism Sepolia | `eip155:11155420` |
+| Polygon Amoy | `eip155:80002` |
 
 ### Non-EVM Networks
 
@@ -94,7 +99,12 @@ bsc       → eip155:56
 avalanche → eip155:43114
 etherlink → eip155:42793
 tempo       → eip155:4217
-hyperliquid → eip155:999
+hyperliquid       → eip155:999
+sepolia           → eip155:11155111
+base-sepolia      → eip155:84532
+arbitrum-sepolia  → eip155:421614
+optimism-sepolia  → eip155:11155420
+polygon-amoy      → eip155:80002
 solana    → solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
 bitcoin   → bip122:000000000019d6689c085ae165831e93
 cosmos    → cosmos:cosmoshub-4

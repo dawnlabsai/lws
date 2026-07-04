@@ -203,6 +203,32 @@ pub const KNOWN_CHAINS: &[Chain] = &[
         chain_type: ChainType::Evm,
         chain_id: "eip155:999",
     },
+    // EVM testnets
+    Chain {
+        name: "sepolia",
+        chain_type: ChainType::Evm,
+        chain_id: "eip155:11155111",
+    },
+    Chain {
+        name: "base-sepolia",
+        chain_type: ChainType::Evm,
+        chain_id: "eip155:84532",
+    },
+    Chain {
+        name: "arbitrum-sepolia",
+        chain_type: ChainType::Evm,
+        chain_id: "eip155:421614",
+    },
+    Chain {
+        name: "optimism-sepolia",
+        chain_type: ChainType::Evm,
+        chain_id: "eip155:11155420",
+    },
+    Chain {
+        name: "polygon-amoy",
+        chain_type: ChainType::Evm,
+        chain_id: "eip155:80002",
+    },
 ];
 
 /// Parse a chain string into a `Chain`. Accepts:
@@ -666,5 +692,51 @@ mod tests {
         let chain = default_chain_for_type(ChainType::Evm);
         assert_eq!(chain.name, "ethereum");
         assert_eq!(chain.chain_id, "eip155:1");
+    }
+    #[test]
+    fn parse_base_sepolia_by_name() {
+        let chain = parse_chain("base-sepolia").unwrap();
+        assert_eq!(chain.chain_id, "eip155:84532");
+        assert_eq!(chain.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn parse_sepolia_by_name() {
+        let chain = parse_chain("sepolia").unwrap();
+        assert_eq!(chain.chain_id, "eip155:11155111");
+        assert_eq!(chain.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn parse_arbitrum_sepolia_by_name() {
+        let chain = parse_chain("arbitrum-sepolia").unwrap();
+        assert_eq!(chain.chain_id, "eip155:421614");
+        assert_eq!(chain.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn parse_optimism_sepolia_by_name() {
+        let chain = parse_chain("optimism-sepolia").unwrap();
+        assert_eq!(chain.chain_id, "eip155:11155420");
+        assert_eq!(chain.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn parse_polygon_amoy_by_name() {
+        let chain = parse_chain("polygon-amoy").unwrap();
+        assert_eq!(chain.chain_id, "eip155:80002");
+        assert_eq!(chain.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn parse_base_sepolia_by_caip2() {
+        let chain = parse_chain("eip155:84532").unwrap();
+        assert_eq!(chain.chain_id, "eip155:84532");
+    }
+
+    #[test]
+    fn parse_base_sepolia_by_chain_id() {
+        let chain = parse_chain("84532").unwrap();
+        assert_eq!(chain.chain_id, "eip155:84532");
     }
 }
