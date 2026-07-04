@@ -1519,7 +1519,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "ows-core"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "ows-lib"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "ows-node"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "ows-signer"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
