@@ -17,13 +17,17 @@
       "types": "./src/solana.d.ts",
       "default": "./src/solana.js"
     },
+    "./solana-kit": {
+      "types": "./src/solana-kit.d.ts",
+      "default": "./src/solana-kit.js"
+    },
     "./wdk": {
       "types": "./src/wdk.d.ts",
       "default": "./src/wdk.js"
     }
   },
   "scripts": {
-    "test": "node --test __test__/viem.spec.mjs __test__/solana.spec.mjs __test__/wdk.spec.mjs",
+    "test": "node --test __test__/viem.spec.mjs __test__/solana.spec.mjs __test__/solana-kit.spec.mjs __test__/wdk.spec.mjs",
     "prepublishOnly": "npm test"
   },
   "dependencies": {
@@ -32,11 +36,15 @@
   },
   "peerDependencies": {
     "viem": ">=2.0.0",
+    "@solana/kit": ">=3.0.0",
     "@solana/web3.js": ">=1.0.0",
     "@tetherto/wdk-wallet": ">=1.0.0-beta.0"
   },
   "peerDependenciesMeta": {
     "viem": {
+      "optional": true
+    },
+    "@solana/kit": {
       "optional": true
     },
     "@solana/web3.js": {
@@ -48,6 +56,7 @@
   },
   "devDependencies": {
     "viem": "^2.0.0",
+    "@solana/kit": "^6.0.0",
     "@solana/web3.js": "^1.95.0"
   },
   "license": "MIT",
