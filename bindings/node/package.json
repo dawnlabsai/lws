@@ -23,6 +23,7 @@
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "napi build --platform --release",
     "publish:all": "node publish.mjs",
     "test": "napi build --platform --features fast-kdf && node --test __test__/index.spec.mjs"
@@ -41,6 +42,7 @@
     "index.js",
     "index.d.ts",
     "bin/ows",
+    "scripts/postinstall.js",
     "README.md"
   ],
   "repository": {
