@@ -12,38 +12,137 @@ use crate::traits::{ChainSigner, SignOutput, SignerError};
 use crate::zeroizing::SecretBytes;
 use ows_core::ChainType;
 
-/// Midnight network selection. Each network uses the same keys but
-/// network-specific Bech32m HRPs for unshielded and shielded addresses
-/// (the dust HRP is network-agnostic).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MidnightNetwork {
-    Mainnet,
-    Preview,
-    Preprod,
+/// Midnight network selection. Each network uses the same keys but a
+/// network-specific Bech32m HRP suffix — the unshielded, shielded, and dust
+/// addresses all carry the network id in their HRP.
+///
+/// A network is identified by its CAIP-2 *reference* (the part after
+/// `midnight:`), preserved verbatim. Any reference is accepted — `mainnet`,
+/// `preview`, `preprod`, and ad-hoc feature testnets like `feature-x` — so an
+/// unregistered id is never cast to mainnet. The reference is validated for
+/// Bech32m HRP compatibility when an address is derived and rejected, not
+/// coerced, if malformed. Only `mainnet` gets the empty HRP suffix; every other
+/// reference carries `_{reference}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidnightNetwork {
+    reference: String,
 }
 
 impl MidnightNetwork {
-    /// Network HRP suffix: empty on mainnet, `_preview`/`_preprod` on the testnets. The
-    /// unshielded, shielded, and dust HRPs share the `{base}{suffix}` shape.
-    fn hrp_suffix(self) -> &'static str {
-        match self {
-            Self::Mainnet => "",
-            Self::Preview => "_preview",
-            Self::Preprod => "_preprod",
+    /// The CAIP-2 reference that denotes mainnet — the only network with an empty HRP suffix.
+    const MAINNET_REFERENCE: &str = "mainnet";
+
+    pub fn mainnet() -> Self {
+        Self::from_reference(Self::MAINNET_REFERENCE)
+    }
+
+    pub fn preview() -> Self {
+        Self::from_reference("preview")
+    }
+
+    pub fn preprod() -> Self {
+        Self::from_reference("preprod")
+    }
+
+    /// Build a network from a CAIP-2 reference (the part after `midnight:`), preserved verbatim —
+    /// no mapping to a fixed set — so ad-hoc feature testnets work end to end. The reference is
+    /// validated when an address is derived, not here.
+    pub fn from_reference(reference: &str) -> Self {
+        Self {
+            reference: reference.to_string(),
         }
     }
 
-    fn unshielded_hrp(self) -> String {
-        format!("mn_addr{}", self.hrp_suffix())
+    /// Resolve a network from a CAIP-2 chain id (`midnight:<reference>`), preserving the
+    /// reference. Lenient at construction: an unregistered id is kept as-is (feature testnets),
+    /// never cast to mainnet and never a panic. A malformed reference is rejected — not coerced —
+    /// as an address-derivation error when its HRP is built.
+    pub fn from_chain_id(chain_id: &str) -> Self {
+        let reference = chain_id.split_once(':').map_or(chain_id, |(_, r)| r);
+        Self::from_reference(reference)
     }
 
-    fn shielded_hrp(self) -> String {
-        format!("mn_shield-addr{}", self.hrp_suffix())
+    /// This network's CAIP-2 reference (the part after `midnight:`).
+    pub fn reference(&self) -> &str {
+        &self.reference
     }
 
-    fn dust_hrp(self) -> String {
-        format!("mn_dust{}", self.hrp_suffix())
+    /// Bech32m HRP for the unshielded (Night) address, validating the reference first.
+    fn unshielded_hrp(&self) -> Result<String, SignerError> {
+        validate_network_reference(&self.reference)?;
+        Ok(hrp_for_network("mn_addr", &self.reference))
     }
+
+    /// Bech32m HRP for the shielded (Zswap) address, validating the reference first.
+    fn shielded_hrp(&self) -> Result<String, SignerError> {
+        validate_network_reference(&self.reference)?;
+        Ok(hrp_for_network("mn_shield-addr", &self.reference))
+    }
+
+    /// Bech32m HRP for the dust address, validating the reference first.
+    fn dust_hrp(&self) -> Result<String, SignerError> {
+        validate_network_reference(&self.reference)?;
+        Ok(hrp_for_network("mn_dust", &self.reference))
+    }
+}
+
+/// Bech32m HRP bases used for Midnight addresses; network references must produce valid
+/// combined HRPs for each (`mn_addr_{network}`, …).
+const MIDNIGHT_ADDRESS_BASE_HRPS: &[&str] = &["mn_addr", "mn_shield-addr", "mn_dust"];
+
+/// True when the network reference is mainnet (no Bech32m HRP suffix).
+fn is_mainnet_network_reference(network_ref: &str) -> bool {
+    network_ref.eq_ignore_ascii_case("mainnet")
+}
+
+/// Build a Bech32m HRP for a Midnight address type on the given network.
+///
+/// Mainnet uses the base HRP with no suffix (`mn_addr`). Every other network appends
+/// `_{network}` (`mn_addr_preview`, `mn_addr_my-feature`, …).
+fn hrp_for_network(base_hrp: &str, network_ref: &str) -> String {
+    if is_mainnet_network_reference(network_ref) {
+        base_hrp.to_string()
+    } else {
+        format!("{base_hrp}_{network_ref}")
+    }
+}
+
+/// Reject network references that are not safe Midnight network id strings or would produce
+/// invalid Bech32m HRPs when suffixed. Validation runs at address-derivation time so
+/// construction stays infallible; a malformed reference is rejected, never coerced.
+fn validate_network_reference(network_ref: &str) -> Result<(), SignerError> {
+    if network_ref.is_empty() {
+        return Err(SignerError::AddressDerivationFailed(
+            "midnight chain id must include a network reference after 'midnight:'".into(),
+        ));
+    }
+    if !network_ref
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(SignerError::AddressDerivationFailed(format!(
+            "invalid midnight network reference {network_ref:?}: must contain only lowercase letters, digits, and hyphens"
+        )));
+    }
+    if network_ref.starts_with('-') || network_ref.ends_with('-') {
+        return Err(SignerError::AddressDerivationFailed(format!(
+            "invalid midnight network reference {network_ref:?}: must not start or end with a hyphen"
+        )));
+    }
+    validate_network_reference_for_bech32_hrp(network_ref)
+}
+
+/// Reject network references that would produce invalid Bech32m HRPs when suffixed.
+fn validate_network_reference_for_bech32_hrp(network_ref: &str) -> Result<(), SignerError> {
+    for base in MIDNIGHT_ADDRESS_BASE_HRPS {
+        let hrp = hrp_for_network(base, network_ref);
+        Hrp::parse(&hrp).map_err(|e| {
+            SignerError::AddressDerivationFailed(format!(
+                "invalid midnight network reference {network_ref:?} (Bech32m HRP {hrp:?}): {e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Midnight signing support.
@@ -87,35 +186,29 @@ impl MidnightSigner {
 
     pub fn mainnet() -> Self {
         Self {
-            network: MidnightNetwork::Mainnet,
+            network: MidnightNetwork::mainnet(),
         }
     }
 
     pub fn preview() -> Self {
         Self {
-            network: MidnightNetwork::Preview,
+            network: MidnightNetwork::preview(),
         }
     }
 
     pub fn preprod() -> Self {
         Self {
-            network: MidnightNetwork::Preprod,
+            network: MidnightNetwork::preprod(),
         }
     }
 
-    /// Resolve a network from a CAIP-2 chain id. Panics on an unrecognized id:
-    /// `signer_for_chain` only builds this from a registered Midnight `Chain`, so
-    /// an unknown id here is a registry/programming error, never user input — and
-    /// silently defaulting to mainnet would mint wrong-but-valid-looking addresses.
+    /// Resolve a signer from a CAIP-2 chain id, preserving the network reference. Any
+    /// `midnight:<reference>` is accepted verbatim — no cast to mainnet, no panic — so ad-hoc
+    /// feature testnets sign and address correctly. A malformed reference surfaces later as an
+    /// address-derivation error, not here.
     pub fn from_chain_id(chain_id: &str) -> Self {
-        if chain_id.eq_ignore_ascii_case("midnight:mainnet") {
-            Self::mainnet()
-        } else if chain_id.eq_ignore_ascii_case("midnight:preview") {
-            Self::preview()
-        } else if chain_id.eq_ignore_ascii_case("midnight:preprod") {
-            Self::preprod()
-        } else {
-            panic!("unsupported Midnight chain id: {chain_id}")
+        Self {
+            network: MidnightNetwork::from_chain_id(chain_id),
         }
     }
 
@@ -262,7 +355,7 @@ impl MidnightSigner {
         let dust_pk = BigUint::from_bytes_be(&be);
 
         let payload = scale_bigint_encode_biguint(&dust_pk)?;
-        Self::bech32m_encode(&self.network.dust_hrp(), &payload)
+        Self::bech32m_encode(&self.network.dust_hrp()?, &payload)
     }
 
     /// Derive all three Midnight addresses (unshielded / shielded / dust) from
@@ -272,11 +365,11 @@ impl MidnightSigner {
         Ok(MidnightAddresses {
             unshielded: self.derive_unshielded_address_with_hrp(
                 seeds.unshielded.expose(),
-                &self.network.unshielded_hrp(),
+                &self.network.unshielded_hrp()?,
             )?,
             shielded: self.derive_shielded_address_with_hrp(
                 seeds.shielded.expose(),
-                &self.network.shielded_hrp(),
+                &self.network.shielded_hrp()?,
             )?,
             dust: self.derive_dust_address_from_seed(seeds.dust.expose())?,
         })
@@ -320,7 +413,7 @@ impl ChainSigner for MidnightSigner {
         let seeds = Self::decode_keys(private_key)?;
         self.derive_unshielded_address_with_hrp(
             seeds.unshielded.expose(),
-            &self.network.unshielded_hrp(),
+            &self.network.unshielded_hrp()?,
         )
     }
 
@@ -506,23 +599,54 @@ mod tests {
     fn midnight_from_chain_id_maps_networks() {
         assert_eq!(
             MidnightSigner::from_chain_id("midnight:mainnet").network,
-            MidnightNetwork::Mainnet
+            MidnightNetwork::mainnet()
         );
         assert_eq!(
             MidnightSigner::from_chain_id("midnight:preview").network,
-            MidnightNetwork::Preview
+            MidnightNetwork::preview()
         );
         assert_eq!(
             MidnightSigner::from_chain_id("midnight:preprod").network,
-            MidnightNetwork::Preprod
+            MidnightNetwork::preprod()
         );
     }
 
     #[test]
-    #[should_panic(expected = "unsupported Midnight chain id")]
-    fn midnight_from_chain_id_panics_on_unknown() {
-        // No silent mainnet fallback: an unregistered id is a programming error.
-        let _ = MidnightSigner::from_chain_id("midnight:bogus");
+    fn midnight_from_chain_id_preserves_arbitrary_reference() {
+        // No cast to mainnet and no panic: an unregistered id is preserved verbatim as an
+        // ad-hoc feature testnet.
+        let net = MidnightSigner::from_chain_id("midnight:feature-x").network;
+        assert_eq!(net.reference(), "feature-x");
+        assert_ne!(net, MidnightNetwork::mainnet());
+
+        // Its address HRPs carry the reference, so a feature-net address can't be mistaken for
+        // a mainnet one.
+        let addrs = MidnightSigner::from_chain_id("midnight:feature-x")
+            .derive_addresses(&signing_key_blob())
+            .unwrap();
+        assert!(addrs.unshielded.starts_with("mn_addr_feature-x1"));
+        assert!(addrs.shielded.starts_with("mn_shield-addr_feature-x1"));
+        assert!(addrs.dust.starts_with("mn_dust_feature-x1"));
+    }
+
+    #[test]
+    fn midnight_rejects_malformed_network_reference() {
+        // Rejected, not coerced: a mixed-case, structurally invalid, or empty reference surfaces
+        // as an address-derivation error instead of minting a wrong-but-valid-looking address.
+        for chain_id in [
+            "midnight:Preview", // uppercase is not lowercased
+            "midnight:foo/bar", // illegal HRP character
+            "midnight:-bad",    // leading hyphen
+            "midnight:bad-",    // trailing hyphen
+            "midnight:",        // empty reference
+        ] {
+            let result =
+                MidnightSigner::from_chain_id(chain_id).derive_addresses(&signing_key_blob());
+            assert!(
+                matches!(result, Err(SignerError::AddressDerivationFailed(_))),
+                "{chain_id} should be rejected"
+            );
+        }
     }
 
     #[test]
