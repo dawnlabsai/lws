@@ -29,8 +29,8 @@ pub use self::xrpl::XrplSigner;
 use crate::traits::ChainSigner;
 use ows_core::{default_chain_for_type, Chain, ChainType};
 
-/// Resolve a signer from a parsed CAIP-2 chain. Families whose address format
-/// depends on the network read `chain.chain_id` inside their constructor.
+/// Resolve signer from a parsed CAIP-2 chain. Families that depend on `chain_id`
+/// read it inside their constructor (e.g. [`MidnightSigner::from_chain_id`]).
 pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
     match chain.chain_type {
         ChainType::Evm => Box::new(EvmSigner),
@@ -45,7 +45,7 @@ pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
-        ChainType::Midnight => Box::new(MidnightSigner),
+        ChainType::Midnight => Box::new(MidnightSigner::from_chain_id(chain.chain_id)),
     }
 }
 
