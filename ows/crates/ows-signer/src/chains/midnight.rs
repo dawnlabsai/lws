@@ -1,5 +1,9 @@
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
+use midnight_ledger::dust::{DustPublicKey, DustSecretKey};
+use midnight_serialize::{ScaleBigInt, Serializable};
+use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
+use num_bigint::BigUint;
 use sha2::Digest;
 
 use crate::curve::Curve;
@@ -27,6 +31,21 @@ impl MidnightNetwork {
         }
     }
 
+    fn shielded_hrp(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mn_shield-addr",
+            Self::Preview => "mn_shield-addr_preview",
+            Self::Preprod => "mn_shield-addr_preprod",
+        }
+    }
+
+    fn dust_hrp(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mn_dust",
+            Self::Preview => "mn_dust_preview",
+            Self::Preprod => "mn_dust_preprod",
+        }
+    }
 }
 
 /// Midnight signing support.
@@ -44,6 +63,13 @@ pub struct MidnightSeeds {
     pub unshielded: SecretBytes,
     pub shielded: SecretBytes,
     pub dust: SecretBytes,
+}
+
+/// The full set of Midnight addresses for one account on one network.
+pub struct MidnightAddresses {
+    pub unshielded: String,
+    pub shielded: String,
+    pub dust: String,
 }
 
 impl MidnightSigner {
@@ -184,6 +210,96 @@ impl MidnightSigner {
         Self::bech32m_encode(hrp, &hash)
     }
 
+    /// Shielded address payload: Wallet SDK Zswap derives the secret key set from
+    /// the 32-byte seed; the address is `coinPublicKey || encryptionPublicKey` (64
+    /// bytes), Bech32m-encoded under the given network HRP.
+    fn derive_shielded_address_with_hrp(
+        &self,
+        seed: &[u8],
+        hrp: &str,
+    ) -> Result<String, SignerError> {
+        let seed_arr: [u8; 32] = seed.try_into().map_err(|_| {
+            SignerError::InvalidPrivateKey(format!(
+                "expected 32-byte shielded seed, got {} bytes",
+                seed.len()
+            ))
+        })?;
+        let keys = ZswapSecretKeys::from(ZswapSeed::from(seed_arr));
+
+        let coin_public = keys.coin_public_key().0 .0;
+        let mut enc_public = Vec::new();
+        keys.enc_public_key()
+            .serialize(&mut enc_public)
+            .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))?;
+        if enc_public.len() != 32 {
+            return Err(SignerError::AddressDerivationFailed(format!(
+                "unexpected encryption public key length: {}",
+                enc_public.len()
+            )));
+        }
+
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(&coin_public);
+        payload.extend_from_slice(&enc_public);
+        Self::bech32m_encode(hrp, &payload)
+    }
+
+    /// Dust address: Wallet SDK / ledger-v8 derives the dust public key (a field
+    /// element) from the 32-byte seed, SCALE-encodes it as a BigInt, and Bech32m-
+    /// encodes that payload under the network's `mn_dust{suffix}` HRP.
+    fn derive_dust_address_from_seed(&self, seed: &[u8]) -> Result<String, SignerError> {
+        let seed_arr: [u8; 32] = seed.try_into().map_err(|_| {
+            SignerError::InvalidPrivateKey(format!(
+                "expected 32-byte dust seed, got {} bytes",
+                seed.len()
+            ))
+        })?;
+        let dsk = DustSecretKey::derive_secret_key(&seed_arr);
+        let dpk = DustPublicKey::from(dsk);
+
+        // JS `fr_to_bigint`: little-endian bytes reversed, interpreted as big-endian
+        // hex. The numeric value is the same; we build it from big-endian bytes.
+        let mut be = dpk.0.as_le_bytes();
+        be.reverse();
+        let dust_pk = BigUint::from_bytes_be(&be);
+
+        let payload = scale_bigint_encode_biguint(&dust_pk)?;
+        Self::bech32m_encode(self.network.dust_hrp(), &payload)
+    }
+
+    /// Derive all three Midnight addresses (unshielded / shielded / dust) from
+    /// the OWS `signing_key` produced by `encode_keys` / `secret_to_signing_key`.
+    pub fn derive_addresses(&self, signing_key: &[u8]) -> Result<MidnightAddresses, SignerError> {
+        let seeds = Self::decode_keys(signing_key)?;
+        Ok(MidnightAddresses {
+            unshielded: self.derive_unshielded_address_with_hrp(
+                seeds.unshielded.expose(),
+                self.network.unshielded_hrp(),
+            )?,
+            shielded: self.derive_shielded_address_with_hrp(
+                seeds.shielded.expose(),
+                self.network.shielded_hrp(),
+            )?,
+            dust: self.derive_dust_address_from_seed(seeds.dust.expose())?,
+        })
+    }
+}
+
+fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
+    // Midnight uses its own SCALE-compatible BigInt encoding (`ScaleBigInt`),
+    // matching wallet-sdk / ledger-v8.
+    let bytes_le = n.to_bytes_le();
+    if bytes_le.len() > 67 {
+        return Err(SignerError::AddressDerivationFailed(
+            "ScaleBigInt: integer too large".into(),
+        ));
+    }
+    let mut sb = ScaleBigInt::default();
+    sb.0[..bytes_le.len()].copy_from_slice(&bytes_le);
+    let mut out = Vec::new();
+    sb.serialize(&mut out)
+        .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))?;
+    Ok(out)
 }
 
 impl ChainSigner for MidnightSigner {
@@ -200,7 +316,14 @@ impl ChainSigner for MidnightSigner {
     }
 
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError> {
-        self.derive_unshielded_address_with_hrp(private_key, self.network.unshielded_hrp())
+        // Address derivation is routed through the multi-key bundle (`encode_keys` ->
+        // `derive_address`), so `private_key` is the packed `MNK1` signing key. Decode it to
+        // the unshielded seed and build the Night address.
+        let seeds = Self::decode_keys(private_key)?;
+        self.derive_unshielded_address_with_hrp(
+            seeds.unshielded.expose(),
+            self.network.unshielded_hrp(),
+        )
     }
 
     fn sign(&self, _private_key: &[u8], _message: &[u8]) -> Result<SignOutput, SignerError> {
@@ -276,16 +399,11 @@ mod tests {
     const UNSHIELDED_KEY_HEX: &str =
         "822fa63c57f6317cd51d12d80f0e64c2bc2164088dec1c71ca34a87a890190aa";
 
-    fn unshielded_key() -> Vec<u8> {
-        hex::decode(UNSHIELDED_KEY_HEX).unwrap()
-    }
-
     #[test]
     fn midnight_unshielded_mainnet_address_vector() {
         let signer = MidnightSigner::mainnet();
-        let key = unshielded_key();
         assert_eq!(
-            signer.derive_address(&key).unwrap(),
+            signer.derive_address(&signing_key_blob()).unwrap(),
             "mn_addr1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qw3dyt6"
         );
     }
@@ -351,11 +469,39 @@ mod tests {
     }
 
     #[test]
+    fn midnight_derive_addresses_mainnet_vector() {
+        let signer = MidnightSigner::mainnet();
+        let addrs = signer.derive_addresses(&signing_key_blob()).unwrap();
+        assert_eq!(
+            addrs.unshielded,
+            "mn_addr1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qw3dyt6"
+        );
+        assert_eq!(
+            addrs.shielded,
+            "mn_shield-addr1ywxc2p9986usecc9xert79afzq4m9x35u62sx0a4e2tc5w6mta5ulwhc432vhrlpnvygfep3pxcdt8tgzfstesrm6tf7hjc5jgpl20gcwvwgz"
+        );
+        assert_eq!(
+            addrs.dust,
+            "mn_dust1wwcff2ckd4n5hfj43055td8glwtzkhhf6z88xwf0rpftvgstr7zpxpl07jx"
+        );
+    }
+
+    #[test]
     fn midnight_preview_unshielded_address_uses_preview_hrp() {
         let addr = MidnightSigner::preview()
-            .derive_address(&unshielded_key())
+            .derive_address(&signing_key_blob())
             .unwrap();
         assert!(addr.starts_with("mn_addr_preview1"));
+    }
+
+    #[test]
+    fn midnight_derive_addresses_preview_uses_preview_hrps() {
+        let addrs = MidnightSigner::preview()
+            .derive_addresses(&signing_key_blob())
+            .unwrap();
+        assert!(addrs.unshielded.starts_with("mn_addr_preview1"));
+        assert!(addrs.shielded.starts_with("mn_shield-addr_preview1"));
+        assert!(addrs.dust.starts_with("mn_dust_preview1"));
     }
 
     #[test]
