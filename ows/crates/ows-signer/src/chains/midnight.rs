@@ -23,28 +23,26 @@ pub enum MidnightNetwork {
 }
 
 impl MidnightNetwork {
-    fn unshielded_hrp(self) -> &'static str {
+    /// Network HRP suffix: empty on mainnet, `_preview`/`_preprod` on the testnets. The
+    /// unshielded, shielded, and dust HRPs share the `{base}{suffix}` shape.
+    fn hrp_suffix(self) -> &'static str {
         match self {
-            Self::Mainnet => "mn_addr",
-            Self::Preview => "mn_addr_preview",
-            Self::Preprod => "mn_addr_preprod",
+            Self::Mainnet => "",
+            Self::Preview => "_preview",
+            Self::Preprod => "_preprod",
         }
     }
 
-    fn shielded_hrp(self) -> &'static str {
-        match self {
-            Self::Mainnet => "mn_shield-addr",
-            Self::Preview => "mn_shield-addr_preview",
-            Self::Preprod => "mn_shield-addr_preprod",
-        }
+    fn unshielded_hrp(self) -> String {
+        format!("mn_addr{}", self.hrp_suffix())
     }
 
-    fn dust_hrp(self) -> &'static str {
-        match self {
-            Self::Mainnet => "mn_dust",
-            Self::Preview => "mn_dust_preview",
-            Self::Preprod => "mn_dust_preprod",
-        }
+    fn shielded_hrp(self) -> String {
+        format!("mn_shield-addr{}", self.hrp_suffix())
+    }
+
+    fn dust_hrp(self) -> String {
+        format!("mn_dust{}", self.hrp_suffix())
     }
 }
 
@@ -264,7 +262,7 @@ impl MidnightSigner {
         let dust_pk = BigUint::from_bytes_be(&be);
 
         let payload = scale_bigint_encode_biguint(&dust_pk)?;
-        Self::bech32m_encode(self.network.dust_hrp(), &payload)
+        Self::bech32m_encode(&self.network.dust_hrp(), &payload)
     }
 
     /// Derive all three Midnight addresses (unshielded / shielded / dust) from
@@ -274,11 +272,11 @@ impl MidnightSigner {
         Ok(MidnightAddresses {
             unshielded: self.derive_unshielded_address_with_hrp(
                 seeds.unshielded.expose(),
-                self.network.unshielded_hrp(),
+                &self.network.unshielded_hrp(),
             )?,
             shielded: self.derive_shielded_address_with_hrp(
                 seeds.shielded.expose(),
-                self.network.shielded_hrp(),
+                &self.network.shielded_hrp(),
             )?,
             dust: self.derive_dust_address_from_seed(seeds.dust.expose())?,
         })
@@ -322,7 +320,7 @@ impl ChainSigner for MidnightSigner {
         let seeds = Self::decode_keys(private_key)?;
         self.derive_unshielded_address_with_hrp(
             seeds.unshielded.expose(),
-            self.network.unshielded_hrp(),
+            &self.network.unshielded_hrp(),
         )
     }
 
