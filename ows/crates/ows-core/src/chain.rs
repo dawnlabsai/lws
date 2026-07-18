@@ -22,7 +22,7 @@ pub enum ChainType {
 }
 
 /// All supported chain families, used for universal wallet derivation.
-pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
+pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
     ChainType::Evm,
     ChainType::Solana,
     ChainType::Bitcoin,
@@ -35,6 +35,7 @@ pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
     ChainType::Xrpl,
     ChainType::Nano,
     ChainType::Near,
+    ChainType::Midnight,
 ];
 
 /// A specific chain (e.g. "ethereum", "arbitrum") with its family type and CAIP-2 ID.
@@ -692,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_all_chain_types() {
-        assert_eq!(ALL_CHAIN_TYPES.len(), 12);
+        assert_eq!(ALL_CHAIN_TYPES.len(), 13);
     }
 
     #[test]

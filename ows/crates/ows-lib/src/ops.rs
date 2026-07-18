@@ -116,6 +116,9 @@ fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, O
     let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
     for ct in &ALL_CHAIN_TYPES {
         let signer = signer_for_chain_type(*ct);
+        if !signer.supports_private_key_import() {
+            continue;
+        }
         let key = keys.key_for_curve(signer.curve());
         let address = signer.derive_address(key)?;
         let chain = default_chain_for_type(*ct);
@@ -1498,10 +1501,21 @@ mod tests {
         )
         .unwrap();
 
+        let importable = ALL_CHAIN_TYPES
+            .iter()
+            .filter(|ct| signer_for_chain_type(**ct).supports_private_key_import())
+            .count();
         assert_eq!(
             info.accounts.len(),
-            ALL_CHAIN_TYPES.len(),
-            "should have one account per chain type"
+            importable,
+            "one account per private-key-importable chain (Midnight is skipped)"
+        );
+        assert!(
+            !info
+                .accounts
+                .iter()
+                .any(|a| a.chain_id.starts_with("midnight:")),
+            "Midnight has no raw private-key import"
         );
 
         // Sign on EVM (secp256k1)
@@ -2227,6 +2241,25 @@ mod tests {
             OwsLibError::WalletNotFound(name) => assert_eq!(name, "del-me-char"),
             other => panic!("expected WalletNotFound, got: {other}"),
         }
+    }
+
+    #[test]
+    fn mnemonic_wallet_includes_midnight_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let info =
+            import_wallet_mnemonic("mn-midnight", phrase, None, None, Some(dir.path())).unwrap();
+
+        let midnight = info
+            .accounts
+            .iter()
+            .find(|a| a.chain_id == "midnight:mainnet")
+            .expect("mnemonic wallet should derive a Midnight account");
+        assert_eq!(
+            midnight.address,
+            "mn_addr1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qw3dyt6"
+        );
     }
 
     #[test]
