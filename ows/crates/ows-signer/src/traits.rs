@@ -29,6 +29,15 @@ pub trait ChainSigner: Send + Sync {
     /// The BIP-44 coin type for this chain.
     fn coin_type(&self) -> u32;
 
+    /// Whether a wallet imported from a single raw private key derives an account
+    /// for this chain. Defaults to `true`. Chains whose account only exists as a
+    /// mnemonic-derived key bundle (Midnight packs three role seeds into one
+    /// signing key) return `false`, so a bare imported key skips them rather than
+    /// failing the whole import.
+    fn supports_private_key_import(&self) -> bool {
+        true
+    }
+
     /// Derive an on-chain address from the key material produced by
     /// [`ChainSigner::encode_keys`] — the primary key for single-key chains, or
     /// the full encoded bundle for chains that bind several keys per account

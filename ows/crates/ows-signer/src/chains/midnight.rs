@@ -406,6 +406,14 @@ impl ChainSigner for MidnightSigner {
         Self::COIN_TYPE
     }
 
+    /// Midnight has no raw private-key import. Its account is the three role seeds
+    /// packed into an `MNK1` bundle, which only mnemonic derivation produces; a
+    /// single imported curve key cannot represent it. Universal-wallet import skips
+    /// Midnight rather than deriving a meaningless account from a bare key.
+    fn supports_private_key_import(&self) -> bool {
+        false
+    }
+
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError> {
         // Address derivation is routed through the multi-key bundle (`encode_keys` ->
         // `derive_address`), so `private_key` is the packed `MNK1` signing key. Decode it to
@@ -673,5 +681,12 @@ mod tests {
         );
         // The primary (first) path matches the single-key default for the same index.
         assert_eq!(paths[0], signer.default_derivation_path(0));
+    }
+
+    #[test]
+    fn midnight_opts_out_of_private_key_import() {
+        // A single raw curve key can't represent the three-seed MNK1 bundle, so
+        // universal-wallet import skips Midnight rather than deriving from a bare key.
+        assert!(!MidnightSigner::mainnet().supports_private_key_import());
     }
 }
