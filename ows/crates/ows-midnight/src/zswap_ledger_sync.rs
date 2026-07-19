@@ -14,11 +14,13 @@ use midnight_storage::db::InMemoryDB;
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::cache_io::SyncCacheScope;
+use super::cache_io::{self, SyncCacheScope};
 use super::indexer_ws::{self, IndexerWs};
 use super::midnight_env::{self, SyncStream};
+use super::shielded_sync_cache;
 use super::ShieldedBalances;
 
 const ZSWAP_LEDGER_SUB: &str = r#"
@@ -32,6 +34,10 @@ pub(super) fn token_type_hex(ci: &coin::Info) -> String {
     format!("0x{}", hex::encode(t.0))
 }
 
+/// Persist a progress snapshot every N applied events during a long replay, so a later run
+/// resumes near the tip even if this one is interrupted.
+const ZSWAP_SNAPSHOT_INTERVAL: u64 = 1000;
+
 pub(super) fn balances_from_owned_coins(
     owned: &BTreeMap<coin::Nullifier, coin::Info>,
 ) -> ShieldedBalances {
@@ -44,19 +50,50 @@ pub(super) fn balances_from_owned_coins(
 
 /// Zswap-ledger-events shielded balance fetch — VK-free path (Mode B).
 ///
-/// No caching: every call replays the entire zswap ledger from genesis. The
-/// disk-snapshot wiring lands in a follow-up.
+/// Resumes from this zswap key's disk snapshot (unspent owned coins + cursor) when present,
+/// otherwise replays from genesis; the synced coin set is persisted for the next run.
 pub(super) async fn fetch_balances(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
-    _scope: &SyncCacheScope,
+    scope: &SyncCacheScope,
+    seed_fp: &str,
 ) -> Result<ShieldedBalances, std::io::Error> {
-    let owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
-    let last_seen_id: i64 = -1;
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    let cache_path = shielded_sync_cache::snapshot_path(indexer_url, seed_fp, scope);
+
+    let mut owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
+    let mut last_seen_id: i64 = -1;
+    let mut max_id: Option<i64> = None;
+
+    // Resume only from a snapshot for this same indexer site, network, and zswap key.
+    let resumed = cache_path
+        .as_ref()
+        .and_then(|p| shielded_sync_cache::try_load_snapshot(p))
+        .filter(|snap| {
+            cache_io::snapshot_site_matches(scope, &snap.chain_id, &fp, &snap.indexer_fingerprint)
+                && snap.zswap_key_fingerprint == seed_fp
+        })
+        .and_then(|snap| {
+            let owned = shielded_sync_cache::decode_owned_coins(&snap.owned_coins).ok()?;
+            Some((owned, snap.last_seen_event_id, snap.max_id_when_saved))
+        });
+    if let Some((resumed_owned, last, saved_max)) = resumed {
+        owned = resumed_owned;
+        last_seen_id = last;
+        max_id = Some(saved_max);
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents: resuming from event id {} ({} unspent coins, saved tip {saved_max})",
+            resume_subscribe_id(last_seen_id),
+            owned.len()
+        );
+    } else {
+        eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
+    }
+
     let mut state = ZswapReplayState {
         owned,
         last_seen_id,
-        max_id: None,
+        max_id,
         n_events: 0,
         n_outputs_decrypted: 0,
         last_event_at: None,
@@ -67,15 +104,19 @@ pub(super) async fn fetch_balances(
         progress_interval: 1000,
         sync_started: Instant::now(),
     };
-
-    eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
+    let cache = cache_path.as_deref().map(|path| ZswapCache {
+        path,
+        scope,
+        fp: &fp,
+        key_fp: seed_fp,
+    });
 
     for attempt in 0..=3u32 {
         if attempt > 0 {
             eprintln!(
                 "[ows-midnight] zswapLedgerEvents: reconnecting (attempt {}) from event id {}",
                 attempt + 1,
-                state.last_seen_id.saturating_add(1)
+                resume_subscribe_id(state.last_seen_id)
             );
         }
 
@@ -85,7 +126,7 @@ pub(super) async fn fetch_balances(
             indexer_ws::connect_and_init(indexer_url, cfg.ws_idle, Some("zswapLedgerEvents"))
                 .await?;
 
-        let resume_id = state.last_seen_id.saturating_add(1);
+        let resume_id = resume_subscribe_id(state.last_seen_id);
         eprintln!(
             "[ows-midnight] zswapLedgerEvents: subscribed from event id {resume_id} (last_seen_id={})",
             state.last_seen_id
@@ -99,10 +140,14 @@ pub(super) async fn fetch_balances(
         .await?;
 
         let (dropped, attempt_events) =
-            replay_zswap_ws_loop(&mut ws, crypto_provider, &mut state, &cfg).await?;
+            replay_zswap_ws_loop(&mut ws, crypto_provider, &mut state, &cfg, cache.as_ref())
+                .await?;
 
         drop(ws);
 
+        if dropped {
+            save_zswap_snapshot(cache.as_ref(), &state);
+        }
         if !dropped && state.max_id.is_some_and(|m| state.last_seen_id >= m) {
             eprintln!(
                 "[ows-midnight] zswapLedgerEvents: caught up (last_seen_id={} max_id={})",
@@ -121,11 +166,14 @@ pub(super) async fn fetch_balances(
         if attempt_events == 0 && state.max_id.is_some_and(|m| state.last_seen_id >= m) {
             break;
         }
+        save_zswap_snapshot(cache.as_ref(), &state);
         return Err(std::io::Error::other(format!(
             "zswap ledger sync incomplete: last_seen_id={} max_id={:?}; try again",
             state.last_seen_id, state.max_id
         )));
     }
+
+    save_zswap_snapshot(cache.as_ref(), &state);
 
     let balances = balances_from_owned_coins(&state.owned);
 
@@ -155,6 +203,50 @@ struct ZswapReplayCfg {
     stall_timeout: Duration,
     progress_interval: u64,
     sync_started: Instant,
+}
+
+/// Where to persist the zswap replay snapshot, plus the keys that scope it.
+struct ZswapCache<'a> {
+    path: &'a Path,
+    scope: &'a SyncCacheScope,
+    fp: &'a str,
+    key_fp: &'a str,
+}
+
+/// Persist the unspent owned coins + cursor for the next run (best-effort; ignored when caching
+/// is disabled or serialization fails).
+fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState) {
+    let Some(cache) = cache else {
+        return;
+    };
+    let Ok(owned_coins) = shielded_sync_cache::encode_owned_coins(&state.owned) else {
+        return;
+    };
+    cache_io::try_save(
+        cache.path,
+        &shielded_sync_cache::ShieldedSyncSnapshot {
+            version: shielded_sync_cache::SNAPSHOT_VERSION,
+            indexer_fingerprint: cache.fp.to_string(),
+            chain_id: cache_io::snapshot_chain_id(cache.scope),
+            zswap_key_fingerprint: cache.key_fp.to_string(),
+            last_seen_event_id: state.last_seen_id,
+            max_id_when_saved: state
+                .max_id
+                .map(|m| m.max(state.last_seen_id))
+                .unwrap_or(state.last_seen_id),
+            owned_coins,
+        },
+    );
+}
+
+/// Subscribe id for resuming the zswap ledger subscription. The indexer treats `id` as an
+/// inclusive lower bound, so resuming from the last-seen event re-sends that event —
+/// carrying the live max id — instead of tailing silently past the tip when nothing new has
+/// happened. Re-applying it is a no-op (`apply_zswap_event` inserts/removes by nullifier).
+/// The unshielded sync resumes the same way (inclusive cursor + idempotent apply). Genesis
+/// (no cursor) starts at 0.
+fn resume_subscribe_id(last_seen_id: i64) -> i64 {
+    last_seen_id.max(0)
 }
 
 /// Decode one raw zswap ledger event and apply it to `owned` via the crypto provider: an owned
@@ -196,6 +288,7 @@ async fn replay_zswap_ws_loop(
     crypto_provider: &MidnightCryptoProvider,
     state: &mut ZswapReplayState,
     cfg: &ZswapReplayCfg,
+    cache: Option<&ZswapCache<'_>>,
 ) -> Result<(bool, u64), std::io::Error> {
     use tokio_tungstenite::tungstenite::Message;
 
@@ -205,6 +298,7 @@ async fn replay_zswap_ws_loop(
     loop {
         let stall_elapsed = state.last_event_at.unwrap_or(cfg.sync_started).elapsed();
         if stall_elapsed > cfg.stall_timeout {
+            save_zswap_snapshot(cache, state);
             return Err(std::io::Error::other(format!(
                 "no zswap ledger events for {}s (last_seen_id={} max_id={:?}); \
 indexer may be stalled",
@@ -297,6 +391,9 @@ indexer may be stalled",
                         state.last_seen_id, state.max_id, state.n_events, state.n_outputs_decrypted
                     );
                 }
+                if state.n_events.is_multiple_of(ZSWAP_SNAPSHOT_INTERVAL) {
+                    save_zswap_snapshot(cache, state);
+                }
 
                 if state.max_id.is_some_and(|m| state.last_seen_id >= m) {
                     dropped = false;
@@ -327,4 +424,19 @@ struct ZswapLedgerEventWire {
     raw: String,
     #[serde(rename = "maxId")]
     max_id: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_subscribe_id;
+
+    #[test]
+    fn resume_is_inclusive_of_last_seen_event() {
+        // Warm resume re-fetches the last-seen event (inclusive) so the indexer echoes it
+        // and reveals the live max id, instead of tailing past the tip from last_seen+1.
+        assert_eq!(resume_subscribe_id(84699), 84699);
+        // Genesis (no cursor, last_seen_id = -1) starts the replay at event 0.
+        assert_eq!(resume_subscribe_id(-1), 0);
+        assert_eq!(resume_subscribe_id(0), 0);
+    }
 }

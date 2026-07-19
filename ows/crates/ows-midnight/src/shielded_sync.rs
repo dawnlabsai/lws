@@ -16,5 +16,9 @@ pub async fn get_shielded_balances_for_display(
     crypto_provider: &MidnightCryptoProvider,
     scope: &SyncCacheScope,
 ) -> Result<ShieldedBalances, std::io::Error> {
-    zswap_ledger_sync::fetch_balances(indexer_url, crypto_provider, scope).await
+    let seed_fp = crypto_provider
+        .shielded_key_fingerprint()
+        .map(|fp| hex::encode(&fp[..16]))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    zswap_ledger_sync::fetch_balances(indexer_url, crypto_provider, scope, &seed_fp).await
 }

@@ -12,6 +12,7 @@ mod indexer_ws;
 mod ledger_params;
 mod midnight_env;
 mod shielded_sync;
+mod shielded_sync_cache;
 mod unshielded_sync;
 mod urls;
 mod wallet;
