@@ -6,6 +6,7 @@ use std::path::Path;
 use ows_core::Chain;
 use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner};
 
+use super::cache_io::SyncCacheScope;
 use super::dust_sync;
 use super::wallet::{resolve_indexer_url, sync_scope_for_wallet};
 use super::{
@@ -44,6 +45,7 @@ fn print_dust_status(
     indexer_url: &str,
     unshielded_utxos: &[UnshieldedUtxo],
     crypto_provider: Option<&MidnightCryptoProvider>,
+    sync_scope: &SyncCacheScope,
 ) -> Result<(), std::io::Error> {
     eprintln!("Dust status (fees):");
 
@@ -92,6 +94,7 @@ fn print_dust_status(
         indexer_url,
         provider,
         chain_time,
+        sync_scope,
     )) {
         Ok((dust_utxo_count, dust_sum)) => {
             eprintln!("  DUST UTXOs: {dust_utxo_count}");
@@ -162,7 +165,12 @@ pub fn print_fund_balance(
     // network activates dust automatically here — no code change when a new one (mainnet included)
     // turns it on.
     if block_on(dust_sync::dust_ledger_is_live(&indexer_url)) {
-        print_dust_status(&indexer_url, &unshielded_utxos, crypto_provider)?;
+        print_dust_status(
+            &indexer_url,
+            &unshielded_utxos,
+            crypto_provider,
+            &sync_scope,
+        )?;
     }
 
     Ok(())

@@ -17,15 +17,21 @@ use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
+use super::cache_io::{self, SyncCacheScope};
+use super::dust_sync_cache;
 use super::indexer_ws;
 use super::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
 
-/// Max reconnect attempts before a from-genesis dust replay gives up.
+/// Max reconnect attempts before a dust replay gives up.
 const DUST_SYNC_MAX_ATTEMPTS: u32 = 4;
 
 /// Read budget for the dust-liveness probe. A live indexer serves the first `dustLedgerEvents`
 /// frame right away, so the probe needs far less than the full-sync idle window.
 const DUST_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// Persist a progress snapshot every N applied events during a long replay, so a later run
+/// resumes near the tip even if this one is interrupted.
+const DUST_SNAPSHOT_INTERVAL: u64 = 1000;
 
 const DUST_LEDGER_SUB: &str = r#"
 subscription DustLedgerEvents($id: Int) {
@@ -78,27 +84,84 @@ indexer may be stalled",
     ))
 }
 
-/// Replay the dust ledger from genesis and return the synced local state.
+/// Persist the dust ledger state + cursor for the next run (best-effort; ignored when caching
+/// is disabled or serialization fails).
+#[allow(clippy::too_many_arguments)]
+fn save_dust_snapshot(
+    path: Option<&std::path::Path>,
+    scope: &SyncCacheScope,
+    fp: &str,
+    dust_pk_hex: &str,
+    state: &DustLocalState<InMemoryDB>,
+    last_seen_id: i64,
+    max_id: Option<i64>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(state_hex) = dust_sync_cache::encode_state(state) else {
+        return;
+    };
+    cache_io::try_save(
+        path,
+        &dust_sync_cache::DustSyncSnapshot {
+            version: dust_sync_cache::SNAPSHOT_VERSION,
+            indexer_fingerprint: fp.to_string(),
+            chain_id: cache_io::snapshot_chain_id(scope),
+            dust_public_key_hex: dust_pk_hex.to_string(),
+            last_seen_event_id: last_seen_id,
+            max_id_when_saved: max_id.map(|m| m.max(last_seen_id)).unwrap_or(last_seen_id),
+            state_hex,
+        },
+    );
+}
+
+/// Sync the dust ledger and return the local state: resume from this dust key's disk snapshot
+/// when present, otherwise replay from genesis. The synced state is persisted for the next run.
 async fn sync_dust_local_state(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
+    scope: &SyncCacheScope,
 ) -> Result<DustLocalState<InMemoryDB>, std::io::Error> {
     // Validate the provider yields a serializable dust public key before we open a socket.
     let dust_pk = crypto_provider
         .dust_public_key()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let _ = dust_public_key_hex(&dust_pk)?;
+    let dust_pk_hex = dust_public_key_hex(&dust_pk)?;
+    let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
+    let cache_path = dust_sync_cache::snapshot_path(indexer_url, &dust_pk_hex, scope);
 
     let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
+    let mut last_seen_id: i64 = -1;
+    let mut max_id: Option<i64> = None;
+
+    // Resume only from a snapshot for this same indexer site, network, and dust key.
+    let resumed = cache_path
+        .as_ref()
+        .and_then(|p| dust_sync_cache::try_load_snapshot(p))
+        .filter(|snap| {
+            cache_io::snapshot_site_matches(scope, &snap.chain_id, &fp, &snap.indexer_fingerprint)
+                && snap.dust_public_key_hex == dust_pk_hex
+        })
+        .and_then(|snap| {
+            let st = dust_sync_cache::decode_state(&snap.state_hex).ok()?;
+            Some((st, snap.last_seen_event_id, snap.max_id_when_saved))
+        });
+    if let Some((st, last, saved_max)) = resumed {
+        state = st;
+        last_seen_id = last;
+        max_id = Some(saved_max);
+        eprintln!(
+            "[ows-midnight] dust sync: resuming from event id {last_seen_id} (saved tip {saved_max})"
+        );
+    } else {
+        eprintln!("[ows-midnight] dust sync: replaying from genesis");
+    }
+
     let ws_idle = ws_idle_timeout(SyncStream::Dust);
     let stall_timeout = stall_timeout(SyncStream::Dust);
     let sync_started = Instant::now();
     let mut last_applied_at: Option<Instant> = None;
-
-    eprintln!("[ows-midnight] dust sync: replaying from genesis");
-
-    let mut max_id: Option<i64> = None;
-    let mut last_seen_id: i64 = -1;
     let mut n_events: u64 = 0;
 
     for attempt in 0..DUST_SYNC_MAX_ATTEMPTS {
@@ -116,6 +179,15 @@ async fn sync_dust_local_state(
         let dropped;
         loop {
             if last_applied_at.unwrap_or(sync_started).elapsed() > stall_timeout {
+                save_dust_snapshot(
+                    cache_path.as_deref(),
+                    scope,
+                    &fp,
+                    &dust_pk_hex,
+                    &state,
+                    last_seen_id,
+                    max_id,
+                );
                 if dust_at_chain_tip(last_seen_id, max_id) {
                     return Ok(state);
                 }
@@ -195,6 +267,17 @@ async fn sync_dust_local_state(
                             "[ows-midnight] dust sync progress: last_seen_id={last_seen_id} max_id={max_id:?} events_applied={n_events}"
                         );
                     }
+                    if n_events.is_multiple_of(DUST_SNAPSHOT_INTERVAL) {
+                        save_dust_snapshot(
+                            cache_path.as_deref(),
+                            scope,
+                            &fp,
+                            &dust_pk_hex,
+                            &state,
+                            last_seen_id,
+                            max_id,
+                        );
+                    }
 
                     if max_id.is_some_and(|m| last_seen_id >= m) {
                         dropped = false;
@@ -214,6 +297,17 @@ async fn sync_dust_local_state(
 
         drop(ws);
 
+        if dropped {
+            save_dust_snapshot(
+                cache_path.as_deref(),
+                scope,
+                &fp,
+                &dust_pk_hex,
+                &state,
+                last_seen_id,
+                max_id,
+            );
+        }
         if !dropped && dust_at_chain_tip(last_seen_id, max_id) {
             break;
         }
@@ -235,17 +329,28 @@ async fn sync_dust_local_state(
         )));
     }
 
+    save_dust_snapshot(
+        cache_path.as_deref(),
+        scope,
+        &fp,
+        &dust_pk_hex,
+        &state,
+        last_seen_id,
+        max_id,
+    );
     Ok(state)
 }
 
-/// DUST balance for `ows fund balance` — replays the dust ledger from genesis and applies the
-/// ledger decay rules at `dust_ctime_unix_secs`. Returns `(utxo_count, summed_specks)`.
+/// DUST balance for `ows fund balance` — resumes the dust ledger from this dust key's disk
+/// snapshot when present, otherwise replays from genesis, then applies the ledger decay rules
+/// at `dust_ctime_unix_secs`. Returns `(utxo_count, summed_specks)`.
 pub async fn get_dust_balance_for_display(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
     dust_ctime_unix_secs: u64,
+    scope: &SyncCacheScope,
 ) -> Result<(usize, u128), std::io::Error> {
-    let st = sync_dust_local_state(indexer_url, crypto_provider).await?;
+    let st = sync_dust_local_state(indexer_url, crypto_provider, scope).await?;
     Ok(dust_balance_from_state(&st, dust_ctime_unix_secs))
 }
 

@@ -3,6 +3,7 @@
 mod async_runtime;
 mod cache_io;
 mod dust_sync;
+mod dust_sync_cache;
 mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
