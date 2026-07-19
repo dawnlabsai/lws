@@ -4,20 +4,47 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ows_core::Chain;
-use ows_signer::chains::MidnightSigner;
+use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner};
 
 use super::wallet::{resolve_indexer_url, sync_scope_for_wallet};
 use super::{block_on, get_unshielded_utxos_for_display};
 
-/// Indexer-backed unshielded balance display for `ows fund balance --chain midnight:*`.
+/// Print the wallet's Midnight addresses: unshielded always, shielded/dust only when the
+/// crypto provider is available (no passphrase, or a raw imported key, leaves them out).
+fn print_addresses(
+    network: &MidnightNetwork,
+    unshielded_address: &str,
+    crypto_provider: Option<&MidnightCryptoProvider>,
+) -> Result<(), std::io::Error> {
+    eprintln!("Addresses:");
+    eprintln!("  Unshielded: {unshielded_address}");
+
+    if let Some(provider) = crypto_provider {
+        let addrs = provider
+            .addresses(network)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        eprintln!("  Shielded:   {}", addrs.shielded);
+        eprintln!("  Dust:       {}", addrs.dust);
+    } else {
+        eprintln!("  Shielded:   (unavailable)");
+        eprintln!("  Dust:       (unavailable)");
+    }
+    eprintln!();
+    Ok(())
+}
+
+/// Indexer-backed balance display for `ows fund balance --chain midnight:*`.
 ///
-/// The stored unshielded address is re-encoded for the target network's bech32 HRP,
-/// then the current UTXO set is fetched from the Midnight indexer and summed per token.
+/// The stored unshielded address is re-encoded for the target network's bech32 HRP and its
+/// UTXO set is summed per token. The optional `crypto_provider` (built by the caller from the
+/// owner passphrase) additionally derives the shielded/dust addresses; a raw imported key whose
+/// bytes carry no packed Midnight roles yields no provider and is treated the same as no key.
 pub fn print_fund_balance(
     wallet_id: &str,
     stored_unshielded_address: &str,
     chain: &Chain,
     vault_path: Option<&Path>,
+    crypto_provider: Option<&MidnightCryptoProvider>,
 ) -> Result<(), std::io::Error> {
     let chain_id = chain.chain_id;
     let address = MidnightSigner::from_chain_id(chain_id)
@@ -40,8 +67,12 @@ pub fn print_fund_balance(
         *unshielded.entry(u.token_type.clone()).or_insert(0) += u.value;
     }
 
-    eprintln!("Address: {address}");
-    eprintln!();
+    print_addresses(
+        &MidnightNetwork::from_chain_id(chain_id),
+        &address,
+        crypto_provider,
+    )?;
+
     if unshielded.is_empty() {
         eprintln!("No Midnight unshielded tokens found for {address} on {chain_id}");
         return Ok(());
