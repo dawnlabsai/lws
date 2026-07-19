@@ -1,11 +1,13 @@
 //! Midnight wallet helpers used by the balance-display path: indexer URL and
 //! sync-cache scope resolution.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use ows_core::Config;
 
 use super::cache_io::SyncCacheScope;
+use super::unshielded_sync::UnshieldedUtxo;
 
 fn invalid_input(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
@@ -37,4 +39,13 @@ pub fn sync_scope_for_wallet(
         scope = scope.with_chain_id(cid);
     }
     scope
+}
+
+/// Sum unshielded UTXO values per token type.
+pub fn sum_utxos_by_token(utxos: &[UnshieldedUtxo]) -> BTreeMap<String, u128> {
+    let mut totals: BTreeMap<String, u128> = BTreeMap::new();
+    for u in utxos {
+        *totals.entry(u.token_type.clone()).or_insert(0) += u.value;
+    }
+    totals
 }

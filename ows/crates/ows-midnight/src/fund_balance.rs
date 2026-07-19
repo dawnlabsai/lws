@@ -1,6 +1,5 @@
-//! `ows fund balance --chain midnight:*` display (unshielded balances + dust fee status).
+//! `ows fund balance --chain midnight:*` display (unshielded + shielded balances, dust fee status).
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use ows_core::Chain;
@@ -8,10 +7,10 @@ use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner
 
 use super::cache_io::SyncCacheScope;
 use super::dust_sync;
-use super::wallet::{resolve_indexer_url, sync_scope_for_wallet};
+use super::wallet::{resolve_indexer_url, sum_utxos_by_token, sync_scope_for_wallet};
 use super::{
-    block_on, format_dust_specks, get_dust_balance_for_display, get_unshielded_utxos_for_display,
-    parse_token_type, UnshieldedUtxo,
+    block_on, format_dust_specks, get_dust_balance_for_display, get_shielded_balances_for_display,
+    get_unshielded_utxos_for_display, parse_token_type, ShieldedBalances, UnshieldedUtxo,
 };
 
 /// Print the wallet's Midnight addresses: unshielded always, shielded/dust only when the
@@ -138,10 +137,21 @@ pub fn print_fund_balance(
     ))
     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let mut unshielded: BTreeMap<String, u128> = BTreeMap::new();
-    for u in &unshielded_utxos {
-        *unshielded.entry(u.token_type.clone()).or_insert(0) += u.value;
-    }
+    let unshielded = sum_utxos_by_token(&unshielded_utxos);
+
+    let shielded = if let Some(provider) = crypto_provider {
+        eprintln!(
+            "[ows-midnight] syncing shielded balance from indexer (may take a while on first run)…"
+        );
+        block_on(get_shielded_balances_for_display(
+            &indexer_url,
+            provider,
+            &sync_scope,
+        ))
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    } else {
+        ShieldedBalances::default()
+    };
 
     print_addresses(
         &MidnightNetwork::from_chain_id(chain_id),
@@ -156,6 +166,18 @@ pub fn print_fund_balance(
         eprintln!("Unshielded balances:");
         for (token_type, amount) in unshielded {
             println!("{amount:>24} {token_type}");
+        }
+        eprintln!();
+    }
+
+    if crypto_provider.is_some() {
+        eprintln!("Shielded balances:");
+        if shielded.is_empty() {
+            eprintln!("  (none — no unspent shielded coins found after full sync)");
+        } else {
+            for (token_type, amount) in shielded {
+                println!("{amount:>24} {token_type}");
+            }
         }
         eprintln!();
     }
