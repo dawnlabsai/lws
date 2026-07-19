@@ -1,7 +1,8 @@
-//! Midnight integration — unshielded indexer sync + `ows fund balance`.
+//! Midnight integration — unshielded + dust indexer sync + `ows fund balance`.
 
 mod async_runtime;
 mod cache_io;
+mod dust_sync;
 mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
@@ -11,6 +12,7 @@ mod urls;
 mod wallet;
 
 pub use async_runtime::block_on;
+pub use dust_sync::{format_dust_specks, get_dust_balance_for_display};
 pub use fund_balance::print_fund_balance;
 pub use ledger_params::fetch_indexer_ledger_parameters;
 pub use unshielded_sync::{get_unshielded_utxos_for_display, UnshieldedUtxo};

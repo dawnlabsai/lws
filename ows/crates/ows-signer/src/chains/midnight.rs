@@ -1,7 +1,8 @@
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
-use midnight_ledger::dust::{DustPublicKey, DustSecretKey};
+use midnight_ledger::dust::{DustLocalState, DustPublicKey, DustSecretKey};
 use midnight_serialize::{ScaleBigInt, Serializable};
+use midnight_storage::db::InMemoryDB;
 use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
 use num_bigint::BigUint;
 use sha2::Digest;
@@ -486,6 +487,18 @@ impl MidnightCryptoProvider {
     /// Public key for the dust (registration/fee) role derived from the dust secret key.
     pub fn dust_public_key(&self) -> Result<DustPublicKey, SignerError> {
         Ok(DustPublicKey::from(self.dust_sk.clone()))
+    }
+
+    /// Fold one decoded dust ledger event into the dust wallet state. The dust secret key stays
+    /// inside the provider; the caller receives the updated state.
+    pub fn fold_dust(
+        &self,
+        state: DustLocalState<InMemoryDB>,
+        ev: &midnight_ledger::events::Event<InMemoryDB>,
+    ) -> Result<DustLocalState<InMemoryDB>, SignerError> {
+        state
+            .replay_events(&self.dust_sk, std::iter::once(ev))
+            .map_err(|e| SignerError::SigningFailed(format!("replay dust event failed: {e:?}")))
     }
 
     /// A 32-byte fingerprint of the shielded seed — the first 32 bytes of SHA-256(seed). Stable
