@@ -2,10 +2,11 @@
 
 use std::time::Duration;
 
-/// Indexer sync stream. Extended with Shielded as that balance type lands.
+/// Indexer sync stream (unshielded / shielded / dust).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStream {
     Unshielded,
+    Shielded,
     Dust,
 }
 

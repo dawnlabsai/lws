@@ -133,11 +133,12 @@ pub fn balance(wallet_name: &str, chain: Option<&str>) -> Result<(), CliError> {
                     .ok()
             });
 
+            let config = ows_core::Config::load_or_default();
             return Ok(ows_midnight::print_fund_balance(
                 &wallet.id,
                 &account.address,
                 &parsed,
-                None,
+                Some(config.vault_path.as_path()),
                 crypto_provider.as_ref(),
             )?);
         }
