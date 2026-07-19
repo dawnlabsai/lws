@@ -85,9 +85,9 @@ Midnight is not limited to these three networks: **any `midnight:<network>` chai
 
 ### Midnight indexer sync (OWS)
 
-`ows fund balance --chain midnight:*` and unsealed transaction signing replay indexer state (unshielded UTXOs, shielded balances, DUST ledger on Preview/Preprod). OWS caches snapshots under `{vault}/sync/midnight/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
+`ows fund balance --chain midnight:*` replays indexer state (unshielded UTXOs, shielded balances, and the DUST fee ledger on any network whose dust ledger is live — detected at run time by probing the indexer, so mainnet lights up automatically once its dust ledger is active). OWS caches snapshots under `{vault}/chains/midnight/cache/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
 
-Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`, etc.) and node RPC (`rpc["midnight:preview:node"]`, etc.). Useful environment variables are documented on [`cache_io`](../../ows/crates/ows-lib/src/chains/midnight/cache_io.rs) in `ows-lib` (`OWS_MIDNIGHT_SYNC_CACHE`, `OWS_MIDNIGHT_SNAPSHOT_MAX_AGE_SECS`, `OWS_MIDNIGHT_SYNC_LOG`, …).
+Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`, etc.); the WebSocket URL is derived from it. The relevant environment variable (`OWS_MIDNIGHT_SYNC_CACHE`) and the full output are documented in [`midnight/fund-balance.md`](./midnight/fund-balance.md); the disk-cache layout lives on [`cache_io`](../../ows/crates/ows-midnight/src/cache_io.rs) in `ows-midnight`.
 
 Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
