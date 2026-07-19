@@ -7,6 +7,7 @@ use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner
 
 use super::cache_io::SyncCacheScope;
 use super::dust_sync;
+use super::tip_verify;
 use super::wallet::{resolve_indexer_url, sum_utxos_by_token, sync_scope_for_wallet};
 use super::{
     block_on, format_dust_specks, get_dust_balance_for_display, get_shielded_balances_for_display,
@@ -45,6 +46,7 @@ fn print_dust_status(
     unshielded_utxos: &[UnshieldedUtxo],
     crypto_provider: Option<&MidnightCryptoProvider>,
     sync_scope: &SyncCacheScope,
+    current_block_height: Option<i64>,
 ) -> Result<(), std::io::Error> {
     eprintln!("Dust status (fees):");
 
@@ -94,6 +96,7 @@ fn print_dust_status(
         provider,
         chain_time,
         sync_scope,
+        current_block_height,
     )) {
         Ok((dust_utxo_count, dust_sum)) => {
             eprintln!("  DUST UTXOs: {dust_utxo_count}");
@@ -129,6 +132,10 @@ pub fn print_fund_balance(
     let indexer_url = resolve_indexer_url(chain_id)?;
     let sync_scope = sync_scope_for_wallet(wallet_id, Some(chain_id), vault_path);
 
+    // One HTTP block-height read gates the snapshot fast-path for the shielded and dust streams
+    // (unshielded UTXOs are fetched fresh each call, so they don't consume it).
+    let current_block_height = tip_verify::fetch_current_block_height(&indexer_url);
+
     eprintln!("[ows-midnight] syncing unshielded balance from indexer…");
     let unshielded_utxos = block_on(get_unshielded_utxos_for_display(
         &indexer_url,
@@ -147,6 +154,7 @@ pub fn print_fund_balance(
             &indexer_url,
             provider,
             &sync_scope,
+            current_block_height,
         ))
         .map_err(|e| std::io::Error::other(e.to_string()))?
     } else {
@@ -192,6 +200,7 @@ pub fn print_fund_balance(
             &unshielded_utxos,
             crypto_provider,
             &sync_scope,
+            current_block_height,
         )?;
     }
 

@@ -28,6 +28,9 @@ pub(super) struct DustSyncSnapshot {
     pub last_seen_event_id: i64,
     /// Chain tip `maxId` when saved; lets a resume at the saved tip settle without new events.
     pub max_id_when_saved: i64,
+    /// Indexer block height when the snapshot was written; gates the HTTP-tip fast path.
+    #[serde(default)]
+    pub block_height_when_saved: i64,
     /// Tagged-serialized `DustLocalState<InMemoryDB>`.
     pub state_hex: String,
 }

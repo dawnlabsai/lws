@@ -28,6 +28,9 @@ pub(super) struct ShieldedSyncSnapshot {
     pub last_seen_event_id: i64,
     /// Chain tip `maxId` when saved; lets a resume at the saved tip settle without new events.
     pub max_id_when_saved: i64,
+    /// Indexer block height when the snapshot was written; gates the HTTP-tip fast path.
+    #[serde(default)]
+    pub block_height_when_saved: i64,
     /// Unspent owned coins after the replay — source state, not a balance.
     pub owned_coins: Vec<ZswapOwnedCoinRecord>,
 }

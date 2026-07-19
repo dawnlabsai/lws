@@ -49,6 +49,16 @@ struct IndexerGraphqlResp<T> {
     errors: Option<Vec<serde_json::Value>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IndexerBlockHeightData {
+    height: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexerBlockHeightResp {
+    block: Option<IndexerBlockHeightData>,
+}
+
 static INDEXER_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Shared HTTP client for Midnight indexer GraphQL (bounded request timeout).
@@ -117,6 +127,51 @@ pub async fn fetch_indexer_tip_with_client(
     )
     .map_err(|e| std::io::Error::other(format!("failed to decode ledger parameters: {e}")))?;
     Ok((ledger_parameters, timestamp_secs))
+}
+
+/// Current indexer chain-tip block height (HTTP `block { height }`).
+pub async fn fetch_indexer_block_height(indexer_url: &str) -> Result<i64, std::io::Error> {
+    fetch_indexer_block_height_with_client(indexer_http_client(), indexer_url).await
+}
+
+pub async fn fetch_indexer_block_height_with_client(
+    client: &reqwest::Client,
+    indexer_url: &str,
+) -> Result<i64, std::io::Error> {
+    let q = r#"query BlockHeight($offset: BlockOffset) { block(offset: $offset) { height } }"#;
+    let resp = client
+        .post(indexer_url)
+        .json(&serde_json::json!({
+            "query": q,
+            "variables": { "offset": null }
+        }))
+        .send()
+        .await
+        .map_err(|e| std::io::Error::other(format!("indexer query failed: {e}")))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| std::io::Error::other(format!("indexer read body failed: {e}")))?;
+    if !status.is_success() {
+        return Err(std::io::Error::other(format!(
+            "indexer returned {status}: {body}"
+        )));
+    }
+
+    let parsed: IndexerGraphqlResp<IndexerBlockHeightResp> = serde_json::from_str(&body)
+        .map_err(|e| std::io::Error::other(format!("invalid indexer json: {e}")))?;
+    if let Some(errs) = parsed.errors {
+        return Err(std::io::Error::other(format!(
+            "indexer GraphQL error: {errs:?}"
+        )));
+    }
+    parsed
+        .data
+        .and_then(|d| d.block)
+        .map(|b| b.height)
+        .ok_or_else(|| std::io::Error::other("indexer did not return block"))
 }
 
 pub async fn fetch_indexer_ledger_parameters(

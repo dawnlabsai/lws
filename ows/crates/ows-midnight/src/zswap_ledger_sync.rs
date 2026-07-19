@@ -57,6 +57,7 @@ pub(super) async fn fetch_balances(
     crypto_provider: &MidnightCryptoProvider,
     scope: &SyncCacheScope,
     seed_fp: &str,
+    current_block_height: Option<i64>,
 ) -> Result<ShieldedBalances, std::io::Error> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
     let cache_path = shielded_sync_cache::snapshot_path(indexer_url, seed_fp, scope);
@@ -64,6 +65,7 @@ pub(super) async fn fetch_balances(
     let mut owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
     let mut last_seen_id: i64 = -1;
     let mut max_id: Option<i64> = None;
+    let mut saved_block_height: i64 = 0;
 
     // Resume only from a snapshot for this same indexer site, network, and zswap key.
     let resumed = cache_path
@@ -75,12 +77,18 @@ pub(super) async fn fetch_balances(
         })
         .and_then(|snap| {
             let owned = shielded_sync_cache::decode_owned_coins(&snap.owned_coins).ok()?;
-            Some((owned, snap.last_seen_event_id, snap.max_id_when_saved))
+            Some((
+                owned,
+                snap.last_seen_event_id,
+                snap.max_id_when_saved,
+                snap.block_height_when_saved,
+            ))
         });
-    if let Some((resumed_owned, last, saved_max)) = resumed {
+    if let Some((resumed_owned, last, saved_max, saved_height)) = resumed {
         owned = resumed_owned;
         last_seen_id = last;
         max_id = Some(saved_max);
+        saved_block_height = saved_height;
         eprintln!(
             "[ows-midnight] zswapLedgerEvents: resuming from event id {} ({} unspent coins, saved tip {saved_max})",
             resume_subscribe_id(last_seen_id),
@@ -88,6 +96,20 @@ pub(super) async fn fetch_balances(
         );
     } else {
         eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
+    }
+
+    // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
+    // already reflects the live tip — skip the WebSocket catch-up entirely.
+    let snapshot_complete = max_id.is_some_and(|m| m > 0 && last_seen_id >= m);
+    if super::tip_verify::snapshot_fresh_by_http_tip(
+        current_block_height,
+        saved_block_height,
+        snapshot_complete,
+    ) {
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"
+        );
+        return Ok(balances_from_owned_coins(&owned));
     }
 
     let mut state = ZswapReplayState {
@@ -109,6 +131,7 @@ pub(super) async fn fetch_balances(
         scope,
         fp: &fp,
         key_fp: seed_fp,
+        block_height: current_block_height.unwrap_or(0),
     });
 
     for attempt in 0..=3u32 {
@@ -211,6 +234,9 @@ struct ZswapCache<'a> {
     scope: &'a SyncCacheScope,
     fp: &'a str,
     key_fp: &'a str,
+    /// Indexer HTTP tip height observed at sync start; stamped onto saved snapshots so a
+    /// later run can skip the WebSocket catch-up when the tip is unchanged.
+    block_height: i64,
 }
 
 /// Persist the unspent owned coins + cursor for the next run (best-effort; ignored when caching
@@ -234,6 +260,7 @@ fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState)
                 .max_id
                 .map(|m| m.max(state.last_seen_id))
                 .unwrap_or(state.last_seen_id),
+            block_height_when_saved: cache.block_height,
             owned_coins,
         },
     );

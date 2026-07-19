@@ -95,6 +95,7 @@ fn save_dust_snapshot(
     state: &DustLocalState<InMemoryDB>,
     last_seen_id: i64,
     max_id: Option<i64>,
+    block_height: i64,
 ) {
     let Some(path) = path else {
         return;
@@ -111,6 +112,7 @@ fn save_dust_snapshot(
             dust_public_key_hex: dust_pk_hex.to_string(),
             last_seen_event_id: last_seen_id,
             max_id_when_saved: max_id.map(|m| m.max(last_seen_id)).unwrap_or(last_seen_id),
+            block_height_when_saved: block_height,
             state_hex,
         },
     );
@@ -122,6 +124,7 @@ async fn sync_dust_local_state(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
     scope: &SyncCacheScope,
+    current_block_height: Option<i64>,
 ) -> Result<DustLocalState<InMemoryDB>, std::io::Error> {
     // Validate the provider yields a serializable dust public key before we open a socket.
     let dust_pk = crypto_provider
@@ -134,6 +137,7 @@ async fn sync_dust_local_state(
     let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
     let mut last_seen_id: i64 = -1;
     let mut max_id: Option<i64> = None;
+    let mut saved_block_height: i64 = 0;
 
     // Resume only from a snapshot for this same indexer site, network, and dust key.
     let resumed = cache_path
@@ -145,12 +149,18 @@ async fn sync_dust_local_state(
         })
         .and_then(|snap| {
             let st = dust_sync_cache::decode_state(&snap.state_hex).ok()?;
-            Some((st, snap.last_seen_event_id, snap.max_id_when_saved))
+            Some((
+                st,
+                snap.last_seen_event_id,
+                snap.max_id_when_saved,
+                snap.block_height_when_saved,
+            ))
         });
-    if let Some((st, last, saved_max)) = resumed {
+    if let Some((st, last, saved_max, saved_height)) = resumed {
         state = st;
         last_seen_id = last;
         max_id = Some(saved_max);
+        saved_block_height = saved_height;
         eprintln!(
             "[ows-midnight] dust sync: resuming from event id {last_seen_id} (saved tip {saved_max})"
         );
@@ -158,6 +168,21 @@ async fn sync_dust_local_state(
         eprintln!("[ows-midnight] dust sync: replaying from genesis");
     }
 
+    // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
+    // already reflects the live tip — skip the WebSocket catch-up entirely.
+    let snapshot_complete = dust_at_chain_tip(last_seen_id, max_id);
+    if super::tip_verify::snapshot_fresh_by_http_tip(
+        current_block_height,
+        saved_block_height,
+        snapshot_complete,
+    ) {
+        eprintln!(
+            "[ows-midnight] dust sync: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"
+        );
+        return Ok(state);
+    }
+
+    let snapshot_block_height = current_block_height.unwrap_or(0);
     let ws_idle = ws_idle_timeout(SyncStream::Dust);
     let stall_timeout = stall_timeout(SyncStream::Dust);
     let sync_started = Instant::now();
@@ -187,6 +212,7 @@ async fn sync_dust_local_state(
                     &state,
                     last_seen_id,
                     max_id,
+                    snapshot_block_height,
                 );
                 if dust_at_chain_tip(last_seen_id, max_id) {
                     return Ok(state);
@@ -276,6 +302,7 @@ async fn sync_dust_local_state(
                             &state,
                             last_seen_id,
                             max_id,
+                            snapshot_block_height,
                         );
                     }
 
@@ -306,6 +333,7 @@ async fn sync_dust_local_state(
                 &state,
                 last_seen_id,
                 max_id,
+                snapshot_block_height,
             );
         }
         if !dropped && dust_at_chain_tip(last_seen_id, max_id) {
@@ -337,6 +365,7 @@ async fn sync_dust_local_state(
         &state,
         last_seen_id,
         max_id,
+        snapshot_block_height,
     );
     Ok(state)
 }
@@ -349,8 +378,10 @@ pub async fn get_dust_balance_for_display(
     crypto_provider: &MidnightCryptoProvider,
     dust_ctime_unix_secs: u64,
     scope: &SyncCacheScope,
+    current_block_height: Option<i64>,
 ) -> Result<(usize, u128), std::io::Error> {
-    let st = sync_dust_local_state(indexer_url, crypto_provider, scope).await?;
+    let st =
+        sync_dust_local_state(indexer_url, crypto_provider, scope, current_block_height).await?;
     Ok(dust_balance_from_state(&st, dust_ctime_unix_secs))
 }
 
