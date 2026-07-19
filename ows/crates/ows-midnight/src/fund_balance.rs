@@ -5,7 +5,6 @@ use std::path::Path;
 use ows_core::Chain;
 use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner};
 
-use super::cache_io::SyncCacheScope;
 use super::dust_sync;
 use super::tip_verify;
 use super::wallet::{resolve_indexer_url, sum_utxos_by_token, sync_scope_for_wallet};
@@ -38,15 +37,25 @@ fn print_addresses(
     Ok(())
 }
 
-/// Print DUST fee status: the NIGHT-UTXO registration summary (derived from the public
-/// unshielded UTXOs, so always available) and, when the dust seed is available, the synced
-/// DUST balance. Without the seed the balance reports as unavailable rather than failing.
+/// How the dust ledger is handled for this run, decided before the concurrent sync so the dust
+/// replay can join the other streams.
+enum DustPlan {
+    /// This chain shows no dust-fee section.
+    Skip,
+    /// Dust section shown, but no crypto provider is available to sync.
+    NoProvider,
+    /// Sync the dust ledger with the available crypto provider.
+    Sync,
+}
+
+/// Print DUST fee status: the NIGHT-UTXO registration summary (derived from the public unshielded
+/// UTXOs, so always available) and the synced DUST balance when the crypto provider was available.
+/// The dust ledger is synced by the caller alongside the other streams; `dust_balance` carries its
+/// result.
 fn print_dust_status(
-    indexer_url: &str,
     unshielded_utxos: &[UnshieldedUtxo],
-    crypto_provider: Option<&MidnightCryptoProvider>,
-    sync_scope: &SyncCacheScope,
-    current_block_height: Option<i64>,
+    dust_plan: &DustPlan,
+    dust_balance: Option<Result<(usize, u128), std::io::Error>>,
 ) -> Result<(), std::io::Error> {
     eprintln!("Dust status (fees):");
 
@@ -79,33 +88,25 @@ fn print_dust_status(
         }
     }
 
-    let Some(provider) = crypto_provider else {
-        eprintln!("  DUST seed: unavailable (can't sync dust ledger state)");
-        eprintln!();
-        return Ok(());
-    };
-
-    eprintln!("  DUST seed: available");
-    eprintln!("  Syncing DUST ledger (replaying from genesis; progress below)...");
-    let chain_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    match block_on(get_dust_balance_for_display(
-        indexer_url,
-        provider,
-        chain_time,
-        sync_scope,
-        current_block_height,
-    )) {
-        Ok((dust_utxo_count, dust_sum)) => {
-            eprintln!("  DUST UTXOs: {dust_utxo_count}");
-            eprintln!(
-                "  DUST balance: {} (best-effort, wall-clock time)",
-                format_dust_specks(dust_sum)
-            );
+    match dust_plan {
+        DustPlan::NoProvider => {
+            eprintln!("  DUST seed: unavailable (can't sync dust ledger state)")
         }
-        Err(e) => eprintln!("  DUST: unavailable ({e})"),
+        DustPlan::Sync => {
+            eprintln!("  DUST seed: available");
+            match dust_balance {
+                Some(Ok((dust_utxo_count, dust_sum))) => {
+                    eprintln!("  DUST UTXOs: {dust_utxo_count}");
+                    eprintln!(
+                        "  DUST balance: {} (best-effort, wall-clock time)",
+                        format_dust_specks(dust_sum)
+                    );
+                }
+                Some(Err(e)) => eprintln!("  DUST: unavailable ({e})"),
+                None => {}
+            }
+        }
+        DustPlan::Skip => {}
     }
     eprintln!();
     Ok(())
@@ -136,30 +137,63 @@ pub fn print_fund_balance(
     // (unshielded UTXOs are fetched fresh each call, so they don't consume it).
     let current_block_height = tip_verify::fetch_current_block_height(&indexer_url);
 
-    eprintln!("[ows-midnight] syncing unshielded balance from indexer…");
-    let unshielded_utxos = block_on(get_unshielded_utxos_for_display(
-        &indexer_url,
-        &address,
-        &sync_scope,
-    ))
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    let unshielded = sum_utxos_by_token(&unshielded_utxos);
-
-    let shielded = if let Some(provider) = crypto_provider {
-        eprintln!(
-            "[ows-midnight] syncing shielded balance from indexer (may take a while on first run)…"
-        );
-        block_on(get_shielded_balances_for_display(
-            &indexer_url,
-            provider,
-            &sync_scope,
-            current_block_height,
-        ))
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+    // Whether to show and sync the dust-fee section is a runtime property of the network, not its
+    // name: probe the indexer's dust ledger and treat dust as applicable only when its stream
+    // reports a live tip. A network activates dust automatically here — no code change when a new
+    // one (mainnet included) turns it on.
+    let needs_dust = block_on(dust_sync::dust_ledger_is_live(&indexer_url));
+    let dust_plan = if !needs_dust {
+        DustPlan::Skip
+    } else if crypto_provider.is_some() {
+        DustPlan::Sync
     } else {
-        ShieldedBalances::default()
+        DustPlan::NoProvider
     };
+    let dust_chain_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // The three balance streams are independent (separate indexer subscriptions and caches), so
+    // sync them concurrently; the wall-clock cost is the slowest stream rather than their sum.
+    eprintln!("[ows-midnight] syncing balances from indexer (may take a while on first run)…");
+    let (unshielded_res, shielded_res, dust_balance) = block_on(async {
+        let unshielded_fut = get_unshielded_utxos_for_display(&indexer_url, &address, &sync_scope);
+        let shielded_fut = async {
+            match crypto_provider {
+                Some(provider) => {
+                    get_shielded_balances_for_display(
+                        &indexer_url,
+                        provider,
+                        &sync_scope,
+                        current_block_height,
+                    )
+                    .await
+                }
+                None => Ok(ShieldedBalances::default()),
+            }
+        };
+        let dust_fut = async {
+            match (&dust_plan, crypto_provider) {
+                (DustPlan::Sync, Some(provider)) => Some(
+                    get_dust_balance_for_display(
+                        &indexer_url,
+                        provider,
+                        dust_chain_time,
+                        &sync_scope,
+                        current_block_height,
+                    )
+                    .await,
+                ),
+                _ => None,
+            }
+        };
+        tokio::join!(unshielded_fut, shielded_fut, dust_fut)
+    });
+
+    let unshielded_utxos = unshielded_res.map_err(|e| std::io::Error::other(e.to_string()))?;
+    let shielded = shielded_res.map_err(|e| std::io::Error::other(e.to_string()))?;
+    let unshielded = sum_utxos_by_token(&unshielded_utxos);
 
     print_addresses(
         &MidnightNetwork::from_chain_id(chain_id),
@@ -190,18 +224,8 @@ pub fn print_fund_balance(
         eprintln!();
     }
 
-    // Whether to show the dust-fee section is a runtime property of the network, not its name:
-    // probe the indexer's dust ledger and show dust only when its stream reports a live tip. A
-    // network activates dust automatically here — no code change when a new one (mainnet included)
-    // turns it on.
-    if block_on(dust_sync::dust_ledger_is_live(&indexer_url)) {
-        print_dust_status(
-            &indexer_url,
-            &unshielded_utxos,
-            crypto_provider,
-            &sync_scope,
-            current_block_height,
-        )?;
+    if needs_dust {
+        print_dust_status(&unshielded_utxos, &dust_plan, dust_balance)?;
     }
 
     Ok(())
