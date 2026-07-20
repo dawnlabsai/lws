@@ -3,9 +3,11 @@ use k256::schnorr::SigningKey;
 use midnight_coin_structure::coin;
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{DustLocalState, DustPublicKey, DustSecretKey};
+use midnight_ledger::semantics::ZswapLocalStateExt as _;
 use midnight_serialize::{ScaleBigInt, Serializable};
 use midnight_storage::db::InMemoryDB;
 use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
+use midnight_zswap::local::State as ZswapLocalState;
 use num_bigint::BigUint;
 use sha2::Digest;
 
@@ -522,6 +524,19 @@ impl MidnightCryptoProvider {
             &self.shielded_keys.coin_secret_key,
         )));
         Some((nul, ci))
+    }
+
+    /// Fold one decoded zswap ledger event into the shielded wallet state, building the full
+    /// spendable `ZswapLocalState` (commitment Merkle tree + qualified coins). The coin detection
+    /// (spending key) stays inside the provider; the caller receives the updated state.
+    pub fn fold_shielded(
+        &self,
+        state: ZswapLocalState<InMemoryDB>,
+        ev: &midnight_ledger::events::Event<InMemoryDB>,
+    ) -> Result<ZswapLocalState<InMemoryDB>, SignerError> {
+        state
+            .replay_events(&self.shielded_keys, std::iter::once(ev))
+            .map_err(|e| SignerError::SigningFailed(format!("replay zswap event failed: {e:?}")))
     }
 }
 
