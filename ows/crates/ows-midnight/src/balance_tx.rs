@@ -38,7 +38,7 @@ use ows_signer::chains::{
     DustSpendPlan, MidnightCryptoProvider, MidnightNetwork, ShieldedSpendPlan,
 };
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::{Proof as ZswapProof, ProvingProvider as _};
+use transient_crypto::proofs::Proof as ZswapProof;
 
 use ows_core::sync_cache::SyncCacheScope;
 
@@ -466,25 +466,23 @@ fn attach_shielded_inputs(
         return Ok(stx);
     }
 
-    let (preimages, binding_delta) = crypto_provider
-        .build_preimage_shielded_offers(&plans, &tree)
+    // The signer builds the proof-preimage spend witnesses from its held shielded keys and proves each
+    // fragment; only the proven offers cross back, so no key material reaches the balancer.
+    let prover = midnight_prover_for_scope(scope)?;
+    let authorized = crate::block_on(crypto_provider.authorize_shielded(&plans, &tree, prover))
         .map_err(|e| err(e.to_string()))?;
 
-    let mut prover = midnight_prover_for_scope(scope)?;
     let mut merged: ZswapOffer<ZswapProof, InMemoryDB> = offer_sp.deref().clone();
-    for (segment, preimage) in preimages {
-        let (_segment, proven_partial) =
-            crate::block_on(preimage.prove(prover.split(), segment))
-                .map_err(|e| err(format!("prove shielded inputs failed: {e:?}")))?;
+    for (_segment, proven) in &authorized.proven {
         merged = merged
-            .merge(&proven_partial)
+            .merge(proven)
             .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
     }
 
     let mut stx = stx;
     stx.guaranteed_coins = Some(Sp::new(merged));
     // Proven txs cannot call `recompute_binding_randomness`; add the spend/change randomness directly.
-    stx.binding_randomness = stx.binding_randomness + binding_delta;
+    stx.binding_randomness = stx.binding_randomness + authorized.binding_delta;
     Ok(stx)
 }
 

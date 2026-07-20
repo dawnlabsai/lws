@@ -30,7 +30,7 @@ use rand::SeedableRng as _;
 use sha2::Digest;
 use std::ops::Deref as _;
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::{ProofPreimage, ProvingProvider};
+use transient_crypto::proofs::{Proof as ZswapProof, ProofPreimage, ProvingProvider};
 
 use crate::curve::Curve;
 use crate::hd::DerivedKey;
@@ -476,6 +476,13 @@ pub struct ShieldedSpendPlan {
     pub change: Vec<(ShieldedTokenType, u128)>,
 }
 
+/// The proven shielded fragments the balancer merges into the transaction's guaranteed offer, plus the
+/// summed Pedersen binding randomness to add to the transaction (a proven tx can't recompute its own).
+pub struct ShieldedAuthorized {
+    pub proven: Vec<(u16, ZswapOffer<ZswapProof, InMemoryDB>)>,
+    pub binding_delta: PedersenRandomness,
+}
+
 /// Proof-preimage shielded offers built by [`MidnightCryptoProvider::build_preimage_shielded_offers`]:
 /// one offer per segment (tagged by segment id) plus the summed Pedersen binding-randomness delta.
 type ShieldedPreimages = (
@@ -657,6 +664,36 @@ impl MidnightCryptoProvider {
         }
 
         Ok((preimages, binding_delta))
+    }
+
+    /// Authorize the wallet's shielded inputs. For each segment, builds the proof-preimage spend
+    /// witnesses (the authorizing key operation) using the already-held `shielded_keys` and the
+    /// self-change against the synced `tree`, then proves the fragment. The bearer preimage is
+    /// born and consumed here — only the proven `Offer` leaves — so this must run **after** any
+    /// policy check.
+    ///
+    /// `async` because proving is; the caller drives it with its own executor. Each segment's
+    /// proof draws from an independent RNG via `prover.split()` — cloning the prover would duplicate
+    /// its RNG state and correlate the segments' proof randomness.
+    pub async fn authorize_shielded<P: ProvingProvider>(
+        &self,
+        segments: &[ShieldedSpendPlan],
+        tree: &ZswapLocalState<InMemoryDB>,
+        mut prover: P,
+    ) -> Result<ShieldedAuthorized, SignerError> {
+        let (preimages, binding_delta) = self.build_preimage_shielded_offers(segments, tree)?;
+        let mut proven = Vec::with_capacity(preimages.len());
+        for (segment, preimage) in preimages {
+            let (_segment, proven_offer) =
+                preimage.prove(prover.split(), segment).await.map_err(|e| {
+                    SignerError::SigningFailed(format!("prove shielded inputs failed: {e:?}"))
+                })?;
+            proven.push((segment, proven_offer));
+        }
+        Ok(ShieldedAuthorized {
+            proven,
+            binding_delta,
+        })
     }
 
     /// Build proof-preimage dust spends sufficient to cover `fee_dust`. Offline — no proving, no
