@@ -7,21 +7,46 @@
 //! balancing tail: `authorize` builds the maker's inputs + outputs, proves them, and returns the
 //! signable bytes for the downstream sign/seal.
 //!
-//! Scope: unshielded inputs (with change back to the maker) and unshielded/shielded outputs. Shielded
-//! inputs are rejected for now — their whole-coin spend + change semantics in a cross-token swap need to
-//! be pinned against the connector swap spec first.
+//! Scope: unshielded and shielded inputs (whole coins, with change back to the maker) and
+//! unshielded/shielded outputs. The maker declares how much of a token it contributes; the wallet spends
+//! whole coins covering that amount and returns the excess as change to the maker — so a shielded input
+//! contributes exactly its declared value regardless of what token the offer wants back. The shielded
+//! spend witnesses are built and proved in the signer ([`MidnightCryptoProvider::authorize_shielded`])
+//! and the proved fragment is merged into the proved maker frame, so the bearer preimage never leaves the
+//! signer.
+//!
+//! Both the shielded and unshielded legs ride the transaction's **guaranteed section** (segment 0),
+//! and — unlike `makeTransfer` — a swap keeps its NIGHT there rather than steering it to a fallible
+//! segment. The ledger balances value **per segment**: every `(token, segment)` cell must net on its
+//! own (a negative cell is `BalanceCheckOverspend`), and two parties' intents cannot share a segment
+//! (`IntentSegmentIdCollision`). A swap is inherently cross-party, so the maker's unshielded spend and
+//! the taker's unshielded receipt can only meet — and net — in segment 0, the one intent-free shared
+//! section; steered to a fallible segment they would land in different segments and overspend.
+//! (`makeTransfer` *can* ride a fallible segment precisely because it is single-party self-funded and
+//! nets within its own segment.) Only a pure shielded↔shielded swap could anchor a fallible segment —
+//! its zswap legs pool in `fallible_coins` — but that saves nothing (only the guaranteed *unshielded*
+//! offer loads the segment-0 `time_to_dismiss` budget) and weakens the swap's all-or-nothing atomicity,
+//! so makeIntent keeps every leg guaranteed. The maker's intent still keys at a fallible segment
+//! (`intentSegment`); only the coins settle guaranteed. See [`GUARANTEED_SEGMENT`].
+
+use std::collections::BTreeMap;
+use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
-use midnight_coin_structure::coin::Info as CoinInfo;
+use midnight_coin_structure::coin::{Info as CoinInfo, QualifiedInfo, ShieldedTokenType};
 use midnight_ledger::structure::{
-    Intent, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput,
-    UtxoSpend,
+    Intent, ProofMarker, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer,
+    UtxoOutput, UtxoSpend,
 };
+use midnight_serialize::tagged_serialize;
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::{Offer as ZswapOffer, Output as ZswapOutput};
-use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner};
+use ows_core::sync_cache::SyncCacheScope;
+use ows_signer::chains::{
+    MidnightCryptoProvider, MidnightNetwork, MidnightSigner, ShieldedSpendPlan,
+};
 use rand::rngs::OsRng;
 use rand::Rng as _;
 use serde::Deserialize;
@@ -30,13 +55,20 @@ use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
     decode_shielded_recipient, decode_unshielded_recipient, deserialize_u128, err, far_future_ttl,
-    prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
-    PreimageTx, TransferKind,
+    prove_preimage, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
+    DesiredOutput, PreimageTx, TransferKind,
 };
 use crate::parse_token_type;
 
 /// The connector convention default when a request omits `intentSegment`.
 const DEFAULT_INTENT_SEGMENT: u16 = 1;
+
+/// Segment 0 is the transaction's guaranteed section. A swap offer's shielded coins ride it — like
+/// `makeTransfer` and `mip6` place theirs — so both legs of the swap sit in **one** segment. The ledger
+/// applies each segment atomically (a segment-0 failure reverts the whole tx; a fallible segment fails
+/// alone), so a swap split across the guaranteed and a fallible section could settle one leg and drop
+/// the other. The intent itself still keys at a fallible segment (`intentSegment`); only the coins move.
+const GUARANTEED_SEGMENT: u16 = 0;
 
 /// One input the maker contributes: a `value` of `token_type` in `kind`'s domain (no recipient — the
 /// maker spends its own coins).
@@ -107,23 +139,14 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
 }
 
 /// Build the maker's imbalanced offer, prove it, and return the signable bytes. Runs **after** the
-/// policy seam. No balancing: the imbalance is the offer.
+/// policy seam. No balancing: the imbalance is the offer. When the maker contributes shielded inputs,
+/// the frame (unshielded offer + shielded outputs) is proved first, then the signer builds and proves
+/// the shielded spend witnesses and the proved fragment is merged in.
 pub(super) fn authorize(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     req: MakeIntentRequest,
 ) -> Result<Vec<u8>, std::io::Error> {
-    let preimage = build_make_intent_preimage(chain_id, crypto_provider, &req)?;
-    prove_to_unsealed_bytes(chain_id, preimage)
-}
-
-/// Construct the single-segment `proof-preimage` maker offer: the maker's unshielded inputs (with change
-/// back to the maker) + unshielded/shielded outputs, deliberately imbalanced.
-fn build_make_intent_preimage(
-    chain_id: &str,
-    crypto_provider: &MidnightCryptoProvider,
-    req: &MakeIntentRequest,
-) -> Result<PreimageTx, std::io::Error> {
     let signer = MidnightSigner::from_chain_id(chain_id);
 
     let (unshielded_in, shielded_in): (Vec<_>, Vec<_>) = req
@@ -135,12 +158,58 @@ fn build_make_intent_preimage(
         .iter()
         .partition(|d| d.kind == TransferKind::Unshielded);
 
-    if !shielded_in.is_empty() {
-        return Err(err(
-            "makeIntent shielded inputs are not yet supported; contribute unshielded inputs",
-        ));
+    let frame = build_make_intent_frame(
+        chain_id,
+        &signer,
+        crypto_provider,
+        req.intent_segment,
+        &unshielded_in,
+        &unshielded_out,
+        &shielded_out,
+        !shielded_in.is_empty(),
+    )?;
+
+    // No shielded inputs: the frame is the whole maker offer; prove and return it.
+    if shielded_in.is_empty() {
+        return prove_to_unsealed_bytes(chain_id, frame);
     }
 
+    // Shielded inputs: prove the frame, then have the signer build + prove the maker's shielded spend
+    // witnesses (the bearer preimage is born and consumed there) and merge the proved fragment in.
+    let proven = prove_preimage(chain_id, frame)?;
+    let Transaction::Standard(mut base) = proven else {
+        return Err(err("makeIntent frame is not a Standard transaction"));
+    };
+    authorize_shielded_inputs(
+        chain_id,
+        crypto_provider,
+        GUARANTEED_SEGMENT,
+        &shielded_in,
+        &mut base,
+    )?;
+
+    let mut out = Vec::new();
+    tagged_serialize(&Transaction::Standard(base), &mut out)
+        .map_err(|e| err(format!("serialize proven tx: {e}")))?;
+    Ok(out)
+}
+
+/// Construct the `proof-preimage` maker frame: the maker's unshielded inputs (with change back to the
+/// maker) + unshielded/shielded outputs, deliberately imbalanced. The intent keys at `segment`
+/// (`intentSegment`), but the shielded outputs ride the guaranteed section (see [`GUARANTEED_SEGMENT`]).
+/// Shielded *inputs* are authorized separately, after proving, so `has_shielded_in` keeps the empty-offer
+/// guard from firing when the maker's only contribution is shielded inputs.
+#[allow(clippy::too_many_arguments)]
+fn build_make_intent_frame(
+    chain_id: &str,
+    signer: &MidnightSigner,
+    crypto_provider: &MidnightCryptoProvider,
+    segment: u16,
+    unshielded_in: &[&DesiredInput],
+    unshielded_out: &[&DesiredOutput],
+    shielded_out: &[&DesiredOutput],
+    has_shielded_in: bool,
+) -> Result<PreimageTx, std::io::Error> {
     let sender_vk = crypto_provider
         .unshielded_verifying_key()
         .map_err(|e| err(e.to_string()))?;
@@ -150,14 +219,14 @@ fn build_make_intent_preimage(
         .unshielded;
     let unshielded_offer = build_unshielded_offer(
         chain_id,
-        &signer,
+        signer,
         &sender_addr,
         &sender_vk,
-        &unshielded_in,
-        &unshielded_out,
+        unshielded_in,
+        unshielded_out,
     )?;
-    let zswap_offer = build_shielded_output_offer(&signer, req.intent_segment, &shielded_out)?;
-    if unshielded_offer.is_none() && zswap_offer.is_none() {
+    let zswap_offer = build_shielded_output_offer(signer, GUARANTEED_SEGMENT, shielded_out)?;
+    if unshielded_offer.is_none() && zswap_offer.is_none() && !has_shielded_in {
         return Err(err("makeIntent produced no offer"));
     }
 
@@ -170,9 +239,8 @@ fn build_make_intent_preimage(
         ttl: far_future_ttl(),
         binding_commitment: rng.r#gen(),
     };
-    let intents: MnHashMap<u16, _, InMemoryDB> =
-        MnHashMap::new().insert(req.intent_segment, intent);
-    let (guaranteed_coins, fallible_coins) = place_zswap_offer(req.intent_segment, zswap_offer);
+    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(segment, intent);
+    let (guaranteed_coins, fallible_coins) = place_zswap_offer(GUARANTEED_SEGMENT, zswap_offer);
     let mut stx = StandardTransaction {
         network_id: signer.ledger_network_id().to_string(),
         intents,
@@ -182,6 +250,75 @@ fn build_make_intent_preimage(
     };
     stx.recompute_binding_randomness();
     Ok(Transaction::Standard(stx))
+}
+
+/// Authorize the maker's shielded inputs into the already-proved frame: sync the wallet, select whole
+/// coins covering each token's declared amount, and hand them to [`MidnightCryptoProvider::authorize_shielded`],
+/// which builds + proves the spend witnesses and the self-change, both in the guaranteed section (see
+/// [`GUARANTEED_SEGMENT`]). The proved fragment is merged into `base`'s guaranteed coins and its Pedersen
+/// binding delta folded in (a proved tx can't recompute its own).
+fn authorize_shielded_inputs(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    segment: u16,
+    shielded_in: &[&DesiredInput],
+    base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> Result<(), std::io::Error> {
+    let deficits = shielded_input_deficits(shielded_in)?;
+
+    let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
+    let scope = SyncCacheScope {
+        chain_id: Some(chain_id.to_string()),
+        ..Default::default()
+    };
+    let block_height = crate::tip_verify::fetch_current_block_height(&indexer_url);
+    let synced = crate::block_on(crate::wallet_sync::shielded::sync_wallet(
+        &indexer_url,
+        crypto_provider,
+        &scope,
+        block_height,
+    ))?;
+    let mut tree = synced.zswap;
+    crate::wallet_sync::shielded::ensure_shielded_merkle_ready(&mut tree)?;
+
+    let coins: Vec<QualifiedInfo> = tree.coins.iter().map(|(_nul, qci)| *qci.deref()).collect();
+    let selection = crate::balance_tx::plan_shielded_inputs(&coins, &deficits)?;
+    let plan = ShieldedSpendPlan {
+        segment,
+        coins: selection.coins,
+        change: selection.change_by_token,
+    };
+
+    let prover = crate::balance_tx::midnight_prover(chain_id)?;
+    let authorized = crate::block_on(crypto_provider.authorize_shielded(
+        std::slice::from_ref(&plan),
+        &tree,
+        prover,
+    ))
+    .map_err(|e| err(e.to_string()))?;
+
+    for (seg, proven_offer) in &authorized.proven {
+        crate::balance_tx::place_shielded_fragment(base, *seg, proven_offer)?;
+    }
+    base.binding_randomness = base.binding_randomness + authorized.binding_delta;
+    Ok(())
+}
+
+/// Aggregate the declared shielded inputs into one whole-coin deficit per token (summing repeats), so a
+/// token's coins are selected once and the change is `selected total − declared total`.
+fn shielded_input_deficits(
+    inputs: &[&DesiredInput],
+) -> Result<Vec<(ShieldedTokenType, u128)>, std::io::Error> {
+    let mut by_token: BTreeMap<ShieldedTokenType, u128> = BTreeMap::new();
+    for d in inputs {
+        if d.value == 0 {
+            return Err(err("desired input value must be greater than zero"));
+        }
+        let token = wire_type_to_shielded(&d.token_type)?;
+        let entry = by_token.entry(token).or_insert(0);
+        *entry = entry.saturating_add(d.value);
+    }
+    Ok(by_token.into_iter().collect())
 }
 
 /// Route the shielded offer to the segment its outputs were bound to: segment 0 → the guaranteed offer;
@@ -343,5 +480,41 @@ mod tests {
     #[test]
     fn rejects_empty_request() {
         assert!(parse_make_intent_json(r#"{"desiredInputs":[],"desiredOutputs":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parses_shielded_inputs() {
+        let req = parse_make_intent_json(
+            r#"{"desiredInputs":[{"kind":"shielded","type":"night","value":"100"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.desired_inputs.len(), 1);
+        assert_eq!(req.desired_inputs[0].kind, TransferKind::Shielded);
+    }
+
+    fn shielded_input(value: u128) -> DesiredInput {
+        DesiredInput {
+            kind: TransferKind::Shielded,
+            token_type: "night".into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn aggregates_repeated_shielded_inputs_of_one_token() {
+        let a = shielded_input(100);
+        let b = shielded_input(50);
+        let deficits = shielded_input_deficits(&[&a, &b]).expect("aggregate");
+        assert_eq!(deficits.len(), 1, "the same token collapses to one deficit");
+        assert_eq!(
+            deficits[0].1, 150,
+            "declared amounts sum, so coins are selected once"
+        );
+    }
+
+    #[test]
+    fn shielded_input_deficits_rejects_zero_value() {
+        let z = shielded_input(0);
+        assert!(shielded_input_deficits(&[&z]).is_err());
     }
 }

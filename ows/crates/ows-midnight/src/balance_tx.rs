@@ -203,7 +203,7 @@ fn tx_balance_imbalances(tx: &TxProven) -> Result<Vec<String>, std::io::Error> {
 /// `well_formed` verifies the guaranteed offer at a hardcoded segment 0 and each fallible offer at its
 /// map-key segment, and `balance()` attributes deltas the same way — so a seg-N>=1 fragment in the
 /// guaranteed offer would fail proof verification and leave the seg-N deficit uncovered.
-fn place_shielded_fragment(
+pub(crate) fn place_shielded_fragment(
     base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     segment: u16,
     proven: &ZswapOffer<ZswapProof, InMemoryDB>,
@@ -491,16 +491,16 @@ fn guaranteed_outputs_of(
 /// it is not a bearer instrument; the authorizing `spend()` happens later, in the signer's
 /// [`MidnightCryptoProvider::authorize_shielded`], after the policy seam.
 #[derive(Debug, Clone)]
-struct SegmentPlan {
-    coins: Vec<QualifiedInfo>,
-    change_by_token: Vec<(ShieldedTokenType, u128)>,
+pub(crate) struct SegmentPlan {
+    pub(crate) coins: Vec<QualifiedInfo>,
+    pub(crate) change_by_token: Vec<(ShieldedTokenType, u128)>,
 }
 
 /// Choose which of the wallet's coins to spend to cover each per-token `deficit` — whole coins,
 /// largest-first — and size the self-change (selected total − deficit) per token. Pure over the synced
 /// coin set: it neither spends nor proves, so it needs no spend key (only the viewing/nullifier
 /// detection that produced `coins`). Errors when a token's coins cannot cover its deficit.
-fn plan_shielded_inputs(
+pub(crate) fn plan_shielded_inputs(
     coins: &[QualifiedInfo],
     deficits: &[(ShieldedTokenType, u128)],
 ) -> Result<SegmentPlan, std::io::Error> {
@@ -653,7 +653,7 @@ struct FallibleNightDeficit {
 /// Build the local [`Prover`](crate::Prover) for a chain's vault-rooted proving-key directory.
 /// Keyless: the prover holds proving/verifier keys, never a wallet secret. A fresh one is built per
 /// authorized section so their proving randomness is independent.
-fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
+pub(crate) fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
     let scope = SyncCacheScope {
         chain_id: Some(chain_id.to_string()),
         ..Default::default()
