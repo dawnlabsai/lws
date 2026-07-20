@@ -5,10 +5,14 @@ use midnight_base_crypto::signatures::{
 };
 use midnight_coin_structure::coin;
 use midnight_coin_structure::transfer;
-use midnight_ledger::dust::{DustLocalState, DustPublicKey, DustSecretKey};
+use midnight_ledger::dust::{
+    DustActions, DustLocalState, DustPublicKey, DustRegistration, DustSecretKey,
+};
 use midnight_ledger::semantics::ZswapLocalStateExt as _;
 use midnight_ledger::structure::{Intent, ProofMarker, StandardTransaction, Transaction};
-use midnight_serialize::{tagged_deserialize, tagged_serialize, ScaleBigInt, Serializable};
+use midnight_serialize::{
+    tagged_deserialize, tagged_serialize, Deserializable, ScaleBigInt, Serializable,
+};
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
@@ -597,38 +601,42 @@ fn parse_single_intent_standard(
     Ok((stx, seg_id, intent))
 }
 
-/// Reject a tx carrying dust registrations — signing them (`reg.signature`) is out of scope for the
-/// unshielded-only path, and the balancer never produces one.
-fn reject_dust_registrations(intent: &IntentProvenUnsealed) -> Result<(), SignerError> {
-    if intent
-        .dust_actions
-        .as_ref()
-        .is_some_and(|da| !da.registrations.is_empty())
-    {
-        return Err(SignerError::InvalidTransaction(
-            "dust registration signing is not supported".into(),
-        ));
+/// Count the intent's dust registrations — the signature-based generationless fee-payment path the
+/// wallet adds. Dust *spends* carry ZK proofs (they need a prover) and are rejected here, so only
+/// registrations remain to sign.
+fn dust_registration_count(intent: &IntentProvenUnsealed) -> Result<usize, SignerError> {
+    match intent.dust_actions.as_ref() {
+        None => Ok(0),
+        Some(da) => {
+            let da = da.deref();
+            if !da.spends.is_empty() {
+                return Err(SignerError::InvalidTransaction(
+                    "dust spend signing requires proving, which is unsupported".into(),
+                ));
+            }
+            Ok(da.registrations.len())
+        }
     }
-    Ok(())
 }
 
 /// Sign the unshielded intent of a balanced proven (`proof,embedded-fr`) Midnight Standard
 /// transaction with the wallet's Night key. The dapp has already proven the contract calls / zswap
-/// offers, so this is pure key work — one signature per guaranteed unshielded input over the
-/// intent's signing message — with no proving, no seal, and no network. The signatures are returned
-/// tagged-serialized in input order; [`seal_signed_proven`] reattaches and seals them.
+/// offers, so this is pure key work — one signature per guaranteed unshielded input and one per dust
+/// fee registration, all over the intent's signing message — with no proving, no seal, and no
+/// network. The signatures are returned tagged-serialized in that order (inputs, then registrations);
+/// [`seal_signed_proven`] reattaches and seals them.
 fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
     let (_stx, seg_id, intent) = parse_single_intent_standard(tx_bytes)?;
-    reject_dust_registrations(&intent)?;
+    let n_regs = dust_registration_count(&intent)?;
 
     let seeds = MidnightSigner::decode_keys(private_key)?;
     let signing_key = MidnightSigningKey::from_bytes(seeds.unshielded.expose()).map_err(|e| {
         SignerError::InvalidPrivateKey(format!("invalid midnight signing key: {e}"))
     })?;
+    let vk = signing_key.verifying_key();
 
     // Every guaranteed unshielded input must be owned by the signing key — the ledger appends one
     // signature per guaranteed input, each verified against that input's owner.
-    let vk = signing_key.verifying_key();
     let inputs = intent.guaranteed_inputs();
     for inp in &inputs {
         if inp.owner != vk {
@@ -637,9 +645,20 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
             ));
         }
     }
+    // Each dust fee registration is likewise keyed to (and signed by) the wallet's Night key.
+    if let Some(da) = intent.dust_actions.as_ref() {
+        for reg in da.deref().registrations.iter() {
+            if reg.night_key != vk {
+                return Err(SignerError::SigningFailed(
+                    "dust fee registration must be owned by the signing key".into(),
+                ));
+            }
+        }
+    }
 
     // The signing message is the proof- and signature-erased intent — computable without the key,
-    // and identical for every input in the segment (this is what `Intent::sign` signs internally).
+    // and identical for every input and registration in the segment (this is what `Intent::sign`
+    // signs internally).
     let data = intent
         .erase_proofs()
         .erase_signatures()
@@ -647,9 +666,12 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
 
     let mut rng = OsRng;
     let mut out = Vec::new();
-    for _ in 0..inputs.len() {
+    for _ in 0..(inputs.len() + n_regs) {
         let sig = signing_key.sign(&mut rng, &data);
-        tagged_serialize(&sig, &mut out)
+        // Plain (untagged) serialization: tagged_deserialize insists on consuming the whole buffer,
+        // so it can't read a concatenation of signatures back one at a time — `seal_signed_proven`
+        // reads exactly `inputs + registrations` of them.
+        sig.serialize(&mut out)
             .map_err(|e| SignerError::SigningFailed(format!("serialize signature: {e}")))?;
     }
     Ok(out)
@@ -659,22 +681,44 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
 /// Keyless: `add_signatures` and `.seal()` take no key, only an RNG. Returns the sealed tx bytes.
 fn seal_signed_proven(tx_bytes: &[u8], signatures: &[u8]) -> Result<Vec<u8>, SignerError> {
     let (stx, seg_id, mut intent) = parse_single_intent_standard(tx_bytes)?;
-    reject_dust_registrations(&intent)?;
+    let n_regs = dust_registration_count(&intent)?;
 
     let n_inputs = intent.guaranteed_inputs().len();
     let mut r: &[u8] = signatures;
-    let mut sigs: Vec<MnSignature> = Vec::with_capacity(n_inputs);
-    for _ in 0..n_inputs {
+    let mut sigs: Vec<MnSignature> = Vec::with_capacity(n_inputs + n_regs);
+    for _ in 0..(n_inputs + n_regs) {
         sigs.push(
-            tagged_deserialize(&mut r)
+            MnSignature::deserialize(&mut r, 0)
                 .map_err(|e| SignerError::InvalidTransaction(format!("parse signature: {e}")))?,
         );
     }
+    // Signatures are ordered inputs-then-registrations, matching `sign_proven_intent`.
+    let (input_sigs, reg_sigs) = sigs.split_at(n_inputs);
 
     if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
         let mut offer = offer_sp.deref().clone();
-        offer.add_signatures(sigs);
+        offer.add_signatures(input_sigs.to_vec());
         intent.guaranteed_unshielded_offer = Some(Sp::new(offer));
+    }
+
+    // Attach one signature to each dust fee registration, in order.
+    if let Some(da_sp) = intent.dust_actions.as_ref() {
+        let da = da_sp.deref().clone();
+        let registrations: Vec<DustRegistration<MnSignature, InMemoryDB>> = da
+            .registrations
+            .iter()
+            .zip(reg_sigs)
+            .map(|(reg, sig)| {
+                let mut reg = (*reg).clone();
+                reg.signature = Some(Sp::new(sig.clone()));
+                reg
+            })
+            .collect();
+        intent.dust_actions = Some(Sp::new(DustActions {
+            spends: da.spends.clone(),
+            registrations: registrations.into(),
+            ctime: da.ctime,
+        }));
     }
 
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent);

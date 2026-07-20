@@ -396,6 +396,7 @@ mod tests {
     use midnight_base_crypto::hash::HashOutput;
     use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
     use midnight_base_crypto::time::Timestamp;
+    use midnight_ledger::dust::{DustActions, DustPublicKey, DustRegistration, DustSecretKey};
     use midnight_ledger::structure::IntentHash;
     use ows_signer::chains::MidnightSigner;
     use ows_signer::traits::ChainSigner;
@@ -419,11 +420,31 @@ mod tests {
         SecretBytes::new(blob)
     }
 
+    /// A generationless dust fee registration owned by `vk` — the signature-based (no-proof) fee
+    /// path. `dust_address` is arbitrary here; sign/seal don't inspect it.
+    fn dust_fee_registration(vk: &VerifyingKey) -> DustActions<MnSig, ProofMarker, InMemoryDB> {
+        let dust_pk = DustPublicKey::from(DustSecretKey::derive_secret_key(&[0x22u8; 32]));
+        DustActions {
+            spends: vec![].into(),
+            registrations: vec![DustRegistration {
+                night_key: vk.clone(),
+                dust_address: Some(Sp::new(dust_pk)),
+                allow_fee_payment: 100_000,
+                signature: None,
+            }]
+            .into(),
+            ctime: Timestamp::from_secs(0),
+        }
+    }
+
     /// Build a minimal proven (`proof,embedded-fr`) unsealed Standard tx: one guaranteed unshielded
-    /// NIGHT input owned by `vk` plus a matching output, no contract calls / shielded coins / dust.
-    /// Structurally what the balancer emits, so it exercises sign → reattach → seal without a prover
-    /// or indexer.
-    fn build_proven_unshielded_tx(vk: &VerifyingKey) -> Vec<u8> {
+    /// NIGHT input owned by `vk` plus a matching output, no contract calls / shielded coins, and the
+    /// given optional dust actions. Structurally what the balancer emits, so it exercises sign →
+    /// reattach → seal without a prover or indexer.
+    fn build_proven_unshielded_tx(
+        vk: &VerifyingKey,
+        dust_actions: Option<DustActions<MnSig, ProofMarker, InMemoryDB>>,
+    ) -> Vec<u8> {
         let input = UtxoSpend {
             value: 1_000_000,
             owner: vk.clone(),
@@ -445,7 +466,7 @@ mod tests {
             guaranteed_unshielded_offer: Some(Sp::new(offer)),
             fallible_unshielded_offer: None,
             actions: vec![].into(),
-            dust_actions: None,
+            dust_actions: dust_actions.map(Sp::new),
             ttl: Timestamp::from_secs(0),
             binding_commitment: Default::default(),
         };
@@ -470,7 +491,7 @@ mod tests {
         let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
             .unwrap()
             .verifying_key();
-        let tx_bytes = build_proven_unshielded_tx(&vk);
+        let tx_bytes = build_proven_unshielded_tx(&vk, None);
 
         // Sign: one detached signature over the intent's signing message, no seal.
         let out = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
@@ -491,7 +512,7 @@ mod tests {
             .erase_proofs()
             .erase_signatures()
             .data_to_sign(seg_id);
-        let sig: MnSig = tagged_deserialize(&mut &out.signature[..]).unwrap();
+        let sig = MnSig::deserialize(&mut &out.signature[..], 0).unwrap();
         assert!(
             vk.verify(&data, &sig),
             "signature must verify over data_to_sign"
@@ -523,7 +544,7 @@ mod tests {
         let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
             .unwrap()
             .verifying_key();
-        let tx_bytes = build_proven_unshielded_tx(&vk);
+        let tx_bytes = build_proven_unshielded_tx(&vk, None);
 
         // Sign the same tx with a different wallet key — the ownership check must reject it.
         let wrong_key = packed_signing_key(OTHER_SEED_HEX);
@@ -534,5 +555,64 @@ mod tests {
             format!("{err}").contains("owned by the signing key"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn sign_then_encode_signs_the_dust_fee_registration() {
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let tx_bytes = build_proven_unshielded_tx(&vk, Some(dust_fee_registration(&vk)));
+
+        // Sign: one signature for the input plus one for the dust fee registration.
+        let out = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
+        let mut r: &[u8] = &out.signature[..];
+        let sig_a = MnSig::deserialize(&mut r, 0).unwrap();
+        let sig_b = MnSig::deserialize(&mut r, 0).unwrap();
+        assert!(r.is_empty(), "expected exactly two signatures");
+
+        // Both verify against the intent's data_to_sign.
+        let mut tr: &[u8] = tx_bytes.as_slice();
+        let parsed: TxProven = tagged_deserialize(&mut tr).unwrap();
+        let Transaction::Standard(stx) = parsed else {
+            panic!("standard");
+        };
+        let pair = stx.intents.iter().next().unwrap();
+        let (seg_sp, intent_sp) = pair.deref();
+        let seg_id = *seg_sp.deref();
+        let data = intent_sp
+            .deref()
+            .clone()
+            .erase_proofs()
+            .erase_signatures()
+            .data_to_sign(seg_id);
+        assert!(vk.verify(&data, &sig_a) && vk.verify(&data, &sig_b));
+
+        // Seal: the sealed tx's dust registration carries a signature, and the offer has one too.
+        let sealed_bytes = signer.encode_signed_transaction(&tx_bytes, &out).unwrap();
+        let mut sr: &[u8] = sealed_bytes.as_slice();
+        let sealed: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
+            tagged_deserialize(&mut sr).unwrap();
+        let Transaction::Standard(sealed_stx) = sealed else {
+            panic!("standard");
+        };
+        let sealed_pair = sealed_stx.intents.iter().next().unwrap();
+        let (_seg, sealed_intent_sp) = sealed_pair.deref();
+        let sealed_intent = sealed_intent_sp.deref();
+        let reg_signed = sealed_intent
+            .dust_actions
+            .as_ref()
+            .and_then(|da| da.deref().registrations.iter().next())
+            .map(|reg| reg.signature.is_some())
+            .unwrap_or(false);
+        assert!(reg_signed, "sealed dust registration must be signed");
+        let offer_sigs = sealed_intent
+            .guaranteed_unshielded_offer
+            .as_ref()
+            .map(|o| o.deref().signatures.len())
+            .unwrap_or(0);
+        assert_eq!(offer_sigs, 1, "the input signature stays on the offer");
     }
 }
