@@ -1,106 +1,41 @@
-//! DApp Connector `makeTransfer` request parsing.
+//! DApp Connector `makeTransfer`.
 //!
-//! `makeTransfer(desiredOutputs, options?)` asks the wallet to build (and then balance) a transaction
-//! that sends `desiredOutputs` to their recipients. Because the wallet *constructs* this transaction,
-//! every desired output is value leaving the wallet — so its wallet-relative movement is known straight
-//! from the request, with no balancing or key access required. Building, balancing, proving, and sealing
-//! the transaction is the `authorize` half of the diagonal (see the adapter in this module).
+//! `makeTransfer(desiredOutputs, options?)` asks the wallet to build a transaction that sends
+//! `desiredOutputs` to their recipients. The wallet constructs the outputs (no inputs), proves them,
+//! and — since an outputs-only proven transaction is a wallet-funded deficit — funnels it through the
+//! same `plan_unsealed_proven_tx` → `authorize_proven_tx` tail as `balanceUnsealed`.
 
-use std::io::Cursor;
-
-use bech32::Hrp;
-use midnight_base_crypto::hash::HashOutput;
 use midnight_base_crypto::signatures::Signature as MnSig;
-use midnight_base_crypto::time::Timestamp;
-use midnight_coin_structure::coin::{
-    Info as CoinInfo, PublicKey as CoinPublicKey, ShieldedTokenType, UnshieldedTokenType,
-    UserAddress, NIGHT,
-};
+use midnight_coin_structure::coin::Info as CoinInfo;
 use midnight_ledger::structure::{
     Intent, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput,
-    INITIAL_PARAMETERS,
 };
-use midnight_serialize::{tagged_serialize, Deserializable};
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::{Offer as ZswapOffer, Output as ZswapOutput};
-use ows_core::sync_cache::SyncCacheScope;
 use ows_signer::chains::{MidnightCryptoProvider, MidnightSigner};
 use rand::rngs::OsRng;
 use rand::Rng as _;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::encryption;
 use transient_crypto::proofs::ProofPreimage;
 
-use crate::{parse_token_type, TokenType};
-
-type PreimageTx = Transaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
-
-fn err(msg: impl Into<String>) -> std::io::Error {
-    std::io::Error::other(msg.into())
-}
-
-/// A TTL an hour past the current wall clock — a stand-in until the balancer re-aligns it to the tip.
-fn far_future_ttl() -> Timestamp {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Timestamp::from_secs(now.saturating_add(3600))
-}
+use super::build::{
+    decode_shielded_recipient, decode_unshielded_recipient, err, far_future_ttl,
+    prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
+    PreimageTx, TransferKind,
+};
 
 /// The guaranteed (segment 0) intent carries the wallet's outputs; balancing draws its own inputs
 /// into this same segment, so an outputs-only transaction reads as a segment-0 deficit.
 const MAKE_TRANSFER_SEGMENT: u16 = 0;
-
-/// Whether a desired output moves value in the unshielded (Night) or shielded (Zswap) domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TransferKind {
-    Shielded,
-    Unshielded,
-}
-
-/// One recipient output the wallet is asked to produce: a `value` of `token_type` in `kind`'s domain,
-/// sent to `recipient`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DesiredOutput {
-    pub kind: TransferKind,
-    #[serde(rename = "type")]
-    pub token_type: String,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub value: u128,
-    pub recipient: String,
-}
 
 /// A parsed `makeTransfer` request: the outputs to send, and whether the wallet should pay DUST fees.
 #[derive(Debug, Clone)]
 pub struct MakeTransferRequest {
     pub desired_outputs: Vec<DesiredOutput>,
     pub pay_fees: bool,
-}
-
-/// Accept a u128 amount as either a JSON number or a decimal string. Routes through `serde_json::Value`
-/// because serde_json cannot deserialize `u128` inside an untagged position.
-pub(super) fn deserialize_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error as _;
-    let v = serde_json::Value::deserialize(deserializer)?;
-    match v {
-        serde_json::Value::String(s) => s.trim().parse().map_err(D::Error::custom),
-        serde_json::Value::Number(n) => n
-            .as_u64()
-            .map(u128::from)
-            .ok_or_else(|| D::Error::custom("integer value out of range")),
-        _ => Err(D::Error::custom(
-            "expected string or number for token amount",
-        )),
-    }
 }
 
 fn default_pay_fees() -> bool {
@@ -137,11 +72,7 @@ pub fn parse_make_transfer_json(json: &str) -> Result<MakeTransferRequest, std::
     })
 }
 
-/// Build, balance, prove, and seal a `makeTransfer` transaction. The wallet constructs the requested
-/// outputs into an unsealed transaction and proves them; an outputs-only proven transaction is a
-/// wallet-funded deficit — structurally what `balanceUnsealed` already funds — so it then funnels
-/// through the identical `plan_unsealed_proven_tx` → `authorize_proven_tx` tail. Runs **after** the
-/// policy seam.
+/// Build, balance, prove, and seal a `makeTransfer` transaction. Runs **after** the policy seam.
 pub(super) fn authorize(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
@@ -198,27 +129,6 @@ fn build_make_transfer_preimage(
     };
     stx.recompute_binding_randomness();
     Ok(Transaction::Standard(stx))
-}
-
-/// Prove the wallet-constructed outputs into a proven, still-unsealed (`proof,embedded-fr`)
-/// transaction and serialize it — the exact input shape `plan_unsealed_proven_tx` consumes.
-fn prove_to_unsealed_bytes(
-    chain_id: &str,
-    preimage: PreimageTx,
-) -> Result<Vec<u8>, std::io::Error> {
-    let scope = SyncCacheScope {
-        chain_id: Some(chain_id.to_string()),
-        ..Default::default()
-    };
-    let dir = crate::cache_io::proving_keys_dir(&scope)
-        .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
-    let prover = crate::Prover::new(dir);
-    let cost_model = &INITIAL_PARAMETERS.cost_model.runtime_cost_model;
-    let proven = crate::block_on(preimage.prove(prover, cost_model))
-        .map_err(|e| err(format!("prove makeTransfer outputs: {e}")))?;
-    let mut out = Vec::new();
-    tagged_serialize(&proven, &mut out).map_err(|e| err(format!("serialize proven tx: {e}")))?;
-    Ok(out)
 }
 
 fn build_unshielded_output_offer(
@@ -280,70 +190,6 @@ fn build_shielded_output_offer(
     ZswapOffer::new(vec![], outputs, vec![])
         .map(Some)
         .ok_or_else(|| err("shielded Zswap offer is empty"))
-}
-
-fn wire_type_to_unshielded(token_type: &str) -> Result<UnshieldedTokenType, std::io::Error> {
-    Ok(match parse_token_type(Some(token_type))? {
-        TokenType::Native => NIGHT,
-        TokenType::Custom(b) => UnshieldedTokenType(HashOutput(b)),
-    })
-}
-
-fn wire_type_to_shielded(token_type: &str) -> Result<ShieldedTokenType, std::io::Error> {
-    Ok(match parse_token_type(Some(token_type))? {
-        TokenType::Native => ShieldedTokenType(HashOutput([0u8; 32])),
-        TokenType::Custom(b) => ShieldedTokenType(HashOutput(b)),
-    })
-}
-
-fn decode_bech32m_payload(addr: &str, expected_hrp: &str) -> Result<Vec<u8>, std::io::Error> {
-    let hrp = Hrp::parse(expected_hrp).map_err(|e| err(format!("invalid expected hrp: {e}")))?;
-    let (got_hrp, payload) =
-        bech32::decode(addr).map_err(|e| err(format!("invalid bech32m address: {e}")))?;
-    if got_hrp != hrp {
-        return Err(err(format!(
-            "address HRP {got_hrp} does not match network (expected {expected_hrp})"
-        )));
-    }
-    Ok(payload.to_vec())
-}
-
-/// Decode a connector unshielded recipient (Bech32m, this network's HRP) into a `UserAddress`.
-fn decode_unshielded_recipient(
-    signer: &MidnightSigner,
-    recipient: &str,
-) -> Result<UserAddress, std::io::Error> {
-    let hrp = signer.unshielded_hrp().map_err(|e| err(e.to_string()))?;
-    let payload = decode_bech32m_payload(recipient, &hrp)?;
-    let bytes: [u8; 32] = payload.as_slice().try_into().map_err(|_| {
-        err(format!(
-            "unshielded recipient payload must be 32 bytes, got {}",
-            payload.len()
-        ))
-    })?;
-    Ok(UserAddress(HashOutput(bytes)))
-}
-
-/// Decode a connector shielded recipient (Bech32m, this network's HRP) into its coin + encryption
-/// public keys.
-fn decode_shielded_recipient(
-    signer: &MidnightSigner,
-    recipient: &str,
-) -> Result<(CoinPublicKey, encryption::PublicKey), std::io::Error> {
-    let hrp = signer.shielded_hrp().map_err(|e| err(e.to_string()))?;
-    let payload = decode_bech32m_payload(recipient, &hrp)?;
-    if payload.len() != 64 {
-        return Err(err(format!(
-            "shielded recipient payload must be 64 bytes, got {}",
-            payload.len()
-        )));
-    }
-    let mut cpk = [0u8; 32];
-    cpk.copy_from_slice(&payload[..32]);
-    let mut cur = Cursor::new(payload[32..].to_vec());
-    let epk = <encryption::PublicKey as Deserializable>::deserialize(&mut cur, 0)
-        .map_err(|e| err(format!("invalid shielded encryption public key: {e}")))?;
-    Ok((CoinPublicKey(HashOutput(cpk)), epk))
 }
 
 #[cfg(test)]

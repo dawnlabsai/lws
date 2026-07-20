@@ -12,14 +12,14 @@ use serde::Deserialize;
 use crate::BalancedPlan;
 
 mod balance_unsealed;
+mod build;
 mod make_transfer;
 
 pub use balance_unsealed::{
     classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
 };
-pub use make_transfer::{
-    parse_make_transfer_json, DesiredOutput, MakeTransferRequest, TransferKind,
-};
+pub use build::{DesiredOutput, TransferKind};
+pub use make_transfer::{parse_make_transfer_json, MakeTransferRequest};
 
 /// A DApp Connector method the wallet can be asked to perform, resolved from a request's `method`.
 #[derive(Debug, Clone, PartialEq, Eq)]
