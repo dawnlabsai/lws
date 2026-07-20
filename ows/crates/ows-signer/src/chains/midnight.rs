@@ -122,6 +122,13 @@ impl MidnightNetwork {
         validate_network_reference(&self.reference)?;
         Ok(hrp_for_network("mn_shield-esk", &self.reference))
     }
+
+    /// The Midnight ledger network id stamped into a `StandardTransaction` (the `network_id` field) —
+    /// the network reference verbatim. Distinct from the address HRPs: this tags the transaction, not
+    /// an address.
+    pub fn ledger_network_id(&self) -> &str {
+        &self.reference
+    }
 }
 
 /// Bech32m HRP bases used for Midnight addresses; network references must produce valid
@@ -433,6 +440,23 @@ impl MidnightSigner {
         credential: &SecretBytes,
     ) -> Result<MidnightCryptoProvider, SignerError> {
         MidnightCryptoProvider::from_credential(credential)
+    }
+
+    /// The Midnight ledger network id for this signer's network (`StandardTransaction.network_id`).
+    pub fn ledger_network_id(&self) -> &str {
+        self.network.ledger_network_id()
+    }
+
+    /// This network's Bech32m HRP for unshielded (Night) addresses — used to decode a connector
+    /// recipient address into a `UserAddress`.
+    pub fn unshielded_hrp(&self) -> Result<String, SignerError> {
+        self.network.unshielded_hrp()
+    }
+
+    /// This network's Bech32m HRP for shielded (Zswap) addresses — used to decode a connector
+    /// recipient address into its coin/encryption public keys.
+    pub fn shielded_hrp(&self) -> Result<String, SignerError> {
+        self.network.shielded_hrp()
     }
 
     /// Re-encode a Bech32m unshielded address under this network's HRP. The
@@ -1293,6 +1317,13 @@ mod tests {
             MidnightSigner::from_chain_id("midnight:preprod").network,
             MidnightNetwork::preprod()
         );
+    }
+
+    #[test]
+    fn midnight_ledger_network_id_maps_networks() {
+        assert_eq!(MidnightSigner::mainnet().ledger_network_id(), "mainnet");
+        assert_eq!(MidnightSigner::preview().ledger_network_id(), "preview");
+        assert_eq!(MidnightSigner::preprod().ledger_network_id(), "preprod");
     }
 
     #[test]
