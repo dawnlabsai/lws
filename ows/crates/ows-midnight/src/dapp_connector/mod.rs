@@ -1,8 +1,15 @@
 //! DApp Connector request dispatch. The wallet receives a stringified connector request whose
 //! top-level `method` names the operation; each method is parsed and handled by its own submodule.
 //! A request with no `method` defaults to `balanceUnsealedTransaction`, the wallet's original method.
+//!
+//! Every method funnels through one diagonal: parse → [`plan_connector_tx`] (an inert
+//! [`ConnectorPlan`]) → policy seam → [`ConnectorPlan::authorize`] (build + prove + sign + seal). The
+//! plan carries no bearer instrument, so the seam can gate on it before any key-bearing work happens.
 
+use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
+
+use crate::BalancedPlan;
 
 mod balance_unsealed;
 
@@ -34,6 +41,48 @@ pub fn parse_connector_method(json: &str) -> Result<ConnectorMethod, std::io::Er
         None | Some("balanceUnsealedTransaction") => ConnectorMethod::BalanceUnsealed,
         Some(other) => ConnectorMethod::Other(other.to_string()),
     })
+}
+
+/// An inert, balanced-but-unauthorized connector transaction — the common denominator every method
+/// resolves to. It carries no bearer instrument (proofs/signatures come later in
+/// [`ConnectorPlan::authorize`]), so the policy seam can gate on it first. One variant per method.
+pub enum ConnectorPlan {
+    /// A `balanceUnsealedTransaction` planned against the wallet's own inputs.
+    BalanceUnsealed(Box<BalancedPlan>),
+}
+
+impl ConnectorPlan {
+    /// Authorize the plan into signable, sealed transaction bytes: build + prove the wallet's bearer
+    /// witnesses in the signer, sign the binding, and serialize. Runs **after** the policy seam.
+    pub fn authorize(
+        self,
+        chain_id: &str,
+        crypto_provider: &MidnightCryptoProvider,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        match self {
+            ConnectorPlan::BalanceUnsealed(plan) => {
+                crate::authorize_proven_tx(chain_id, crypto_provider, *plan)
+            }
+        }
+    }
+    // ── POLICY SEAM ── TODO(policy): `ConnectorPlan::effects()` belongs here — the wallet-relative
+    // movement each method contributes (request-derived for the `make*` methods, plan-derived for the
+    // `balance*` methods), for the seam to gate on before `authorize`. Not wired yet.
+}
+
+/// Parse a stringified connector request and plan it (inert) into a [`ConnectorPlan`], ready for the
+/// policy seam. Routes by the request's `method`; each method plans in its own submodule.
+pub fn plan_connector_tx(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    json: &str,
+) -> Result<ConnectorPlan, std::io::Error> {
+    match parse_connector_method(json)? {
+        ConnectorMethod::BalanceUnsealed => balance_unsealed::plan(chain_id, crypto_provider, json),
+        ConnectorMethod::Other(method) => Err(std::io::Error::other(format!(
+            "Midnight DApp Connector method '{method}' is not yet implemented"
+        ))),
+    }
 }
 
 #[cfg(test)]

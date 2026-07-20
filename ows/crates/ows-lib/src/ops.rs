@@ -553,60 +553,27 @@ pub fn prepare_signable_tx(
     if chain.chain_type != ChainType::Midnight {
         return Ok(tx_bytes);
     }
-    // decode_tx_input carried the DApp Connector request through as UTF-8; parse it, then classify
-    // the tagged transaction it wraps.
+    // decode_tx_input carried the DApp Connector request through as UTF-8; parse it and plan the
+    // balancing inertly. `plan_connector_tx` routes by the connector `method` (absent `method`
+    // resolves to balanceUnsealed) and returns a plan that carries no bearer instrument.
     let json = std::str::from_utf8(&tx_bytes)
         .map_err(|e| OwsLibError::InvalidInput(format!("Midnight tx input is not UTF-8: {e}")))?;
-    // Route by the connector `method`; each method has its own handler. Absent `method` resolves to
-    // balanceUnsealed, the wallet's original single-method behavior.
-    match ows_midnight::parse_connector_method(json)
-        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?
-    {
-        ows_midnight::ConnectorMethod::BalanceUnsealed => {
-            let request = ows_midnight::parse_balance_unsealed_json(json)
-                .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-            match ows_midnight::classify_unsealed_payload(&request.tx_bytes) {
-                Some(ows_midnight::UnsealedKind::Proven) => {
-                    // ows-lib holds the credential; ows-midnight never sees it. Build the Midnight
-                    // crypto provider once here (it owns all the wallet's key material), then hand
-                    // only `&crypto_provider` across the crate boundary to balance the proven tx.
-                    let crypto_provider = MidnightSigner::from_chain_id(chain.chain_id)
-                        .crypto_provider(key)
-                        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
 
-                    // Plan the balancing without proving (sync + select shielded/dust + size the
-                    // fee): the returned plan is inert — it carries no bearer proof-preimage.
-                    let plan = ows_midnight::plan_unsealed_proven_tx(
-                        chain.chain_id,
-                        &crypto_provider,
-                        &request.tx_bytes,
-                        request.pay_fees,
-                    )
-                    .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+    // ows-lib holds the credential; ows-midnight never sees it. Build the Midnight crypto provider once
+    // here (it owns all the wallet's key material), then hand only `&crypto_provider` across the crate
+    // boundary to plan and authorize the tx.
+    let crypto_provider = MidnightSigner::from_chain_id(chain.chain_id)
+        .crypto_provider(key)
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
 
-                    // ── POLICY SEAM ── TODO(policy): gate on `plan` here (the 2nd policy pass, over
-                    // the plan's key-derived effects) before authorizing. `authorize_proven_tx`
-                    // builds and proves the wallet's shielded/dust spend witnesses (the bearer
-                    // instruments) in the signer.
-                    ows_midnight::authorize_proven_tx(chain.chain_id, &crypto_provider, plan)
-                        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
-                }
-                Some(ows_midnight::UnsealedKind::ProofPreimage) => Err(OwsLibError::InvalidInput(
-                    "Midnight balanceUnsealedTransaction expects a proven (proof,embedded-fr) transaction per \
-                     the DApp Connector spec; received a proof-preimage transaction (the dapp must prove its \
-                     own part before calling the wallet)"
-                        .into(),
-                )),
-                None => Err(OwsLibError::InvalidInput(
-                    "unrecognized Midnight transaction (expected an unsealed proof or proof-preimage payload)"
-                        .into(),
-                )),
-            }
-        }
-        ows_midnight::ConnectorMethod::Other(method) => Err(OwsLibError::InvalidInput(format!(
-            "Midnight DApp Connector method '{method}' is not yet implemented"
-        ))),
-    }
+    let plan = ows_midnight::plan_connector_tx(chain.chain_id, &crypto_provider, json)
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+
+    // ── POLICY SEAM ── TODO(policy): gate on `plan` here (the 2nd policy pass, over the plan's
+    // key-derived effects) before authorizing. `ConnectorPlan::authorize` builds and proves the
+    // wallet's shielded/dust spend witnesses (the bearer instruments) in the signer.
+    plan.authorize(chain.chain_id, &crypto_provider)
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.

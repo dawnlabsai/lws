@@ -1,6 +1,11 @@
-//! DApp Connector `balanceUnsealedTransaction` request parsing and unsealed-payload classification.
+//! DApp Connector `balanceUnsealedTransaction` request parsing, unsealed-payload classification, and
+//! planning. The dapp hands the wallet an already-**proven** (`proof,embedded-fr`) unsealed tx; the
+//! wallet balances it against its own inputs, then signs and seals.
 
+use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
+
+use super::ConnectorPlan;
 
 /// Pre-seal Midnight transaction shapes the wallet can classify by tag. Per the DApp Connector spec a
 /// `balanceUnsealedTransaction` arrives already **proven** (`proof,embedded-fr`) — "unsealed" means
@@ -74,6 +79,38 @@ pub fn parse_balance_unsealed_json(json: &str) -> Result<BalanceUnsealedRequest,
         tx_bytes,
         pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
     })
+}
+
+/// Plan a `balanceUnsealedTransaction` request: parse it, classify its payload, and — for the
+/// spec-conformant proven shape — plan the balancing inertly (sync + select shielded/dust + size the
+/// fee, no proving). A proof-preimage or unrecognized payload is rejected with a precise error.
+pub(super) fn plan(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    json: &str,
+) -> Result<ConnectorPlan, std::io::Error> {
+    let request = parse_balance_unsealed_json(json)?;
+    match classify_unsealed_payload(&request.tx_bytes) {
+        Some(UnsealedKind::Proven) => {
+            // The returned plan is inert — it carries no bearer proof-preimage; `authorize_proven_tx`
+            // builds and proves the wallet's shielded/dust spend witnesses later, in the signer.
+            let plan = crate::plan_unsealed_proven_tx(
+                chain_id,
+                crypto_provider,
+                &request.tx_bytes,
+                request.pay_fees,
+            )?;
+            Ok(ConnectorPlan::BalanceUnsealed(Box::new(plan)))
+        }
+        Some(UnsealedKind::ProofPreimage) => Err(std::io::Error::other(
+            "Midnight balanceUnsealedTransaction expects a proven (proof,embedded-fr) transaction per \
+             the DApp Connector spec; received a proof-preimage transaction (the dapp must prove its \
+             own part before calling the wallet)",
+        )),
+        None => Err(std::io::Error::other(
+            "unrecognized Midnight transaction (expected an unsealed proof or proof-preimage payload)",
+        )),
+    }
 }
 
 #[cfg(test)]
