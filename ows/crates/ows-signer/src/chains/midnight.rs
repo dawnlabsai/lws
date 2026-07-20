@@ -1,21 +1,37 @@
 use bech32::{Bech32m, Hrp};
 use k256::schnorr::SigningKey;
+use midnight_base_crypto::signatures::{
+    Signature as MnSignature, SigningKey as MidnightSigningKey,
+};
 use midnight_coin_structure::coin;
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{DustLocalState, DustPublicKey, DustSecretKey};
 use midnight_ledger::semantics::ZswapLocalStateExt as _;
-use midnight_serialize::{ScaleBigInt, Serializable};
+use midnight_ledger::structure::{Intent, ProofMarker, StandardTransaction, Transaction};
+use midnight_serialize::{tagged_deserialize, tagged_serialize, ScaleBigInt, Serializable};
+use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
+use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
 use midnight_zswap::local::State as ZswapLocalState;
 use num_bigint::BigUint;
+use rand::rngs::{OsRng, StdRng};
+use rand::SeedableRng as _;
 use sha2::Digest;
+use std::ops::Deref as _;
+use transient_crypto::commitment::PedersenRandomness;
 
 use crate::curve::Curve;
 use crate::hd::DerivedKey;
 use crate::traits::{ChainSigner, SignOutput, SignerError};
 use crate::zeroizing::SecretBytes;
 use ows_core::ChainType;
+
+/// A proven-but-unsealed Midnight Standard transaction (`proof,embedded-fr`).
+type TxProvenUnsealed = Transaction<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
+type StdTxProvenUnsealed =
+    StandardTransaction<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
+type IntentProvenUnsealed = Intent<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
 
 /// Midnight network selection. Each network uses the same keys but a
 /// network-specific Bech32m HRP suffix — the unshielded, shielded, and dust
@@ -554,6 +570,131 @@ impl MidnightCryptoProvider {
     }
 }
 
+/// Deserialize a balanced proven (`proof,embedded-fr`) Midnight Standard transaction that carries
+/// exactly one intent segment, returning the Standard body, the segment id, and the intent. Shared
+/// by the sign and seal steps so both agree on the tx shape.
+fn parse_single_intent_standard(
+    tx_bytes: &[u8],
+) -> Result<(StdTxProvenUnsealed, u16, IntentProvenUnsealed), SignerError> {
+    let mut r: &[u8] = tx_bytes;
+    let tx: TxProvenUnsealed = tagged_deserialize(&mut r).map_err(|e| {
+        SignerError::InvalidTransaction(format!("failed to parse balanced proven tx bytes: {e}"))
+    })?;
+    let Transaction::Standard(stx) = tx else {
+        return Err(SignerError::InvalidTransaction(
+            "expected Standard transaction".into(),
+        ));
+    };
+    if stx.intents.iter().count() != 1 {
+        return Err(SignerError::InvalidTransaction(
+            "expected exactly one intent segment".into(),
+        ));
+    }
+    let pair_sp = stx.intents.iter().next().expect("count == 1");
+    let (seg_id_sp, intent_sp) = pair_sp.deref();
+    let seg_id: u16 = *seg_id_sp.deref();
+    let intent = intent_sp.deref().clone();
+    Ok((stx, seg_id, intent))
+}
+
+/// Reject a tx carrying dust registrations — signing them (`reg.signature`) is out of scope for the
+/// unshielded-only path, and the balancer never produces one.
+fn reject_dust_registrations(intent: &IntentProvenUnsealed) -> Result<(), SignerError> {
+    if intent
+        .dust_actions
+        .as_ref()
+        .is_some_and(|da| !da.registrations.is_empty())
+    {
+        return Err(SignerError::InvalidTransaction(
+            "dust registration signing is not supported".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Sign the unshielded intent of a balanced proven (`proof,embedded-fr`) Midnight Standard
+/// transaction with the wallet's Night key. The dapp has already proven the contract calls / zswap
+/// offers, so this is pure key work — one signature per guaranteed unshielded input over the
+/// intent's signing message — with no proving, no seal, and no network. The signatures are returned
+/// tagged-serialized in input order; [`seal_signed_proven`] reattaches and seals them.
+fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+    let (_stx, seg_id, intent) = parse_single_intent_standard(tx_bytes)?;
+    reject_dust_registrations(&intent)?;
+
+    let seeds = MidnightSigner::decode_keys(private_key)?;
+    let signing_key = MidnightSigningKey::from_bytes(seeds.unshielded.expose()).map_err(|e| {
+        SignerError::InvalidPrivateKey(format!("invalid midnight signing key: {e}"))
+    })?;
+
+    // Every guaranteed unshielded input must be owned by the signing key — the ledger appends one
+    // signature per guaranteed input, each verified against that input's owner.
+    let vk = signing_key.verifying_key();
+    let inputs = intent.guaranteed_inputs();
+    for inp in &inputs {
+        if inp.owner != vk {
+            return Err(SignerError::SigningFailed(
+                "all guaranteed unshielded inputs must be owned by the signing key".into(),
+            ));
+        }
+    }
+
+    // The signing message is the proof- and signature-erased intent — computable without the key,
+    // and identical for every input in the segment (this is what `Intent::sign` signs internally).
+    let data = intent
+        .erase_proofs()
+        .erase_signatures()
+        .data_to_sign(seg_id);
+
+    let mut rng = OsRng;
+    let mut out = Vec::new();
+    for _ in 0..inputs.len() {
+        let sig = signing_key.sign(&mut rng, &data);
+        tagged_serialize(&sig, &mut out)
+            .map_err(|e| SignerError::SigningFailed(format!("serialize signature: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Reattach the [`sign_proven_intent`] signatures to the balanced proven transaction and seal it.
+/// Keyless: `add_signatures` and `.seal()` take no key, only an RNG. Returns the sealed tx bytes.
+fn seal_signed_proven(tx_bytes: &[u8], signatures: &[u8]) -> Result<Vec<u8>, SignerError> {
+    let (stx, seg_id, mut intent) = parse_single_intent_standard(tx_bytes)?;
+    reject_dust_registrations(&intent)?;
+
+    let n_inputs = intent.guaranteed_inputs().len();
+    let mut r: &[u8] = signatures;
+    let mut sigs: Vec<MnSignature> = Vec::with_capacity(n_inputs);
+    for _ in 0..n_inputs {
+        sigs.push(
+            tagged_deserialize(&mut r)
+                .map_err(|e| SignerError::InvalidTransaction(format!("parse signature: {e}")))?,
+        );
+    }
+
+    if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
+        let mut offer = offer_sp.deref().clone();
+        offer.add_signatures(sigs);
+        intent.guaranteed_unshielded_offer = Some(Sp::new(offer));
+    }
+
+    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent);
+    let stx_signed = StandardTransaction {
+        network_id: stx.network_id.clone(),
+        intents,
+        guaranteed_coins: stx.guaranteed_coins.clone(),
+        fallible_coins: stx.fallible_coins.clone(),
+        binding_randomness: stx.binding_randomness,
+    };
+    let tx_signed: TxProvenUnsealed = Transaction::Standard(stx_signed);
+
+    let sealed = tx_signed.seal(StdRng::from_entropy());
+
+    let mut out = Vec::new();
+    tagged_serialize(&sealed, &mut out)
+        .map_err(|e| SignerError::SigningFailed(format!("serialize sealed tx: {e}")))?;
+    Ok(out)
+}
+
 impl ChainSigner for MidnightSigner {
     fn chain_type(&self) -> ChainType {
         ChainType::Midnight
@@ -604,12 +745,25 @@ impl ChainSigner for MidnightSigner {
 
     fn sign_transaction(
         &self,
-        _private_key: &[u8],
-        _tx_bytes: &[u8],
+        private_key: &[u8],
+        tx_bytes: &[u8],
     ) -> Result<SignOutput, SignerError> {
-        Err(SignerError::SigningFailed(
-            "Midnight transaction signing is not implemented yet".into(),
-        ))
+        let signature = sign_proven_intent(private_key, tx_bytes)?;
+        Ok(SignOutput {
+            signature,
+            recovery_id: None,
+            public_key: None,
+        })
+    }
+
+    /// Reattach the [`sign_proven_intent`] signatures and seal the transaction. Keyless — the
+    /// `signature` blob carries everything the seal needs.
+    fn encode_signed_transaction(
+        &self,
+        tx_bytes: &[u8],
+        signature: &SignOutput,
+    ) -> Result<Vec<u8>, SignerError> {
+        seal_signed_proven(tx_bytes, &signature.signature)
     }
 
     fn default_derivation_path(&self, index: u32) -> String {

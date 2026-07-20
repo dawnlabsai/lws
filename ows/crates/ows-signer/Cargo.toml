@@ -43,6 +43,7 @@ midnight-serialize = "1.0.0"
 midnight-base-crypto = "1.0.0"
 midnight-storage = "2.0.1"
 midnight-coin-structure = "2.0.0"
+transient-crypto = { version = "2.0.0", package = "midnight-transient-crypto" }
 num-bigint = "0.4"
 libc = "0.2"
 signal-hook = "0.4"
