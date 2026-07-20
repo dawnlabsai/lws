@@ -83,6 +83,13 @@ pub fn cache_root_dir(subdir: &str, scope: &SyncCacheScope) -> Option<PathBuf> {
     )
 }
 
+/// Directory holding the shared Midnight ZK proving keys (circuit prover/verifier keys + IR):
+/// `{vault}/chains/midnight/proving-keys`. Vault-rooted like the snapshots but not per-scope — the
+/// keys are circuit assets shared across wallets, and not disabled by `OWS_MIDNIGHT_SYNC_CACHE`.
+pub fn proving_keys_dir(scope: &SyncCacheScope) -> Option<PathBuf> {
+    vault_root(scope).map(|v| v.join("chains").join("midnight").join("proving-keys"))
+}
+
 /// File path for the snapshot keyed by `(indexer_url, chain_id, key)` under `subdir`.
 pub fn snapshot_path(
     subdir: &str,

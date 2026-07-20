@@ -3455,6 +3455,7 @@ dependencies = [
 name = "ows-midnight"
 version = "1.3.2"
 dependencies = [
+ "anyhow",
  "bech32 0.11.1",
  "futures-util",
  "hex",
@@ -3471,6 +3472,7 @@ dependencies = [
  "midnight-zswap",
  "ows-core",
  "ows-signer",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",

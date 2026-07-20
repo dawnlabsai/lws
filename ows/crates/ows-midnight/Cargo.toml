@@ -28,5 +28,7 @@ midnight-coin-structure = "2.0.0"
 transient-crypto = { version = "2.0.0", package = "midnight-transient-crypto" }
 onchain-runtime = { version = "3.0.0", package = "midnight-onchain-runtime" }
 zkir_v2 = { version = "2.1.0", package = "midnight-zkir" }
+rand = "0.8"
+anyhow = "1"
 subxt = { version = "0.38", default-features = false, features = ["jsonrpsee", "native"] }
 jsonrpsee = { version = "0.24", features = ["ws-client", "macros"] }
