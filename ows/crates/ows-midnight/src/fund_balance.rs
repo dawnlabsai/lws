@@ -5,9 +5,9 @@ use std::path::Path;
 use ows_core::Chain;
 use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork, MidnightSigner};
 
-use super::dust_sync;
 use super::tip_verify;
 use super::wallet::{resolve_indexer_url, sum_utxos_by_token, sync_scope_for_wallet};
+use super::wallet_sync::dust;
 use super::{
     block_on, format_dust_specks, get_dust_balance_for_display, get_shielded_balances_for_display,
     get_unshielded_utxos_for_display, parse_token_type, ShieldedBalances, UnshieldedUtxo,
@@ -141,7 +141,7 @@ pub fn print_fund_balance(
     // name: probe the indexer's dust ledger and treat dust as applicable only when its stream
     // reports a live tip. A network activates dust automatically here — no code change when a new
     // one (mainnet included) turns it on.
-    let needs_dust = block_on(dust_sync::dust_ledger_is_live(&indexer_url));
+    let needs_dust = block_on(dust::dust_ledger_is_live(&indexer_url));
     let dust_plan = if !needs_dust {
         DustPlan::Skip
     } else if crypto_provider.is_some() {

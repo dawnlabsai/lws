@@ -17,10 +17,10 @@ use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
-use super::cache_io::{self, SyncCacheScope};
-use super::dust_sync_cache;
-use super::indexer_ws;
-use super::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
+use crate::cache_io::{self, SyncCacheScope};
+mod sync_cache;
+use crate::indexer_ws;
+use crate::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
 
 /// Max reconnect attempts before a dust replay gives up.
 const DUST_SYNC_MAX_ATTEMPTS: u32 = 4;
@@ -100,13 +100,13 @@ fn save_dust_snapshot(
     let Some(path) = path else {
         return;
     };
-    let Ok(state_hex) = dust_sync_cache::encode_state(state) else {
+    let Ok(state_hex) = sync_cache::encode_state(state) else {
         return;
     };
     cache_io::try_save(
         path,
-        &dust_sync_cache::DustSyncSnapshot {
-            version: dust_sync_cache::SNAPSHOT_VERSION,
+        &sync_cache::DustSyncSnapshot {
+            version: sync_cache::SNAPSHOT_VERSION,
             indexer_fingerprint: fp.to_string(),
             chain_id: cache_io::snapshot_chain_id(scope),
             dust_public_key_hex: dust_pk_hex.to_string(),
@@ -132,7 +132,7 @@ async fn sync_dust_local_state(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let dust_pk_hex = dust_public_key_hex(&dust_pk)?;
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
-    let cache_path = dust_sync_cache::snapshot_path(indexer_url, &dust_pk_hex, scope);
+    let cache_path = sync_cache::snapshot_path(indexer_url, &dust_pk_hex, scope);
 
     let mut state = DustLocalState::new(INITIAL_DUST_PARAMETERS);
     let mut last_seen_id: i64 = -1;
@@ -142,13 +142,13 @@ async fn sync_dust_local_state(
     // Resume only from a snapshot for this same indexer site, network, and dust key.
     let resumed = cache_path
         .as_ref()
-        .and_then(|p| dust_sync_cache::try_load_snapshot(p))
+        .and_then(|p| sync_cache::try_load_snapshot(p))
         .filter(|snap| {
             cache_io::snapshot_site_matches(scope, &snap.chain_id, &fp, &snap.indexer_fingerprint)
                 && snap.dust_public_key_hex == dust_pk_hex
         })
         .and_then(|snap| {
-            let st = dust_sync_cache::decode_state(&snap.state_hex).ok()?;
+            let st = sync_cache::decode_state(&snap.state_hex).ok()?;
             Some((
                 st,
                 snap.last_seen_event_id,
@@ -171,7 +171,7 @@ async fn sync_dust_local_state(
     // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
     // already reflects the live tip — skip the WebSocket catch-up entirely.
     let snapshot_complete = dust_at_chain_tip(last_seen_id, max_id);
-    if super::tip_verify::snapshot_fresh_by_http_tip(
+    if crate::tip_verify::snapshot_fresh_by_http_tip(
         current_block_height,
         saved_block_height,
         snapshot_complete,

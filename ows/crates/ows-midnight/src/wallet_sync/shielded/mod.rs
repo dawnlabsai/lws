@@ -6,9 +6,11 @@
 
 use ows_signer::chains::MidnightCryptoProvider;
 
-use super::cache_io::SyncCacheScope;
-use super::zswap_ledger_sync;
-use super::ShieldedBalances;
+use crate::cache_io::SyncCacheScope;
+use crate::ShieldedBalances;
+
+mod sync_cache;
+mod zswap_ledger;
 
 /// Shielded balances for `ows fund balance`, from the VK-free `zswapLedgerEvents` full sync. The
 /// shielded keys stay inside `crypto_provider`, which does the key-bearing owned-coin detection.
@@ -22,7 +24,7 @@ pub async fn get_shielded_balances_for_display(
         .shielded_key_fingerprint()
         .map(|fp| hex::encode(&fp[..16]))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    zswap_ledger_sync::fetch_balances(
+    zswap_ledger::fetch_balances(
         indexer_url,
         crypto_provider,
         scope,

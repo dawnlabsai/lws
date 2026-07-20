@@ -17,11 +17,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::cache_io::{self, SyncCacheScope};
-use super::indexer_ws::{self, IndexerWs};
-use super::midnight_env::{self, SyncStream};
-use super::shielded_sync_cache;
-use super::ShieldedBalances;
+use crate::cache_io::{self, SyncCacheScope};
+use crate::indexer_ws::{self, IndexerWs};
+use crate::midnight_env::{self, SyncStream};
+use super::sync_cache;
+use crate::ShieldedBalances;
 
 const ZSWAP_LEDGER_SUB: &str = r#"
 subscription ZswapLedgerEvents($id: Int) {
@@ -60,7 +60,7 @@ pub(super) async fn fetch_balances(
     current_block_height: Option<i64>,
 ) -> Result<ShieldedBalances, std::io::Error> {
     let fp = cache_io::sync_site_fingerprint(indexer_url, scope);
-    let cache_path = shielded_sync_cache::snapshot_path(indexer_url, seed_fp, scope);
+    let cache_path = sync_cache::snapshot_path(indexer_url, seed_fp, scope);
 
     let mut owned: BTreeMap<coin::Nullifier, coin::Info> = BTreeMap::new();
     let mut last_seen_id: i64 = -1;
@@ -70,13 +70,13 @@ pub(super) async fn fetch_balances(
     // Resume only from a snapshot for this same indexer site, network, and zswap key.
     let resumed = cache_path
         .as_ref()
-        .and_then(|p| shielded_sync_cache::try_load_snapshot(p))
+        .and_then(|p| sync_cache::try_load_snapshot(p))
         .filter(|snap| {
             cache_io::snapshot_site_matches(scope, &snap.chain_id, &fp, &snap.indexer_fingerprint)
                 && snap.zswap_key_fingerprint == seed_fp
         })
         .and_then(|snap| {
-            let owned = shielded_sync_cache::decode_owned_coins(&snap.owned_coins).ok()?;
+            let owned = sync_cache::decode_owned_coins(&snap.owned_coins).ok()?;
             Some((
                 owned,
                 snap.last_seen_event_id,
@@ -101,7 +101,7 @@ pub(super) async fn fetch_balances(
     // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
     // already reflects the live tip — skip the WebSocket catch-up entirely.
     let snapshot_complete = max_id.is_some_and(|m| m > 0 && last_seen_id >= m);
-    if super::tip_verify::snapshot_fresh_by_http_tip(
+    if crate::tip_verify::snapshot_fresh_by_http_tip(
         current_block_height,
         saved_block_height,
         snapshot_complete,
@@ -245,13 +245,13 @@ fn save_zswap_snapshot(cache: Option<&ZswapCache<'_>>, state: &ZswapReplayState)
     let Some(cache) = cache else {
         return;
     };
-    let Ok(owned_coins) = shielded_sync_cache::encode_owned_coins(&state.owned) else {
+    let Ok(owned_coins) = sync_cache::encode_owned_coins(&state.owned) else {
         return;
     };
     cache_io::try_save(
         cache.path,
-        &shielded_sync_cache::ShieldedSyncSnapshot {
-            version: shielded_sync_cache::SNAPSHOT_VERSION,
+        &sync_cache::ShieldedSyncSnapshot {
+            version: sync_cache::SNAPSHOT_VERSION,
             indexer_fingerprint: cache.fp.to_string(),
             chain_id: cache_io::snapshot_chain_id(cache.scope),
             zswap_key_fingerprint: cache.key_fp.to_string(),

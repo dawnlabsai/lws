@@ -7,7 +7,7 @@ use std::path::Path;
 use ows_core::Config;
 
 use super::cache_io::SyncCacheScope;
-use super::unshielded_sync::UnshieldedUtxo;
+use super::wallet_sync::unshielded::UnshieldedUtxo;
 
 fn invalid_input(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())

@@ -5,26 +5,21 @@ pub type ShieldedBalances = std::collections::BTreeMap<String, u128>;
 
 mod async_runtime;
 mod cache_io;
-mod dust_sync;
-mod dust_sync_cache;
 mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
 mod midnight_env;
-mod shielded_sync;
-mod shielded_sync_cache;
 mod tip_verify;
-mod unshielded_sync;
 mod urls;
 mod wallet;
-mod zswap_ledger_sync;
+mod wallet_sync;
 
 pub use async_runtime::block_on;
-pub use dust_sync::{format_dust_specks, get_dust_balance_for_display};
 pub use fund_balance::print_fund_balance;
 pub use ledger_params::fetch_indexer_ledger_parameters;
-pub use shielded_sync::get_shielded_balances_for_display;
-pub use unshielded_sync::{get_unshielded_utxos_for_display, UnshieldedUtxo};
+pub use wallet_sync::dust::{format_dust_specks, get_dust_balance_for_display};
+pub use wallet_sync::shielded::get_shielded_balances_for_display;
+pub use wallet_sync::unshielded::{get_unshielded_utxos_for_display, UnshieldedUtxo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenType {

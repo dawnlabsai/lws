@@ -4,7 +4,7 @@
 //! Stores source state (the ledger state + cursor), never a derived balance — the balance is
 //! recomputed from the state on read.
 
-use super::cache_io::{self, SyncCacheScope};
+use crate::cache_io::{self, SyncCacheScope};
 use midnight_ledger::dust::DustLocalState;
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
 use midnight_storage::db::InMemoryDB;

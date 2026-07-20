@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use super::cache_io::{self, SyncCacheScope};
-use super::indexer_ws;
-use super::ledger_params::parse_indexer_timestamp_secs;
-use super::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
+use crate::cache_io::{self, SyncCacheScope};
+use crate::indexer_ws;
+use crate::ledger_params::parse_indexer_timestamp_secs;
+use crate::midnight_env::{stall_timeout, ws_idle_timeout, SyncStream};
 
 /// One spendable unshielded UTXO as reported by the indexer (after replay).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,7 @@
 //! Stores source state (the unspent owned coins + indexer cursor), never a derived balance —
 //! the per-token balance is recomputed from the coins on read.
 
-use super::cache_io::{self, SyncCacheScope};
+use crate::cache_io::{self, SyncCacheScope};
 use midnight_coin_structure::coin;
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
 use serde::{Deserialize, Serialize};
