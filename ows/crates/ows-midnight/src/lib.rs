@@ -5,6 +5,7 @@ pub type ShieldedBalances = std::collections::BTreeMap<String, u128>;
 
 mod async_runtime;
 mod cache_io;
+mod dapp_connector;
 mod fund_balance;
 mod indexer_ws;
 mod ledger_params;
@@ -15,6 +16,9 @@ mod wallet;
 mod wallet_sync;
 
 pub use async_runtime::block_on;
+pub use dapp_connector::{
+    classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
+};
 pub use fund_balance::print_fund_balance;
 pub use ledger_params::fetch_indexer_ledger_parameters;
 pub use wallet_sync::dust::{format_dust_specks, get_dust_balance_for_display};

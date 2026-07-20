@@ -3435,6 +3435,7 @@ dependencies = [
  "hex",
  "k256",
  "ows-core",
+ "ows-midnight",
  "ows-signer",
  "prost",
  "rand 0.8.7",

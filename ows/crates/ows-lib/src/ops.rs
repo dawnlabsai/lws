@@ -552,13 +552,29 @@ pub fn prepare_signable_tx(
     if chain.chain_type != ChainType::Midnight {
         return Ok(tx_bytes);
     }
-    // TODO(midnight balanceUnsealed): parse the connector request from tx_bytes, classify it, and
-    // balance it into the transaction to sign using `key` (payFees=false / unshielded-only for v1,
-    // proving deferred).
-    let _ = (tx_bytes, key);
-    Err(OwsLibError::InvalidInput(
-        "Midnight transaction preparation is not yet implemented".into(),
-    ))
+    // decode_tx_input carried the DApp Connector request through as UTF-8; parse it, then classify
+    // the tagged transaction it wraps.
+    let json = std::str::from_utf8(&tx_bytes)
+        .map_err(|e| OwsLibError::InvalidInput(format!("Midnight tx input is not UTF-8: {e}")))?;
+    let request = ows_midnight::parse_balance_unsealed_json(json)
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+    match ows_midnight::classify_unsealed_payload(&request.tx_bytes) {
+        Some(ows_midnight::UnsealedKind::Proven) => {
+            // TODO: balance the proven tx with the wallet's own unshielded UTXOs (unshielded-only,
+            // pay_fees per request), deriving the seeds/indexer URL/sync scope from key + chain.
+            let _ = (key, request.pay_fees);
+            Err(OwsLibError::InvalidInput(
+                "Midnight unsealed-tx balancing is not yet implemented".into(),
+            ))
+        }
+        Some(ows_midnight::UnsealedKind::ProofPreimage) => Err(OwsLibError::InvalidInput(
+            "Midnight proof-preimage transactions require proving, which is not supported yet".into(),
+        )),
+        None => Err(OwsLibError::InvalidInput(
+            "unrecognized Midnight transaction (expected an unsealed proof or proof-preimage payload)"
+                .into(),
+        )),
+    }
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.
