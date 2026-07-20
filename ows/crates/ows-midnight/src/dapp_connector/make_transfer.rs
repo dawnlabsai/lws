@@ -27,9 +27,15 @@ use super::build::{
     PreimageTx, TransferKind,
 };
 
-/// The guaranteed (segment 0) intent carries the wallet's outputs; balancing draws its own inputs
-/// into this same segment, so an outputs-only transaction reads as a segment-0 deficit.
-const MAKE_TRANSFER_SEGMENT: u16 = 0;
+/// The intent that carries the wallet's unshielded outputs must key at a fallible segment (>= 1): the
+/// ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
+/// (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`). The outputs still ride
+/// the guaranteed section — the intent's guaranteed offer and the transaction's guaranteed Zswap coins —
+/// so the transfer is unconditional; balancing draws the wallet's own inputs into this same intent.
+const MAKE_TRANSFER_INTENT_SEGMENT: u16 = 1;
+/// Segment 0 is the transaction's guaranteed section; a transfer's shielded outputs ride it so they
+/// execute unconditionally.
+const GUARANTEED_SEGMENT: u16 = 0;
 
 /// A parsed `makeTransfer` request: the outputs to send, and whether the wallet should pay DUST fees.
 #[derive(Debug, Clone)]
@@ -119,7 +125,7 @@ fn build_make_transfer_preimage(
         binding_commitment: rng.r#gen(),
     };
     let intents: MnHashMap<u16, _, InMemoryDB> =
-        MnHashMap::new().insert(MAKE_TRANSFER_SEGMENT, intent);
+        MnHashMap::new().insert(MAKE_TRANSFER_INTENT_SEGMENT, intent);
     let mut stx = StandardTransaction {
         network_id: signer.ledger_network_id().to_string(),
         intents,
@@ -177,14 +183,8 @@ fn build_shielded_output_offer(
             type_,
             value: d.value,
         };
-        let out = ZswapOutput::new(
-            &mut rng,
-            &coin,
-            Some(MAKE_TRANSFER_SEGMENT),
-            &cpk,
-            Some(epk),
-        )
-        .map_err(|e| err(format!("shielded output failed: {e:?}")))?;
+        let out = ZswapOutput::new(&mut rng, &coin, Some(GUARANTEED_SEGMENT), &cpk, Some(epk))
+            .map_err(|e| err(format!("shielded output failed: {e:?}")))?;
         outputs.push(out);
     }
     ZswapOffer::new(vec![], outputs, vec![])
@@ -264,6 +264,39 @@ mod tests {
         assert!(
             has_deficit,
             "makeTransfer must leave a wallet-funded deficit"
+        );
+    }
+
+    /// The ledger rejects an intent declared at segment 0 (the reserved guaranteed section) with
+    /// `IntentAtGuaranteedSegmentId`, surfaced on-chain as `Custom error: 167`. Guard that makeTransfer
+    /// keys its intent at a fallible segment; the outputs still ride the guaranteed section.
+    ///
+    /// A full ledger `well_formed` check can't stand in here: an outputs-only transfer is imbalanced
+    /// until the wallet funds it, and `well_formed` runs `pedersen_check` (the balance check) *before*
+    /// the intent-segment check (verify.rs:605 vs :622), so an imbalanced tx fails on balance before the
+    /// segment rule is ever reached. This structural assertion checks the segment invariant directly.
+    #[test]
+    fn make_transfer_intent_is_off_the_guaranteed_segment() {
+        let req = MakeTransferRequest {
+            desired_outputs: vec![DesiredOutput {
+                kind: TransferKind::Unshielded,
+                token_type: "night".into(),
+                value: 1_000,
+                recipient: preview_unshielded_address(),
+            }],
+            pay_fees: true,
+        };
+        let tx = build_make_transfer_preimage("midnight:preview", &req).expect("build preimage");
+        let Transaction::Standard(stx) = &tx else {
+            panic!("expected a Standard transaction");
+        };
+        assert!(
+            stx.intents.get(&0).is_none(),
+            "makeTransfer must not key an intent at segment 0 (IntentAtGuaranteedSegmentId / node error 167)"
+        );
+        assert!(
+            stx.intents.get(&MAKE_TRANSFER_INTENT_SEGMENT).is_some(),
+            "the maker intent rides the fallible segment"
         );
     }
 
