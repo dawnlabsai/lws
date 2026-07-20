@@ -720,22 +720,15 @@ fn parse_single_intent_standard(
     Ok((stx, seg_id, intent))
 }
 
-/// Count the intent's dust registrations — the signature-based generationless fee-payment path the
-/// wallet adds. Dust *spends* carry ZK proofs (they need a prover) and are rejected here, so only
-/// registrations remain to sign.
-fn dust_registration_count(intent: &IntentProvenUnsealed) -> Result<usize, SignerError> {
-    match intent.dust_actions.as_ref() {
-        None => Ok(0),
-        Some(da) => {
-            let da = da.deref();
-            if !da.spends.is_empty() {
-                return Err(SignerError::InvalidTransaction(
-                    "dust spend signing requires proving, which is unsupported".into(),
-                ));
-            }
-            Ok(da.registrations.len())
-        }
-    }
+/// Count the intent's dust fee registrations — the signature path the wallet signs with its Night
+/// key. Dust *spends* are authorized by their own ZK proof (built and proved by the balancer) and
+/// carry no signature, so they pass through untouched and are not counted here.
+fn dust_registration_count(intent: &IntentProvenUnsealed) -> usize {
+    intent
+        .dust_actions
+        .as_ref()
+        .map(|da| da.deref().registrations.len())
+        .unwrap_or(0)
 }
 
 /// Sign the unshielded intent of a balanced proven (`proof,embedded-fr`) Midnight Standard
@@ -746,7 +739,7 @@ fn dust_registration_count(intent: &IntentProvenUnsealed) -> Result<usize, Signe
 /// [`seal_signed_proven`] reattaches and seals them.
 fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
     let (_stx, seg_id, intent) = parse_single_intent_standard(tx_bytes)?;
-    let n_regs = dust_registration_count(&intent)?;
+    let n_regs = dust_registration_count(&intent);
 
     let seeds = MidnightSigner::decode_keys(private_key)?;
     let signing_key = MidnightSigningKey::from_bytes(seeds.unshielded.expose()).map_err(|e| {
@@ -800,7 +793,7 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
 /// Keyless: `add_signatures` and `.seal()` take no key, only an RNG. Returns the sealed tx bytes.
 fn seal_signed_proven(tx_bytes: &[u8], signatures: &[u8]) -> Result<Vec<u8>, SignerError> {
     let (stx, seg_id, mut intent) = parse_single_intent_standard(tx_bytes)?;
-    let n_regs = dust_registration_count(&intent)?;
+    let n_regs = dust_registration_count(&intent);
 
     let n_inputs = intent.guaranteed_inputs().len();
     let mut r: &[u8] = signatures;
