@@ -99,43 +99,49 @@ fn try_registration_dust_actions(
     )))
 }
 
+/// The transaction context a generationless DUST fee registration is sized against: the proven
+/// standard tx and its single intent segment, the balanced unshielded offer and the UTXOs funding it,
+/// the wallet's dust/night keys, and the chain time plus ledger parameters that fix the fee.
+pub(super) struct DustFeeContext<'a> {
+    pub(super) stx: &'a StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    pub(super) seg_id: u16,
+    pub(super) intent_in: &'a Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    pub(super) offer: &'a UnshieldedOffer<MnSig, InMemoryDB>,
+    pub(super) selected: &'a [UnshieldedUtxo],
+    pub(super) dust_pk: DustPublicKey,
+    pub(super) night_vk: VerifyingKey,
+    pub(super) dust_ctime: Timestamp,
+    pub(super) ledger_params: &'a LedgerParameters,
+}
+
 /// Size a generationless DUST fee registration that balances the transaction. The fee depends on the
 /// tx (registration bytes included), so estimate → build registration → re-check, converging within
 /// a few iterations. Registration-only (no proof); a wallet with no unregistered NIGHT capacity is
 /// an error here rather than falling back to proof-bearing dust spends.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn cover_dust_fee_registration(
-    stx: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
-    seg_id: u16,
-    intent_in: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
-    offer: &UnshieldedOffer<MnSig, InMemoryDB>,
-    selected: &[UnshieldedUtxo],
-    dust_pk: DustPublicKey,
-    night_vk: VerifyingKey,
-    dust_ctime: Timestamp,
-    ledger_params: &LedgerParameters,
+    ctx: &DustFeeContext,
 ) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
     const MAX_FEE_ITERS: usize = 8;
-    let intent_ttl = chain_aligned_intent_ttl(dust_ctime);
+    let intent_ttl = chain_aligned_intent_ttl(ctx.dust_ctime);
 
     // First pass: a zero-allowance registration only to size the fee.
-    let first = registration_dust_actions(dust_pk, night_vk.clone(), 0, dust_ctime);
+    let first = registration_dust_actions(ctx.dust_pk, ctx.night_vk.clone(), 0, ctx.dust_ctime);
     let tx_first = wrap_proven_standard(
-        stx,
-        seg_id,
-        assemble_proven_intent(offer, intent_in, Some(first), intent_ttl),
+        ctx.stx,
+        ctx.seg_id,
+        assemble_proven_intent(ctx.offer, ctx.intent_in, Some(first), intent_ttl),
     );
     let mut fee_target = tx_first
-        .fees(ledger_params, false)
+        .fees(ctx.ledger_params, false)
         .map_err(|e| err(format!("DUST fee estimate failed: {e:?}")))?;
 
     for attempt in 0..MAX_FEE_ITERS {
         let Some(reg) = try_registration_dust_actions(
-            selected,
+            ctx.selected,
             fee_target,
-            dust_pk,
-            night_vk.clone(),
-            dust_ctime,
+            ctx.dust_pk,
+            ctx.night_vk.clone(),
+            ctx.dust_ctime,
         )?
         else {
             return Err(err(
@@ -143,15 +149,15 @@ pub(super) fn cover_dust_fee_registration(
             ));
         };
         let tx_check = wrap_proven_standard(
-            stx,
-            seg_id,
-            assemble_proven_intent(offer, intent_in, Some(reg.clone()), intent_ttl),
+            ctx.stx,
+            ctx.seg_id,
+            assemble_proven_intent(ctx.offer, ctx.intent_in, Some(reg.clone()), intent_ttl),
         );
         if tx_balance_imbalances(&tx_check)?.is_empty() {
             return Ok(reg);
         }
         let actual_fee = tx_check
-            .fees(ledger_params, false)
+            .fees(ctx.ledger_params, false)
             .map_err(|e| err(format!("DUST fee re-estimate failed: {e:?}")))?;
         fee_target = actual_fee.max(fee_target.saturating_add(1));
         if attempt + 1 == MAX_FEE_ITERS {

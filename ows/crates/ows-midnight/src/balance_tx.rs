@@ -38,7 +38,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
-use fee_sizing::cover_dust_fee_registration;
+use fee_sizing::{cover_dust_fee_registration, DustFeeContext};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
@@ -383,17 +383,17 @@ fn balance_unsealed_proven_standard_tx(
             .dust_public_key()
             .map_err(|e| err(e.to_string()))?;
         let night_vk = sender_vk.clone();
-        let registration = cover_dust_fee_registration(
-            &stx,
+        let registration = cover_dust_fee_registration(&DustFeeContext {
+            stx: &stx,
             seg_id,
-            &intent_in,
-            &offer,
-            &selected,
+            intent_in: &intent_in,
+            offer: &offer,
+            selected: &selected,
             dust_pk,
             night_vk,
             dust_ctime,
-            &ledger_params,
-        )?;
+            ledger_params: &ledger_params,
+        })?;
         (Some(registration), chain_aligned_intent_ttl(dust_ctime))
     } else {
         (None, intent_in.ttl)
