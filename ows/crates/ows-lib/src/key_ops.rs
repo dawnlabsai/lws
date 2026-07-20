@@ -103,8 +103,8 @@ pub fn sign_with_api_key(
         vault_path,
     )?;
 
-    // 7. Sign (extract signable portion first — e.g. strips Solana sig-slot headers)
-    let signable = signer.extract_signable_bytes(tx_bytes)?;
+    let signable_tx = crate::ops::prepare_signable_tx(chain, tx_bytes.to_vec(), &key)?;
+    let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
 
     Ok(crate::types::SignResult {

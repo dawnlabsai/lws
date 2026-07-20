@@ -513,10 +513,11 @@ pub fn sign_transaction(
         );
     }
 
-    // Owner mode: existing passphrase-based signing (unchanged)
+    // Owner mode: passphrase-based signing
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
+    let signable_tx = prepare_signable_tx(&chain, tx_bytes, &key)?;
     let signer = signer_for_chain(&chain);
-    let signable = signer.extract_signable_bytes(&tx_bytes)?;
+    let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
 
     Ok(SignResult {
@@ -536,6 +537,28 @@ pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8
     let clean = tx_input.strip_prefix("0x").unwrap_or(tx_input);
     hex::decode(clean)
         .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))
+}
+
+/// Second, key-aware step of preparing a signable transaction. A no-op for every chain except
+/// Midnight, where the DApp Connector request carried through by `decode_tx_input` is parsed and
+/// balanced — using `key` to pull in the wallet's own inputs — into the transaction to sign. Every
+/// caller resolves the key first (the agent path only after policy evaluation). Not wired yet, so
+/// Midnight errors.
+pub fn prepare_signable_tx(
+    chain: &ows_core::Chain,
+    tx_bytes: Vec<u8>,
+    key: &SecretBytes,
+) -> Result<Vec<u8>, OwsLibError> {
+    if chain.chain_type != ChainType::Midnight {
+        return Ok(tx_bytes);
+    }
+    // TODO(midnight balanceUnsealed): parse the connector request from tx_bytes, classify it, and
+    // balance it into the transaction to sign using `key` (payFees=false / unshielded-only for v1,
+    // proving deferred).
+    let _ = (tx_bytes, key);
+    Err(OwsLibError::InvalidInput(
+        "Midnight transaction preparation is not yet implemented".into(),
+    ))
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.
@@ -703,10 +726,11 @@ pub fn sign_and_send(
 
     let chain_info = parse_chain(chain)?;
     // `decode_tx_input` carries a Midnight DApp Connector request through as UTF-8; every other chain
-    // hex-decodes, so a Midnight request is no longer rejected before it can be balanced.
+    // hex-decodes. `prepare_signable_tx` then authorizes it (for Midnight: parse, balance, prove, seal;
+    // a no-op passthrough elsewhere) so the bytes handed to broadcast are the wallet's real transaction.
     let tx_bytes = decode_tx_input(&chain_info, tx_hex)?;
 
-    // Agent mode: enforce policies, decrypt key, then sign + broadcast
+    // Agent mode: enforce policies, decrypt key, authorize the balancing, then sign + broadcast.
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
@@ -722,13 +746,14 @@ pub fn sign_and_send(
             index,
             vault_path,
         )?;
-        return sign_encode_and_broadcast(key.expose(), chain, &tx_bytes, rpc_url);
+        let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key)?;
+        return sign_encode_and_broadcast(key.expose(), chain, &signable_tx, rpc_url);
     }
 
     // Owner mode
     let key = decrypt_signing_key(wallet, chain_info.chain_type, credential, index, vault_path)?;
-
-    sign_encode_and_broadcast(key.expose(), chain, &tx_bytes, rpc_url)
+    let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key)?;
+    sign_encode_and_broadcast(key.expose(), chain, &signable_tx, rpc_url)
 }
 
 /// Sign, encode, and broadcast a transaction using an already-resolved private key.
