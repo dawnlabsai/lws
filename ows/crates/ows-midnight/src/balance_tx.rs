@@ -337,10 +337,65 @@ fn assemble_proven_intent(
         guaranteed_unshielded_offer: Some(Sp::new(offer.clone())),
         fallible_unshielded_offer: None,
         actions: intent_in.actions.clone(),
-        dust_actions: dust_actions.map(Sp::new),
+        // Prefer the wallet's own dust section; otherwise carry through whatever the intent already
+        // held — merging into a dapp intent must never silently drop its dust.
+        dust_actions: dust_actions
+            .or_else(|| intent_in.dust_actions.as_ref().map(|sp| sp.deref().clone()))
+            .map(Sp::new),
         ttl,
         binding_commitment: intent_in.binding_commitment,
     }
+}
+
+/// An empty proven intent at zero binding randomness: no offers, actions, or dust. It carries the
+/// wallet's balancing offer + a dust section that needs its own timestamp onto a **fresh** segment
+/// (spec §L961-967) without disturbing the dapp's proven transaction. Zero `binding_commitment` keeps
+/// the added intent binding-neutral — `recompute_binding_randomness` sums each intent's
+/// `binding_commitment`, so the tx's global `binding_randomness` is unchanged.
+fn empty_intent_skeleton() -> Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
+    Intent {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: vec![].into(),
+        dust_actions: None,
+        ttl: Timestamp::from_secs(0),
+        binding_commitment: PedersenRandomness::from(0),
+    }
+}
+
+/// The next unused intent segment id: one past the current maximum. Intents never sit at segment 0
+/// (reserved for the guaranteed section), so this is always `>= 1` and collision-free.
+fn fresh_segment_id(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> u16 {
+    base.intents
+        .iter()
+        .map(|pair| *pair.deref().0.deref())
+        .max()
+        .map(|m| m.saturating_add(1))
+        .unwrap_or(1)
+}
+
+/// The intent's guaranteed unshielded outputs, cloned — re-emitted by the balancing offer that replaces
+/// that intent's guaranteed offer when the wallet merges into it.
+fn guaranteed_outputs_of(
+    intent: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+) -> Vec<UtxoOutput> {
+    intent
+        .guaranteed_unshielded_offer
+        .as_ref()
+        .map(|sp| {
+            sp.deref()
+                .outputs
+                .iter_deref()
+                .map(|o| UtxoOutput {
+                    value: o.value,
+                    owner: o.owner,
+                    type_: o.type_,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The wallet's inert shielded funding plan for one intent segment: the coins to spend — chosen whole
@@ -548,6 +603,7 @@ fn plan_unsealed_proven_standard_tx(
         pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url));
     let mut need_night: u128 = 0;
     let mut has_fallible_unshielded = false;
+    let mut has_preexisting_dust = false;
     let mut chosen: Option<(
         u16,
         Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
@@ -556,11 +612,16 @@ fn plan_unsealed_proven_standard_tx(
         let (seg_sp, intent_sp) = pair.deref();
         let seg_id = *seg_sp.deref();
         let intent = intent_sp.deref();
-        // Adding our own dust section clashes with a dust section the tx already carries.
-        if adding_dust && intent.dust_actions.is_some() {
-            return Err(err(
-                "transaction already carries dust actions, which is unsupported",
-            ));
+        // A dust section the tx already carries is fine — the wallet's own dust rides a fresh intent
+        // below (spec §L961-967). But it must not carry a dust *registration*: that is a second
+        // wallet-signable section, which the signer's one-signable-intent invariant can't accommodate.
+        if let Some(da) = intent.dust_actions.as_ref() {
+            has_preexisting_dust = true;
+            if adding_dust && !da.deref().registrations.is_empty() {
+                return Err(err(
+                    "transaction already carries a dust fee registration, which is unsupported",
+                ));
+            }
         }
         has_fallible_unshielded |= intent.fallible_unshielded_offer.is_some();
         if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
@@ -586,23 +647,20 @@ fn plan_unsealed_proven_standard_tx(
             chosen = Some((seg_id, intent.clone()));
         }
     }
-    let (seg_id, intent_in) = chosen.ok_or_else(|| err("expected at least one intent segment"))?;
 
-    let outputs_in: Vec<UtxoOutput> = intent_in
-        .guaranteed_unshielded_offer
-        .as_ref()
-        .map(|sp| {
-            sp.deref()
-                .outputs
-                .iter_deref()
-                .map(|o| UtxoOutput {
-                    value: o.value,
-                    owner: o.owner,
-                    type_: o.type_,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Where the wallet folds its balancing inputs + dust. Normally it merges into an existing intent,
+    // re-emitting that intent's own guaranteed outputs. But when the tx already carries a dust section,
+    // the wallet's dust needs its own timestamp — an intent holds only one dust section — so it rides a
+    // brand-new intent at a fresh segment with an empty skeleton (no outputs to re-emit: every existing
+    // intent keeps its guaranteed offer, so its outputs stay put) per spec §L961-967.
+    let (seg_id, intent_in, outputs_in) = if adding_dust && has_preexisting_dust {
+        (fresh_segment_id(&base), empty_intent_skeleton(), Vec::new())
+    } else {
+        let (seg_id, intent_in) =
+            chosen.ok_or_else(|| err("expected at least one intent segment"))?;
+        let outputs_in = guaranteed_outputs_of(&intent_in);
+        (seg_id, intent_in, outputs_in)
+    };
 
     let (offer, selected) = build_balanced_unshielded_offer(
         indexer_url,
@@ -1047,5 +1105,138 @@ mod tests {
         let exact = plan_shielded_inputs(&coins, &[(token, 500)]).unwrap();
         assert_eq!(exact.coins.len(), 1);
         assert!(exact.change_by_token.is_empty());
+    }
+
+    /// An empty unshielded offer (no inputs/outputs/signatures) — a placeholder for tests that only
+    /// exercise intent structure, not balancing.
+    fn empty_offer() -> UnshieldedOffer<MnSig, InMemoryDB> {
+        UnshieldedOffer {
+            inputs: vec![].into(),
+            outputs: vec![].into(),
+            signatures: vec![].into(),
+        }
+    }
+
+    /// A proven intent carrying `offer` as its guaranteed offer plus optional dust, at a **nonzero**
+    /// binding commitment so tests can observe whether it is perturbed.
+    fn intent_with(
+        offer: Option<UnshieldedOffer<MnSig, InMemoryDB>>,
+        dust: Option<DustActions<MnSig, ProofMarker, InMemoryDB>>,
+    ) -> Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
+        Intent {
+            guaranteed_unshielded_offer: offer.map(Sp::new),
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: dust.map(Sp::new),
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: PedersenRandomness::from(7),
+        }
+    }
+
+    fn base_with_intents(
+        intents: Vec<(
+            u16,
+            Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+        )>,
+    ) -> StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
+        let mut map: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new();
+        for (seg, intent) in intents {
+            map = map.insert(seg, intent);
+        }
+        StandardTransaction {
+            network_id: "midnight:test".to_string(),
+            intents: map,
+            guaranteed_coins: None,
+            fallible_coins: MnHashMap::new(),
+            binding_randomness: PedersenRandomness::from(0),
+        }
+    }
+
+    /// The fresh segment is one past the current maximum, and 1 when there are no intents — never 0
+    /// (reserved for the guaranteed section).
+    #[test]
+    fn fresh_segment_id_is_one_past_the_max() {
+        let base = base_with_intents(vec![
+            (2, intent_with(None, None)),
+            (5, intent_with(None, None)),
+        ]);
+        assert_eq!(fresh_segment_id(&base), 6);
+        assert_eq!(fresh_segment_id(&base_with_intents(vec![])), 1);
+    }
+
+    /// The skeleton that carries a wallet dust section onto a fresh segment is empty and
+    /// binding-neutral (zero `binding_commitment`), so adding it leaves the tx's `binding_randomness`
+    /// untouched.
+    #[test]
+    fn empty_intent_skeleton_is_empty_and_binding_neutral() {
+        let s = empty_intent_skeleton();
+        assert_eq!(s.binding_commitment, PedersenRandomness::from(0));
+        assert!(s.guaranteed_unshielded_offer.is_none());
+        assert!(s.fallible_unshielded_offer.is_none());
+        assert!(s.dust_actions.is_none());
+        assert_eq!(s.actions.len(), 0);
+    }
+
+    /// Merging into a dapp intent that already carries its own dust must not drop it when the wallet
+    /// supplies no dust of its own; the wallet's dust wins when it does.
+    #[test]
+    fn assemble_preserves_a_dapp_intents_own_dust() {
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let intent_in = intent_with(None, Some(dust_fee_registration(&vk)));
+
+        // No dust of our own → the intent's existing dust survives.
+        let kept =
+            assemble_proven_intent(&empty_offer(), &intent_in, None, Timestamp::from_secs(0));
+        assert!(
+            kept.dust_actions.is_some(),
+            "merging must not drop the intent's own dust"
+        );
+
+        // Our own dust replaces it when supplied.
+        let ours = dust_fee_registration(&vk);
+        let replaced = assemble_proven_intent(
+            &empty_offer(),
+            &intent_in,
+            Some(ours.clone()),
+            Timestamp::from_secs(0),
+        );
+        assert_eq!(
+            replaced.dust_actions.as_ref().unwrap().deref().ctime,
+            ours.ctime
+        );
+    }
+
+    /// Placing the wallet's balancing offer at a fresh segment (the Gap C new-intent path) adds an
+    /// intent without touching the existing ones or the tx's binding randomness.
+    #[test]
+    fn wrap_at_a_fresh_segment_adds_without_disturbing_the_rest() {
+        let base = base_with_intents(vec![(2, intent_with(Some(empty_offer()), None))]);
+        let orig_binding = base.binding_randomness;
+        let fresh = fresh_segment_id(&base);
+        assert_eq!(fresh, 3);
+
+        let new_intent = assemble_proven_intent(
+            &empty_offer(),
+            &empty_intent_skeleton(),
+            None,
+            Timestamp::from_secs(0),
+        );
+        let Transaction::Standard(stx) = wrap_proven_standard(&base, fresh, new_intent) else {
+            panic!("standard");
+        };
+
+        let segs: Vec<u16> = stx.intents.iter().map(|p| *p.deref().0.deref()).collect();
+        assert_eq!(
+            stx.intents.iter().count(),
+            2,
+            "the original intent survives"
+        );
+        assert!(segs.contains(&2) && segs.contains(&3));
+        assert_eq!(
+            stx.binding_randomness, orig_binding,
+            "a binding-neutral intent leaves binding_randomness untouched"
+        );
     }
 }
