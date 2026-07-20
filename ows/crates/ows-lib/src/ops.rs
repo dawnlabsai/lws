@@ -919,9 +919,8 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
         ChainType::Xrpl => broadcast_xrpl(rpc_url, signed_bytes),
         ChainType::Nano => broadcast_nano(rpc_url, signed_bytes),
         ChainType::Near => crate::near_rpc::broadcast_tx_commit(rpc_url, signed_bytes),
-        ChainType::Midnight => Err(OwsLibError::InvalidInput(
-            "Midnight send is not wired until transaction signing is integrated".into(),
-        )),
+        ChainType::Midnight => ows_midnight::broadcast_sealed(rpc_url, signed_bytes)
+            .map_err(|e| OwsLibError::BroadcastFailed(e.to_string())),
     }
 }
 
