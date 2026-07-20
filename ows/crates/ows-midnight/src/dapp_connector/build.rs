@@ -12,7 +12,9 @@ use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
     PublicKey as CoinPublicKey, ShieldedTokenType, UnshieldedTokenType, UserAddress, NIGHT,
 };
-use midnight_ledger::structure::{ProofPreimageMarker, Transaction, INITIAL_PARAMETERS};
+use midnight_ledger::structure::{
+    ProofMarker, ProofPreimageMarker, Transaction, INITIAL_PARAMETERS,
+};
 use midnight_serialize::{tagged_serialize, Deserializable};
 use midnight_storage::db::InMemoryDB;
 use ows_core::sync_cache::SyncCacheScope;
@@ -26,6 +28,9 @@ use crate::{parse_token_type, TokenType};
 /// The `proof-preimage,embedded-fr` transaction a wallet-constructed method builds before proving.
 pub(super) type PreimageTx =
     Transaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
+
+/// The proven (`proof,embedded-fr`) transaction a preimage becomes once proved.
+pub(super) type ProvenTx = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
 pub(super) fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
@@ -148,11 +153,12 @@ pub(super) fn decode_shielded_recipient(
 }
 
 /// Prove a wallet-constructed preimage into a proven, still-unsealed (`proof,embedded-fr`)
-/// transaction and serialize it — the exact input shape `plan_unsealed_proven_tx` consumes.
-pub(super) fn prove_to_unsealed_bytes(
+/// transaction. `makeIntent` keeps the proven transaction to merge authorized shielded-input
+/// fragments into it; the other methods serialize it straight away via [`prove_to_unsealed_bytes`].
+pub(super) fn prove_preimage(
     chain_id: &str,
     preimage: PreimageTx,
-) -> Result<Vec<u8>, std::io::Error> {
+) -> Result<ProvenTx, std::io::Error> {
     let scope = SyncCacheScope {
         chain_id: Some(chain_id.to_string()),
         ..Default::default()
@@ -161,8 +167,17 @@ pub(super) fn prove_to_unsealed_bytes(
         .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
     let prover = crate::Prover::new(dir);
     let cost_model = &INITIAL_PARAMETERS.cost_model.runtime_cost_model;
-    let proven = crate::block_on(preimage.prove(prover, cost_model))
-        .map_err(|e| err(format!("prove constructed outputs: {e}")))?;
+    crate::block_on(preimage.prove(prover, cost_model))
+        .map_err(|e| err(format!("prove constructed outputs: {e}")))
+}
+
+/// Prove a wallet-constructed preimage and serialize it — the exact input shape
+/// `plan_unsealed_proven_tx` consumes.
+pub(super) fn prove_to_unsealed_bytes(
+    chain_id: &str,
+    preimage: PreimageTx,
+) -> Result<Vec<u8>, std::io::Error> {
+    let proven = prove_preimage(chain_id, preimage)?;
     let mut out = Vec::new();
     tagged_serialize(&proven, &mut out).map_err(|e| err(format!("serialize proven tx: {e}")))?;
     Ok(out)
