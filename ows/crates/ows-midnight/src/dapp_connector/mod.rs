@@ -11,11 +11,13 @@ use serde::Deserialize;
 
 use crate::BalancedPlan;
 
+mod balance_sealed;
 mod balance_unsealed;
 mod build;
 mod make_intent;
 mod make_transfer;
 
+pub use balance_sealed::{parse_balance_sealed_json, BalanceSealedRequest};
 pub use balance_unsealed::{
     classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
 };
@@ -32,6 +34,8 @@ pub enum ConnectorMethod {
     MakeTransfer,
     /// `makeIntent` — the wallet builds an imbalanced maker swap-offer intent.
     MakeIntent,
+    /// `balanceSealedTransaction` — the wallet (taker) completes a maker's swap offer.
+    BalanceSealed,
     /// A method name the wallet parses but does not yet handle (e.g. a sibling still to be built).
     Other(String),
 }
@@ -51,6 +55,7 @@ pub fn parse_connector_method(json: &str) -> Result<ConnectorMethod, std::io::Er
         None | Some("balanceUnsealedTransaction") => ConnectorMethod::BalanceUnsealed,
         Some("makeTransfer") => ConnectorMethod::MakeTransfer,
         Some("makeIntent") => ConnectorMethod::MakeIntent,
+        Some("balanceSealedTransaction") => ConnectorMethod::BalanceSealed,
         Some(other) => ConnectorMethod::Other(other.to_string()),
     })
 }
@@ -66,6 +71,9 @@ pub enum ConnectorPlan {
     MakeTransfer(MakeTransferRequest),
     /// A `makeIntent` request; the wallet builds an imbalanced maker offer, proved in `authorize`.
     MakeIntent(MakeIntentRequest),
+    /// A `balanceSealedTransaction`: the taker's balancing of a proven maker offer, planned against
+    /// the wallet's own inputs — the same shape as `BalanceUnsealed`.
+    BalanceSealed(Box<BalancedPlan>),
 }
 
 impl ConnectorPlan {
@@ -85,6 +93,9 @@ impl ConnectorPlan {
             }
             ConnectorPlan::MakeIntent(req) => {
                 make_intent::authorize(chain_id, crypto_provider, req)
+            }
+            ConnectorPlan::BalanceSealed(plan) => {
+                crate::authorize_proven_tx(chain_id, crypto_provider, *plan)
             }
         }
     }
@@ -106,6 +117,7 @@ pub fn plan_connector_tx(
             Ok(ConnectorPlan::MakeTransfer(parse_make_transfer_json(json)?))
         }
         ConnectorMethod::MakeIntent => Ok(ConnectorPlan::MakeIntent(parse_make_intent_json(json)?)),
+        ConnectorMethod::BalanceSealed => balance_sealed::plan(chain_id, crypto_provider, json),
         ConnectorMethod::Other(method) => Err(std::io::Error::other(format!(
             "Midnight DApp Connector method '{method}' is not yet implemented"
         ))),
