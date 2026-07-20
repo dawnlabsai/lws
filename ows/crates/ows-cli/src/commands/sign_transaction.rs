@@ -23,7 +23,12 @@ pub fn run(
             Some(index),
             None,
         )?;
-        return print_result(&result.signature, result.recovery_id, json_output);
+        return print_result(
+            &result.signature,
+            result.recovery_id,
+            result.transaction,
+            json_output,
+        );
     }
 
     // Owner mode: resolve key directly (existing behavior)
@@ -36,10 +41,13 @@ pub fn run(
     let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
+    let transaction =
+        ows_lib::signed_transaction_hex(&chain, signer.as_ref(), &signable_tx, &output)?;
 
     print_result(
         &hex::encode(&output.signature),
         output.recovery_id,
+        transaction,
         json_output,
     )
 }
@@ -47,13 +55,18 @@ pub fn run(
 fn print_result(
     signature: &str,
     recovery_id: Option<u8>,
+    transaction: Option<String>,
     json_output: bool,
 ) -> Result<(), CliError> {
     if json_output {
-        let obj = serde_json::json!({
+        let mut obj = serde_json::json!({
             "signature": signature,
             "recovery_id": recovery_id,
         });
+        // Only chains that seal a complete transaction at sign time (Midnight) carry this.
+        if let Some(transaction) = transaction {
+            obj["transaction"] = serde_json::Value::String(transaction);
+        }
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         println!("{signature}");

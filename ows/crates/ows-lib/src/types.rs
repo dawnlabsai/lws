@@ -22,6 +22,12 @@ pub struct WalletInfo {
 pub struct SignResult {
     pub signature: String,
     pub recovery_id: Option<u8>,
+    /// The fully signed, sealed transaction (hex), when a chain assembles a complete broadcastable
+    /// artifact at sign time. Only Midnight does: its proven intent is signed and then sealed
+    /// (keyless), yielding a submit-ready transaction. `None` for every other chain, whose signing
+    /// product is the bare `signature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<String>,
 }
 
 /// Result from a sign-and-send operation.

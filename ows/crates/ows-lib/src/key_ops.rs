@@ -106,10 +106,13 @@ pub fn sign_with_api_key(
     let signable_tx = crate::ops::prepare_signable_tx(chain, tx_bytes.to_vec(), &key)?;
     let signable = signer.extract_signable_bytes(&signable_tx)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
+    let transaction =
+        crate::ops::signed_transaction_hex(chain, signer.as_ref(), &signable_tx, &output)?;
 
     Ok(crate::types::SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction,
     })
 }
 
@@ -144,6 +147,7 @@ pub fn sign_message_with_api_key(
     Ok(crate::types::SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction: None,
     })
 }
 
@@ -180,6 +184,7 @@ pub fn sign_hash_with_api_key(
     Ok(crate::types::SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction: None,
     })
 }
 
@@ -264,6 +269,7 @@ pub fn sign_typed_data_with_api_key(
     Ok(crate::types::SignResult {
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
+        transaction: None,
     })
 }
 
