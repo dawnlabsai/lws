@@ -804,8 +804,13 @@ pub fn sign_encode_and_broadcast(
     // 3. Encode the full signed transaction
     let signed_tx = signer.encode_signed_transaction(tx_bytes, &output)?;
 
-    // 4. Resolve RPC URL using exact chain_id
-    let rpc = resolve_rpc_url(chain.chain_id, chain.chain_type, rpc_url)?;
+    // 4. Resolve the RPC URL. Midnight submits to a Substrate node, which is a different endpoint
+    //    than the GraphQL indexer that `resolve_rpc_url` returns for balance queries.
+    let rpc = if chain.chain_type == ChainType::Midnight {
+        resolve_midnight_node_rpc_url(chain.chain_id, rpc_url)?
+    } else {
+        resolve_rpc_url(chain.chain_id, chain.chain_type, rpc_url)?
+    };
 
     // 5. Broadcast the full signed transaction
     let tx_hash = broadcast(chain.chain_type, &rpc, &signed_tx)?;
@@ -868,6 +873,30 @@ fn resolve_rpc_url(
 
     Err(OwsLibError::InvalidInput(format!(
         "no RPC URL configured for chain '{chain_id}'"
+    )))
+}
+
+/// Resolve the Midnight node (Substrate) RPC URL for transaction submission — the endpoint that
+/// accepts `Midnight::send_mn_transaction`, distinct from the GraphQL indexer used for balance
+/// queries. Looks up the `{chain_id}:node` key (e.g. `midnight:preview:node`); an explicit `--rpc`
+/// override wins. There is deliberately no namespace fallback, so a missing entry errors instead of
+/// silently returning the indexer URL.
+fn resolve_midnight_node_rpc_url(
+    chain_id: &str,
+    explicit: Option<&str>,
+) -> Result<String, OwsLibError> {
+    if let Some(url) = explicit {
+        return Ok(url.to_string());
+    }
+    let key = format!("{chain_id}:node");
+    if let Some(url) = Config::load_or_default().rpc.get(&key) {
+        return Ok(url.clone());
+    }
+    if let Some(url) = Config::default_rpc().get(&key) {
+        return Ok(url.clone());
+    }
+    Err(OwsLibError::InvalidInput(format!(
+        "no Midnight node RPC URL configured for '{chain_id}' (pass --rpc <node-url> or set rpc.{key})"
     )))
 }
 
