@@ -5,6 +5,7 @@ use midnight_base_crypto::signatures::{
 };
 use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin;
+use midnight_coin_structure::coin::{Info as CoinInfo, QualifiedInfo, ShieldedTokenType};
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{
     DustActions, DustLocalState, DustOutput, DustPublicKey, DustRegistration, DustSecretKey,
@@ -22,13 +23,14 @@ use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::keys::{SecretKeys as ZswapSecretKeys, Seed as ZswapSeed};
 use midnight_zswap::local::State as ZswapLocalState;
+use midnight_zswap::{Offer as ZswapOffer, Output as ZswapOutput};
 use num_bigint::BigUint;
 use rand::rngs::{OsRng, StdRng};
 use rand::SeedableRng as _;
 use sha2::Digest;
 use std::ops::Deref as _;
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::ProvingProvider;
+use transient_crypto::proofs::{ProofPreimage, ProvingProvider};
 
 use crate::curve::Curve;
 use crate::hd::DerivedKey;
@@ -464,6 +466,23 @@ fn scale_bigint_encode_biguint(n: &BigUint) -> Result<Vec<u8>, SignerError> {
     Ok(out)
 }
 
+/// A shielded input/change spend to authorize for one intent segment: the coins to spend and the
+/// self-change to mint per token. A keyless balancer plans this — selection needs the spending key
+/// only to *detect* coins (via nullifiers), which is non-authorizing — and the authorizing witness is
+/// built from it here, in the signer.
+pub struct ShieldedSpendPlan {
+    pub segment: u16,
+    pub coins: Vec<QualifiedInfo>,
+    pub change: Vec<(ShieldedTokenType, u128)>,
+}
+
+/// Proof-preimage shielded offers built by [`MidnightCryptoProvider::build_preimage_shielded_offers`]:
+/// one offer per segment (tagged by segment id) plus the summed Pedersen binding-randomness delta.
+type ShieldedPreimages = (
+    Vec<(u16, ZswapOffer<ProofPreimage, InMemoryDB>)>,
+    PedersenRandomness,
+);
+
 /// Holds the decoded Midnight account seeds plus the keys derived from them once at construction.
 /// Created via [`MidnightSigner::crypto_provider`]. Keys never leave the provider — callers get
 /// public outputs only (addresses, the dust public key, a fingerprint), so balance code can hold
@@ -576,6 +595,68 @@ impl MidnightCryptoProvider {
         state
             .replay_events(&self.shielded_keys, std::iter::once(ev))
             .map_err(|e| SignerError::SigningFailed(format!("replay zswap event failed: {e:?}")))
+    }
+
+    /// Build the proof-preimage shielded input offers for each segment (the key-bearing spend-witness
+    /// construction) WITHOUT proving. Shared by `authorize_shielded` (which proves each) and the offline
+    /// fee-sizing path (which mock-proves + discards each). The preimage is for a throwaway sizing tx or
+    /// the real authorization; either way the spend witnesses are built here from `self.shielded_keys`.
+    pub fn build_preimage_shielded_offers(
+        &self,
+        plans: &[ShieldedSpendPlan],
+        tree: &ZswapLocalState<InMemoryDB>,
+    ) -> Result<ShieldedPreimages, SignerError> {
+        use rand::Rng as _;
+        let mut rng = OsRng;
+        let keys = &self.shielded_keys;
+        let cpk = keys.coin_public_key();
+
+        let mut preimages = Vec::with_capacity(plans.len());
+        let mut binding_delta = PedersenRandomness::from(0);
+
+        for plan in plans {
+            // Fresh clone per segment: each spend sees the prior spends' pending nullifiers (mirroring
+            // the signer), while the plan's tree stays pristine for the real authorization.
+            let mut working = tree.clone();
+            let mut inputs = Vec::with_capacity(plan.coins.len());
+            for coin in &plan.coins {
+                let (next, input) = working
+                    .spend(&mut rng, keys, coin, Some(plan.segment))
+                    .map_err(|e| {
+                        SignerError::SigningFailed(format!("shielded spend build failed: {e:?}"))
+                    })?;
+                working = next;
+                inputs.push(input);
+            }
+
+            let mut outputs = Vec::with_capacity(plan.change.len());
+            for (token, amount) in &plan.change {
+                let coin = CoinInfo {
+                    nonce: rng.r#gen(),
+                    type_: *token,
+                    value: *amount,
+                };
+                let out = ZswapOutput::new(
+                    &mut rng,
+                    &coin,
+                    Some(plan.segment),
+                    &cpk,
+                    Some(keys.enc_public_key()),
+                )
+                .map_err(|e| {
+                    SignerError::SigningFailed(format!("shielded change output failed: {e:?}"))
+                })?;
+                outputs.push(out);
+            }
+
+            let offer = ZswapOffer::new(inputs, outputs, vec![]).ok_or_else(|| {
+                SignerError::SigningFailed("failed to build the shielded input offer".into())
+            })?;
+            binding_delta = binding_delta + offer.binding_randomness();
+            preimages.push((plan.segment, offer));
+        }
+
+        Ok((preimages, binding_delta))
     }
 
     /// Build proof-preimage dust spends sufficient to cover `fee_dust`. Offline — no proving, no

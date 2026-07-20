@@ -52,6 +52,21 @@ pub async fn sync_wallet(
     vk_hidden::sync_wallet(indexer_url, crypto_provider, scope, current_block_height).await
 }
 
+/// Rehash the synced Merkle tree and confirm it has a root, so coin spends can build a valid
+/// membership path. Coin selection (`State::spend`) reads the tree; a sync that left it collapsed or
+/// rootless would otherwise fail deep inside spend-building with an opaque error.
+pub(crate) fn ensure_shielded_merkle_ready(
+    state: &mut ZswapLocalState<InMemoryDB>,
+) -> Result<(), std::io::Error> {
+    state.merkle_tree = state.merkle_tree.rehash();
+    if state.merkle_tree.root().is_none() {
+        return Err(std::io::Error::other(
+            "shielded Merkle tree has no root after sync; the shielded wallet sync may be incomplete",
+        ));
+    }
+    Ok(())
+}
+
 /// Shielded balances for `ows fund balance` — derived from the synced wallet state.
 pub async fn get_shielded_balances_for_display(
     indexer_url: &str,

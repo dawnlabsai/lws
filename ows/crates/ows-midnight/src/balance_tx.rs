@@ -1,21 +1,23 @@
 //! Wallet-side balancing of an already-proven (`proof,embedded-fr`) unsealed Midnight Standard
 //! transaction against the indexer's UTXO set.
 //!
-//! v1 scope: the wallet injects its own **unshielded** NIGHT inputs (and a change output) to cover
-//! the transaction's unshielded outputs, preserving the existing ZK proofs, and — when asked to pay
-//! fees on a chain that needs DUST — covers the fee with either a signature-based **generationless**
-//! DUST fee registration funded by its own unregistered NIGHT (no proving), or, when the wallet has
-//! no unregistered NIGHT capacity (its NIGHT is all registered for dust generation), a proof-bearing
-//! **DUST spend** of its generated dust. Shielded-input balancing is not handled — a transaction
-//! that needs it is rejected.
+//! The wallet injects its own inputs, preserving the existing ZK proofs: **shielded** coins to fund
+//! a shielded deficit (e.g. a contract deposit whose Zswap offer has outputs but no inputs), then
+//! **unshielded** NIGHT inputs (and a change output) to cover the transaction's unshielded outputs.
+//! Each added shielded fragment is proved on its own and merged into the already-proven guaranteed
+//! offer. When asked to pay fees on a chain that needs DUST, the fee is covered with either a
+//! signature-based **generationless** DUST fee registration funded by its own unregistered NIGHT (no
+//! proving), or, when the wallet has no unregistered NIGHT capacity (its NIGHT is all registered for
+//! dust generation), a proof-bearing **DUST spend** of its generated dust.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
 use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
-    ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
+    QualifiedInfo, ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
 };
 use midnight_ledger::dust::{
     DustActions, DustLocalState, DustPublicKey, DustRegistration, DustSpend,
@@ -32,9 +34,11 @@ use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::Offer as ZswapOffer;
-use ows_signer::chains::{DustSpendPlan, MidnightCryptoProvider, MidnightNetwork};
+use ows_signer::chains::{
+    DustSpendPlan, MidnightCryptoProvider, MidnightNetwork, ShieldedSpendPlan,
+};
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::Proof as ZswapProof;
+use transient_crypto::proofs::{Proof as ZswapProof, ProvingProvider as _};
 
 use ows_core::sync_cache::SyncCacheScope;
 
@@ -337,8 +341,151 @@ fn assemble_proven_intent(
     }
 }
 
-/// Inject the wallet's unshielded inputs/change into a proven Standard transaction, preserving its
-/// existing proofs and shielded coins. Rejects transactions that would require shielded inputs.
+/// Select whole coins largest-first to cover each per-token `deficit` and size the self-change per
+/// token (selected total − deficit), building a per-segment [`ShieldedSpendPlan`] over the synced
+/// coin set. Pure selection — it neither spends nor proves; the authorizing witness is built later,
+/// from this plan, by the signer. Errors when a token's coins cannot cover its deficit.
+fn select_shielded_inputs(
+    segment: u16,
+    coins: &[QualifiedInfo],
+    deficits: &[(ShieldedTokenType, u128)],
+) -> Result<ShieldedSpendPlan, std::io::Error> {
+    let mut selected = Vec::new();
+    let mut change = Vec::new();
+
+    for (token, need) in deficits {
+        if *need == 0 {
+            continue;
+        }
+        let mut candidates: Vec<QualifiedInfo> = coins
+            .iter()
+            .copied()
+            .filter(|c| c.type_ == *token)
+            .collect();
+        candidates.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let mut remaining = *need;
+        let mut spent = 0u128;
+        for coin in candidates {
+            if remaining == 0 {
+                break;
+            }
+            selected.push(coin);
+            spent = spent.saturating_add(coin.value);
+            remaining = remaining.saturating_sub(coin.value);
+        }
+        if remaining > 0 {
+            return Err(err(format!(
+                "insufficient shielded balance for token {}: need {need}, short by {remaining}",
+                hex::encode(token.into_inner().0)
+            )));
+        }
+        let excess = spent.saturating_sub(*need);
+        if excess > 0 {
+            change.push((*token, excess));
+        }
+    }
+
+    Ok(ShieldedSpendPlan {
+        segment,
+        coins: selected,
+        change,
+    })
+}
+
+/// Fund a proven transaction's shielded deficit (e.g. a contract deposit whose Zswap offer has
+/// outputs but no inputs) with the wallet's own shielded coins, preserving the existing proofs.
+///
+/// Mirrors how the DUST-spend fee path proves independently and folds in: per intent segment, select
+/// the wallet's coins into a proof-preimage Zswap offer (inputs + self-change) via the crypto
+/// provider, prove that fragment on its own with the local [`Prover`](crate::Prover), and merge the
+/// proven fragment into the already-proven `guaranteed_coins`. A proven transaction can't recompute
+/// its Pedersen binding, so the spent/created coins' binding randomness is added to
+/// `binding_randomness` directly. A transaction with no shielded deficit is returned untouched.
+fn attach_shielded_inputs(
+    stx: StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    crypto_provider: &MidnightCryptoProvider,
+    indexer_url: &str,
+    scope: &SyncCacheScope,
+) -> Result<StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, std::io::Error>
+{
+    let Some(offer_sp) = stx.guaranteed_coins.as_ref() else {
+        return Ok(stx);
+    };
+    let deficits = if zswap_offer_needs_shielded_inputs(offer_sp.deref()) {
+        ledger_shielded_deficits(&Transaction::Standard(stx.clone()))?
+    } else {
+        Vec::new()
+    };
+    if deficits.is_empty() {
+        return Ok(stx);
+    }
+
+    let current_block_height = crate::tip_verify::fetch_current_block_height(indexer_url);
+    let wallet = crate::block_on(crate::wallet_sync::shielded::sync_wallet(
+        indexer_url,
+        crypto_provider,
+        scope,
+        current_block_height,
+    ))?;
+    let mut tree = wallet.zswap;
+    crate::wallet_sync::shielded::ensure_shielded_merkle_ready(&mut tree)?;
+
+    let mut by_segment: BTreeMap<u16, Vec<(ShieldedTokenType, u128)>> = BTreeMap::new();
+    for (token, need, segment) in deficits {
+        by_segment.entry(segment).or_default().push((token, need));
+    }
+
+    // The signer clones the tree fresh per segment, so a coin planned for one segment must not be
+    // planned for another; thread the remaining coins across segments to keep the plans disjoint.
+    let mut remaining: Vec<QualifiedInfo> =
+        tree.coins.iter().map(|(_nul, qci)| *qci.deref()).collect();
+    let mut plans = Vec::new();
+    for (segment, seg_deficits) in by_segment {
+        let plan = select_shielded_inputs(segment, &remaining, &seg_deficits)?;
+        if plan.coins.is_empty() {
+            continue;
+        }
+        remaining.retain(|c| !plan.coins.contains(c));
+        plans.push(plan);
+    }
+    if plans.is_empty() {
+        return Ok(stx);
+    }
+
+    let (preimages, binding_delta) = crypto_provider
+        .build_preimage_shielded_offers(&plans, &tree)
+        .map_err(|e| err(e.to_string()))?;
+
+    let mut prover = midnight_prover_for_scope(scope)?;
+    let mut merged: ZswapOffer<ZswapProof, InMemoryDB> = offer_sp.deref().clone();
+    for (segment, preimage) in preimages {
+        let (_segment, proven_partial) =
+            crate::block_on(preimage.prove(prover.split(), segment))
+                .map_err(|e| err(format!("prove shielded inputs failed: {e:?}")))?;
+        merged = merged
+            .merge(&proven_partial)
+            .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
+    }
+
+    let mut stx = stx;
+    stx.guaranteed_coins = Some(Sp::new(merged));
+    // Proven txs cannot call `recompute_binding_randomness`; add the spend/change randomness directly.
+    stx.binding_randomness = stx.binding_randomness + binding_delta;
+    Ok(stx)
+}
+
+/// Build the local [`Prover`](crate::Prover) for a sync scope's vault-rooted proving-key directory.
+/// Keyless: the prover holds proving/verifier keys, never a wallet secret.
+fn midnight_prover_for_scope(scope: &SyncCacheScope) -> Result<crate::Prover, std::io::Error> {
+    let dir = crate::cache_io::proving_keys_dir(scope)
+        .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
+    Ok(crate::Prover::new(dir))
+}
+
+/// Inject the wallet's own inputs into a proven Standard transaction, preserving its existing proofs:
+/// shielded inputs to fund a contract deposit (when the tx has a shielded deficit), then unshielded
+/// NIGHT inputs/change to cover the unshielded outputs.
 #[allow(clippy::too_many_arguments)]
 fn balance_unsealed_proven_standard_tx(
     indexer_url: &str,
@@ -356,15 +503,9 @@ fn balance_unsealed_proven_standard_tx(
         return Err(err("expected Standard transaction"));
     };
 
-    if let Some(offer) = stx.guaranteed_coins.as_ref() {
-        if zswap_offer_needs_shielded_inputs(offer.deref())
-            || !ledger_shielded_deficits(&Transaction::Standard(stx.clone()))?.is_empty()
-        {
-            return Err(err(
-                "this transaction needs shielded coin inputs to balance, which is not supported yet (unshielded-only)",
-            ));
-        }
-    }
+    // Fund a shielded deficit (e.g. a contract deposit) with the wallet's own shielded coins before
+    // unshielded balancing — a no-op when the tx has no shielded shortfall.
+    let stx = attach_shielded_inputs(stx, crypto_provider, indexer_url, scope)?;
 
     let pair = stx
         .intents
