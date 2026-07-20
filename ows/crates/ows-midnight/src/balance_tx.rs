@@ -58,7 +58,7 @@ fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
 
-fn parse_intent_hash_hex(
+pub(crate) fn parse_intent_hash_hex(
     s: &str,
 ) -> Result<midnight_ledger::structure::IntentHash, std::io::Error> {
     use midnight_base_crypto::hash::HashOutput;
@@ -75,7 +75,7 @@ fn parse_intent_hash_hex(
 
 /// Resolve a UTXO owner field (32-byte hex x-only pubkey, or the sender's own address) to a
 /// verifying key.
-fn resolve_owner_vk(
+pub(crate) fn resolve_owner_vk(
     owner_field: &str,
     sender_bech32: &str,
     sender_vk: &VerifyingKey,
@@ -128,7 +128,7 @@ fn sender_utxos_sorted(
 }
 
 /// Pick just enough sender-owned UTXOs for `token_wire` to cover `need`.
-fn select_utxos_for_token(
+pub(crate) fn select_utxos_for_token(
     utxos: &[UnshieldedUtxo],
     sender_bech32: &str,
     sender_vk: &VerifyingKey,
