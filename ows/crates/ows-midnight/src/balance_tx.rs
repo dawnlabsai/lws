@@ -230,15 +230,16 @@ fn place_shielded_fragment(
     Ok(())
 }
 
-/// Reassemble a proven `StandardTransaction`, preserving shielded Zswap offers and binding
-/// randomness (must already match `guaranteed_coins` / intents) and the input transaction's
-/// network id.
+/// Reassemble a proven `StandardTransaction`, replacing only the balanced intent (`seg_id`) and
+/// preserving every other intent, the shielded Zswap offers, binding randomness (must already match
+/// `guaranteed_coins` / intents), and the input transaction's network id.
 fn wrap_proven_standard(
     stx_in: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     seg_id: u16,
     intent_out: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
 ) -> TxProven {
-    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent_out);
+    // Replace only the intent the wallet balanced; the dapp's other intents carry through untouched.
+    let intents = stx_in.intents.insert(seg_id, intent_out);
     Transaction::Standard(StandardTransaction {
         network_id: stx_in.network_id.clone(),
         intents,
@@ -248,26 +249,22 @@ fn wrap_proven_standard(
     })
 }
 
-/// Resolve sender UTXOs and build the balanced unshielded offer (inputs to cover the outputs, plus a
-/// NIGHT change output), sorted for ledger validity. Also returns the selected UTXOs so the caller
-/// can size the generationless DUST fee allowance from their unregistered NIGHT.
+/// Resolve sender UTXOs and build the wallet's balancing unshielded offer: inputs covering `need_night`
+/// (the NIGHT the wallet must supply, summed across every intent's guaranteed offer) plus a NIGHT change
+/// output, with `outputs_in` (the chosen intent's own guaranteed outputs) embedded so the offer can
+/// replace that intent's guaranteed offer. Sorted for ledger validity. Also returns the selected UTXOs
+/// so the caller can size the generationless DUST fee allowance from their unregistered NIGHT.
 fn build_balanced_unshielded_offer(
     indexer_url: &str,
     sender_vk: &VerifyingKey,
     sender_addr: &str,
+    need_night: u128,
     has_fallible_unshielded: bool,
     outputs_in: Vec<UtxoOutput>,
     scope: &SyncCacheScope,
 ) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
     if has_fallible_unshielded {
         return Err(err("fallible unshielded offers are not supported yet"));
-    }
-
-    let mut need_night: u128 = 0;
-    for o in &outputs_in {
-        if o.type_ == NIGHT {
-            need_night = need_night.saturating_add(o.value);
-        }
     }
 
     let utxos = crate::block_on(
@@ -543,14 +540,53 @@ fn plan_unsealed_proven_standard_tx(
     // no-op when the tx has no shielded shortfall. Pure selection: no spend, no prove.
     let shielded = plan_shielded_funding(&base, crypto_provider, indexer_url, scope)?;
 
-    let pair = base
-        .intents
-        .iter()
-        .next()
-        .ok_or_else(|| err("expected one intent segment"))?;
-    let (seg_sp, intent_sp) = pair.deref();
-    let seg_id: u16 = *seg_sp.deref();
-    let intent_in = intent_sp.deref().clone();
+    // The guaranteed unshielded section aggregates one offer from each intent, so balancing spans every
+    // intent: sum the NIGHT the wallet must supply across all of them, reject shapes it cannot authorize,
+    // and fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
+    // others intact.
+    let adding_dust =
+        pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url));
+    let mut need_night: u128 = 0;
+    let mut has_fallible_unshielded = false;
+    let mut chosen: Option<(
+        u16,
+        Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    )> = None;
+    for pair in base.intents.iter() {
+        let (seg_sp, intent_sp) = pair.deref();
+        let seg_id = *seg_sp.deref();
+        let intent = intent_sp.deref();
+        // Adding our own dust section clashes with a dust section the tx already carries.
+        if adding_dust && intent.dust_actions.is_some() {
+            return Err(err(
+                "transaction already carries dust actions, which is unsupported",
+            ));
+        }
+        has_fallible_unshielded |= intent.fallible_unshielded_offer.is_some();
+        if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
+            let offer = offer_sp.deref();
+            // The wallet supplies (and signs) the balancing inputs; it cannot sign inputs the dapp put
+            // in an intent, so reject any that are already present.
+            if offer.inputs.iter_deref().next().is_some() {
+                return Err(err(
+                    "transaction carries dapp-provided unshielded inputs, which is unsupported",
+                ));
+            }
+            for o in offer.outputs.iter_deref() {
+                if o.type_ == NIGHT {
+                    need_night = need_night.saturating_add(o.value);
+                }
+            }
+        }
+        let is_lower = match &chosen {
+            Some((s, _)) => seg_id < *s,
+            None => true,
+        };
+        if is_lower {
+            chosen = Some((seg_id, intent.clone()));
+        }
+    }
+    let (seg_id, intent_in) = chosen.ok_or_else(|| err("expected at least one intent segment"))?;
 
     let outputs_in: Vec<UtxoOutput> = intent_in
         .guaranteed_unshielded_offer
@@ -572,7 +608,8 @@ fn plan_unsealed_proven_standard_tx(
         indexer_url,
         sender_vk,
         sender_addr,
-        intent_in.fallible_unshielded_offer.is_some(),
+        need_night,
+        has_fallible_unshielded,
         outputs_in,
         scope,
     )?;
@@ -591,14 +628,7 @@ fn plan_unsealed_proven_standard_tx(
     // hour-past-tip TTL need the chain time, so fetch the tip once (it also carries the ledger
     // parameters used to size the fee). The fee is sized here without real proving; the proof-bearing
     // spend is realized post-seam by the signer.
-    let (dust, intent_ttl) = if pay_fees
-        && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url))
-    {
-        if intent_in.dust_actions.is_some() {
-            return Err(err(
-                "transaction already carries dust actions, which is unsupported",
-            ));
-        }
+    let (dust, intent_ttl) = if adding_dust {
         let (ledger_params, tip_secs) =
             crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
         let dust_ctime = Timestamp::from_secs(tip_secs);
