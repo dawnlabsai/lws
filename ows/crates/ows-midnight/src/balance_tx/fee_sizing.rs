@@ -329,31 +329,29 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
 /// `mock_prove` each fragment instead of really proving it. `mock_prove` yields a correctly-sized
 /// (non-verifying, non-submittable) `ProofMarker` offer whose serialized size — hence fee contribution
 /// — matches the real proof's exactly (ZK proofs are fixed-size). Discarded after sizing; the real,
-/// submittable offer is built post-seam by the signer. Returns the merged mock-proven offer plus its
-/// binding-randomness delta, to splice into the fee-sizing transaction.
+/// submittable offer is built post-seam by the signer. Returns the per-segment mock-proven fragments
+/// (so the caller can route each to the offer bound to its segment, matching the real placement) plus
+/// their summed binding-randomness delta, to splice into the fee-sizing transaction.
 fn build_mock_shielded(
     network_id: String,
     crypto_provider: &MidnightCryptoProvider,
     plans: &[ShieldedSpendPlan],
     tree: &ZswapLocalState<InMemoryDB>,
-) -> Result<(ZswapOffer<ZswapProof, InMemoryDB>, PedersenRandomness), std::io::Error> {
+) -> Result<(Vec<ShieldedFragment>, PedersenRandomness), std::io::Error> {
     let (preimages, binding_delta) = crypto_provider
         .build_preimage_shielded_offers(plans, tree)
         .map_err(|e| err(e.to_string()))?;
 
-    let mut merged: Option<ZswapOffer<ZswapProof, InMemoryDB>> = None;
-    for (_segment, preimage) in preimages {
+    let mut fragments = Vec::with_capacity(preimages.len());
+    for (segment, preimage) in preimages {
         let proven = mock_prove_shielded_offer(network_id.clone(), preimage)?;
-        merged = Some(match merged {
-            None => proven,
-            Some(acc) => acc
-                .merge(&proven)
-                .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?,
-        });
+        fragments.push((segment, proven));
     }
 
-    let merged = merged.ok_or_else(|| err("no shielded segments to mock-prove"))?;
-    Ok((merged, binding_delta))
+    if fragments.is_empty() {
+        return Err(err("no shielded segments to mock-prove"));
+    }
+    Ok((fragments, binding_delta))
 }
 
 /// Mock-prove a single proof-preimage Zswap offer into a fixed-size `ProofMarker` offer. `mock_prove`
@@ -400,29 +398,26 @@ fn mock_prove_shielded_offer(
 /// Splice a mock-proven shielded section into a copy of `base` for DUST fee sizing. The DUST fee
 /// covers the whole tx, shielded proofs included, but the real shielded proving is deferred past the
 /// seam — so size the fee against a `mock_prove`d stand-in of the shielded section (same fixed-size
-/// proofs → same fee) and discard it. Returns `base` untouched when there is no shielded funding.
+/// proofs → same fee) and discard it. Each fragment is routed to the offer bound to its segment
+/// (segment 0 → guaranteed, segment N>=1 → `fallible_coins[N]`), mirroring the real placement in
+/// [`authorize_proven_tx`] so the sized fee matches the real tx's serialized byte length. Returns
+/// `base` untouched when there is no shielded funding.
 pub(super) fn splice_mock_shielded_for_sizing(
     base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     shielded: &ShieldedFundingPlan,
 ) -> Result<StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, std::io::Error>
 {
-    let (mock_offer, binding_delta) = build_mock_shielded(
+    let (fragments, binding_delta) = build_mock_shielded(
         base.network_id.clone(),
         crypto_provider,
         &shielded.plans,
         &shielded.tree,
     )?;
-    let mut merged = base
-        .guaranteed_coins
-        .as_ref()
-        .map(|sp| sp.deref().clone())
-        .ok_or_else(|| err("shielded plan present but tx has no guaranteed coins offer"))?;
-    merged = merged
-        .merge(&mock_offer)
-        .map_err(|e| err(format!("merge mock shielded zswap offer: {e}")))?;
     let mut sized = base.clone();
-    sized.guaranteed_coins = Some(Sp::new(merged));
+    for (segment, proven) in &fragments {
+        place_shielded_fragment(&mut sized, *segment, proven)?;
+    }
     sized.binding_randomness = sized.binding_randomness + binding_delta;
     Ok(sized)
 }

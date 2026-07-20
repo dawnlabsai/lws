@@ -50,6 +50,10 @@ use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
+/// A proven shielded Zswap offer bound to a transaction segment: `0` = guaranteed coins, `>= 1` = the
+/// `fallible_coins` entry for that segment.
+type ShieldedFragment = (u16, ZswapOffer<ZswapProof, InMemoryDB>);
+
 fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
@@ -191,6 +195,39 @@ fn tx_balance_imbalances(tx: &TxProven) -> Result<Vec<String>, std::io::Error> {
         .map(|((_, segment), bal)| format!("segment {segment} overspent by {}", bal.unsigned_abs()))
         .collect();
     Ok(imbalances)
+}
+
+/// Route a proven shielded fragment into the offer the signer bound it to: `segment == 0` merges into
+/// the guaranteed offer; `segment >= 1` merges into `fallible_coins[segment]` (creating that segment's
+/// entry if absent). Placement must match the segment the fragment's spends/proofs were bound to —
+/// `well_formed` verifies the guaranteed offer at a hardcoded segment 0 and each fallible offer at its
+/// map-key segment, and `balance()` attributes deltas the same way — so a seg-N>=1 fragment in the
+/// guaranteed offer would fail proof verification and leave the seg-N deficit uncovered.
+fn place_shielded_fragment(
+    base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    segment: u16,
+    proven: &ZswapOffer<ZswapProof, InMemoryDB>,
+) -> Result<(), std::io::Error> {
+    if segment == 0 {
+        let merged = match base.guaranteed_coins.as_ref() {
+            Some(sp) => sp
+                .deref()
+                .merge(proven)
+                .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?,
+            None => proven.clone(),
+        };
+        base.guaranteed_coins = Some(Sp::new(merged));
+    } else {
+        let merged = match base.fallible_coins.get(&segment) {
+            Some(sp) => sp
+                .deref()
+                .merge(proven)
+                .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?,
+            None => proven.clone(),
+        };
+        base.fallible_coins = base.fallible_coins.insert(segment, merged);
+    }
+    Ok(())
 }
 
 /// Reassemble a proven `StandardTransaction`, preserving shielded Zswap offers and binding
@@ -405,10 +442,18 @@ fn plan_shielded_funding(
     indexer_url: &str,
     scope: &SyncCacheScope,
 ) -> Result<Option<ShieldedFundingPlan>, std::io::Error> {
-    let Some(offer_sp) = base.guaranteed_coins.as_ref() else {
-        return Ok(None);
-    };
-    let deficits = if zswap_offer_needs_shielded_inputs(offer_sp.deref()) {
+    // A shielded shortfall can sit in the guaranteed offer (segment 0) or in any fallible offer
+    // (segment N>=1); gate on either needing inputs. `ledger_shielded_deficits` then reports the
+    // per-segment deficits across the whole tx via `balance()`.
+    let guaranteed_needs = base
+        .guaranteed_coins
+        .as_ref()
+        .is_some_and(|sp| zswap_offer_needs_shielded_inputs(sp.deref()));
+    let fallible_needs = base
+        .fallible_coins
+        .iter()
+        .any(|entry| zswap_offer_needs_shielded_inputs(entry.1.deref()));
+    let deficits = if guaranteed_needs || fallible_needs {
         ledger_shielded_deficits(&Transaction::Standard(base.clone()))?
     } else {
         Vec::new()
@@ -601,8 +646,8 @@ pub fn authorize_proven_tx(
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut base = plan.base;
 
-    // Shielded: the signer builds + proves the witnesses; merge each proven fragment into the
-    // already-proven guaranteed offer.
+    // Shielded: the signer builds + proves the witnesses; route each proven fragment to the offer the
+    // signer bound it to — segment 0 into the guaranteed offer, segment N>=1 into `fallible_coins[N]`.
     if let Some(shielded) = plan.shielded {
         let prover = midnight_prover(chain_id)?;
         let authorized: ShieldedAuthorized = crate::block_on(crypto_provider.authorize_shielded(
@@ -611,19 +656,10 @@ pub fn authorize_proven_tx(
             prover,
         ))
         .map_err(|e| err(e.to_string()))?;
-        let mut merged = base
-            .guaranteed_coins
-            .as_ref()
-            .map(|sp| sp.deref().clone())
-            .ok_or_else(|| {
-                err("shielded authorization present but tx has no guaranteed coins offer")
-            })?;
-        for (_segment, proven) in &authorized.proven {
-            merged = merged
-                .merge(proven)
-                .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
+        for (segment, proven) in &authorized.proven {
+            place_shielded_fragment(&mut base, *segment, proven)?;
         }
-        base.guaranteed_coins = Some(Sp::new(merged));
+        // Binding randomness is tx-global (placement-independent), so add the whole delta once.
         base.binding_randomness = base.binding_randomness + authorized.binding_delta;
     }
 
