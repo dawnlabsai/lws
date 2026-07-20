@@ -503,21 +503,17 @@ pub fn sign_transaction(
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
-
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))?;
+    let chain = parse_chain(chain)?;
+    let tx_bytes = decode_tx_input(&chain, tx_hex)?;
 
     // Agent mode: token-based signing with policy enforcement
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
-        let chain = parse_chain(chain)?;
         return crate::key_ops::sign_with_api_key(
             credential, wallet, &chain, &tx_bytes, index, vault_path,
         );
     }
 
     // Owner mode: existing passphrase-based signing (unchanged)
-    let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
     let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&tx_bytes)?;
@@ -527,6 +523,19 @@ pub fn sign_transaction(
         signature: hex::encode(&output.signature),
         recovery_id: output.recovery_id,
     })
+}
+
+/// Decode the `--tx` input into transaction bytes. A hex decode for every chain; Midnight's input is
+/// a DApp Connector request (JSON, not hex), so it is carried through unchanged for the key-aware
+/// preparation step to parse. Needs no signing key, so it can run before policy evaluation on the
+/// agent path.
+pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8>, OwsLibError> {
+    if chain.chain_type == ChainType::Midnight {
+        return Ok(tx_input.as_bytes().to_vec());
+    }
+    let clean = tx_input.strip_prefix("0x").unwrap_or(tx_input);
+    hex::decode(clean)
+        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))
 }
 
 /// Sign a raw 32-byte hash using the secp256k1 key for the selected chain.
@@ -692,13 +701,13 @@ pub fn sign_and_send(
 ) -> Result<SendResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
 
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex transaction: {e}")))?;
+    let chain_info = parse_chain(chain)?;
+    // `decode_tx_input` carries a Midnight DApp Connector request through as UTF-8; every other chain
+    // hex-decodes, so a Midnight request is no longer rejected before it can be balanced.
+    let tx_bytes = decode_tx_input(&chain_info, tx_hex)?;
 
     // Agent mode: enforce policies, decrypt key, then sign + broadcast
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
-        let chain_info = parse_chain(chain)?;
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
         let signer = signer_for_chain(&chain_info);
@@ -717,7 +726,6 @@ pub fn sign_and_send(
     }
 
     // Owner mode
-    let chain_info = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain_info.chain_type, credential, index, vault_path)?;
 
     sign_encode_and_broadcast(key.expose(), chain, &tx_bytes, rpc_url)

@@ -30,9 +30,7 @@ pub fn run(
     let chain = parse_chain(chain_str)?;
     let key = super::resolve_signing_key(wallet_name, chain.chain_type, index)?;
 
-    let tx_hex_clean = tx_hex.strip_prefix("0x").unwrap_or(tx_hex);
-    let tx_bytes = hex::decode(tx_hex_clean)
-        .map_err(|e| CliError::InvalidArgs(format!("invalid hex transaction: {e}")))?;
+    let tx_bytes = ows_lib::decode_tx_input(&chain, tx_hex)?;
 
     let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&tx_bytes)?;
