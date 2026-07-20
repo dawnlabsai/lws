@@ -227,6 +227,32 @@ pub(super) enum DustFeePlan {
     },
 }
 
+/// Whether `tx`'s DUST section covers the fee the node will charge. Mirrors the node's fee gate
+/// (`well_formed` computes `fees(params, true)` then rejects any segment/token whose `balance` of that
+/// fee goes negative): unlike `tx_balance_imbalances` (which uses `balance(None)` and so ignores the
+/// fee entirely), this charges the real fee, so a DUST section that only satisfies structural balance
+/// but under-covers the fee is correctly rejected. `fees(_, true)` enforces the guaranteed-compute
+/// time-to-dismiss bound; a tx still too small to satisfy it is reported as not-covered so the caller
+/// keeps growing the section (the proof-bearing spend adds the bytes that lift the bound).
+fn dust_section_covers_fee(
+    tx: &TxProven,
+    params: &LedgerParameters,
+) -> Result<bool, std::io::Error> {
+    use midnight_ledger::error::FeeCalculationError;
+    let fee = match tx.fees(params, true) {
+        Ok(f) => f,
+        // `OutsideTimeToDismiss` means the tx's guaranteed compute exceeds the size-derived
+        // time-to-dismiss bound — not coverable by more dust as-is, so report not-covered and let the
+        // caller grow the section (the proof-bearing spend adds the bytes that lift the bound).
+        Err(FeeCalculationError::OutsideTimeToDismiss { .. }) => return Ok(false),
+        Err(e) => return Err(err(format!("DUST fee check failed: {e:?}"))),
+    };
+    let balances = tx
+        .balance(Some(fee))
+        .map_err(|e| err(format!("transaction balance check failed: {e:?}")))?;
+    Ok(balances.into_iter().all(|(_, bal)| bal >= 0))
+}
+
 /// Size the DUST fee section that balances the transaction, **without** real proving. The fee depends
 /// on the tx (dust-section bytes included), so estimate → build section → re-check, converging within
 /// a few iterations.
@@ -269,7 +295,7 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
                 ctx.seg_id,
                 assemble_proven_intent(ctx.offer, ctx.intent_in, Some(reg.clone()), intent_ttl),
             );
-            if tx_balance_imbalances(&tx_check)?.is_empty() {
+            if dust_section_covers_fee(&tx_check, ctx.ledger_params)? {
                 return Ok(DustFeePlan::Registration(reg));
             }
         }
@@ -293,7 +319,7 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
                 intent_ttl,
             ),
         );
-        if tx_balance_imbalances(&tx_check)?.is_empty() {
+        if dust_section_covers_fee(&tx_check, ctx.ledger_params)? {
             return Ok(DustFeePlan::Spend {
                 plan: DustSpendPlan {
                     fee_dust: fee_target,
@@ -308,7 +334,7 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
         }
 
         let actual_fee = tx_check
-            .fees(ctx.ledger_params, false)
+            .fees(ctx.ledger_params, true)
             .map_err(|e| err(format!("DUST fee re-estimate failed: {e:?}")))?;
         let dust_paid = sum_dust_v_fee(dust_actions.spends.iter_deref());
         fee_target = actual_fee
