@@ -643,8 +643,11 @@ fn plan_unsealed_proven_standard_tx(
         let seg_id = *seg_sp.deref();
         let intent = intent_sp.deref();
         // A dust section the tx already carries is fine — the wallet's own dust rides a fresh intent
-        // below (spec §L961-967). But it must not carry a dust *registration*: that is a second
-        // wallet-signable section, which the signer's one-signable-intent invariant can't accommodate.
+        // below, since an intent holds only one dust section (spec §L961-967). But it must not carry a
+        // dust *registration*: unlike a proof-authorized dust *spend* (which passes through untouched), a
+        // registration is signature-authorized, so a foreign one needs a signer the wallet lacks, and one
+        // for the wallet's own key is redundant with the dust the wallet adds here and muddies the fee
+        // accounting.
         if let Some(da) = intent.dust_actions.as_ref() {
             has_preexisting_dust = true;
             if adding_dust && !da.deref().registrations.is_empty() {
