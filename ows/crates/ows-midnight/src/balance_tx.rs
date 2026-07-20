@@ -341,17 +341,27 @@ fn assemble_proven_intent(
     }
 }
 
-/// Select whole coins largest-first to cover each per-token `deficit` and size the self-change per
-/// token (selected total − deficit), building a per-segment [`ShieldedSpendPlan`] over the synced
-/// coin set. Pure selection — it neither spends nor proves; the authorizing witness is built later,
-/// from this plan, by the signer. Errors when a token's coins cannot cover its deficit.
-fn select_shielded_inputs(
-    segment: u16,
+/// The wallet's inert shielded funding plan for one intent segment: the coins to spend — chosen whole
+/// and largest-first to cover each per-token deficit — and the self-change to mint per token. Built
+/// from the synced coin set alone (viewing + nullifier detection), it carries **no** spend witness, so
+/// it is not a bearer instrument; the authorizing `spend()` happens later, in the signer's
+/// [`MidnightCryptoProvider::authorize_shielded`], after the policy seam.
+#[derive(Debug, Clone)]
+struct SegmentPlan {
+    coins: Vec<QualifiedInfo>,
+    change_by_token: Vec<(ShieldedTokenType, u128)>,
+}
+
+/// Choose which of the wallet's coins to spend to cover each per-token `deficit` — whole coins,
+/// largest-first — and size the self-change (selected total − deficit) per token. Pure over the synced
+/// coin set: it neither spends nor proves, so it needs no spend key (only the viewing/nullifier
+/// detection that produced `coins`). Errors when a token's coins cannot cover its deficit.
+fn plan_shielded_inputs(
     coins: &[QualifiedInfo],
     deficits: &[(ShieldedTokenType, u128)],
-) -> Result<ShieldedSpendPlan, std::io::Error> {
+) -> Result<SegmentPlan, std::io::Error> {
     let mut selected = Vec::new();
-    let mut change = Vec::new();
+    let mut change_by_token = Vec::new();
 
     for (token, need) in deficits {
         if *need == 0 {
@@ -380,16 +390,15 @@ fn select_shielded_inputs(
                 hex::encode(token.into_inner().0)
             )));
         }
-        let excess = spent.saturating_sub(*need);
-        if excess > 0 {
-            change.push((*token, excess));
+        let change = spent.saturating_sub(*need);
+        if change > 0 {
+            change_by_token.push((*token, change));
         }
     }
 
-    Ok(ShieldedSpendPlan {
-        segment,
+    Ok(SegmentPlan {
         coins: selected,
-        change,
+        change_by_token,
     })
 }
 
@@ -442,12 +451,16 @@ fn attach_shielded_inputs(
         tree.coins.iter().map(|(_nul, qci)| *qci.deref()).collect();
     let mut plans = Vec::new();
     for (segment, seg_deficits) in by_segment {
-        let plan = select_shielded_inputs(segment, &remaining, &seg_deficits)?;
-        if plan.coins.is_empty() {
+        let seg_plan = plan_shielded_inputs(&remaining, &seg_deficits)?;
+        if seg_plan.coins.is_empty() {
             continue;
         }
-        remaining.retain(|c| !plan.coins.contains(c));
-        plans.push(plan);
+        remaining.retain(|c| !seg_plan.coins.contains(c));
+        plans.push(ShieldedSpendPlan {
+            segment,
+            coins: seg_plan.coins,
+            change: seg_plan.change_by_token,
+        });
     }
     if plans.is_empty() {
         return Ok(stx);
@@ -860,5 +873,51 @@ mod tests {
             .map(|o| o.deref().signatures.len())
             .unwrap_or(0);
         assert_eq!(offer_sigs, 1, "the input signature stays on the offer");
+    }
+
+    /// A synced coin of the given token and value; the nonce/mt_index don't affect selection.
+    fn qci(token: ShieldedTokenType, value: u128) -> QualifiedInfo {
+        use rand::Rng as _;
+        let mut coin: QualifiedInfo = rand::rngs::OsRng.r#gen();
+        coin.type_ = token;
+        coin.value = value;
+        coin
+    }
+
+    /// Whole coins are spent largest-first until the deficit is covered; the excess becomes self-change
+    /// and unneeded coins are left untouched. No spend/prove — pure selection.
+    #[test]
+    fn plan_shielded_inputs_selects_largest_first_and_sizes_change() {
+        let token = ShieldedTokenType(HashOutput([7u8; 32]));
+        let coins = vec![qci(token, 100), qci(token, 30), qci(token, 40)];
+        // Need 120: 100 then 40 (= 140) covers it; the 30-coin is untouched. Change = 20.
+        let plan = plan_shielded_inputs(&coins, &[(token, 120)]).unwrap();
+        let picked: Vec<u128> = plan.coins.iter().map(|c| c.value).collect();
+        assert_eq!(picked, vec![100, 40]);
+        assert_eq!(plan.change_by_token, vec![(token, 20)]);
+    }
+
+    /// A token whose coins can't cover its deficit errors before any spend/prove.
+    #[test]
+    fn plan_shielded_inputs_errors_when_coins_fall_short() {
+        let token = ShieldedTokenType(HashOutput([3u8; 32]));
+        let coins = vec![qci(token, 10), qci(token, 5)];
+        let e = plan_shielded_inputs(&coins, &[(token, 100)]).unwrap_err();
+        assert!(
+            format!("{e}").contains("insufficient shielded balance"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// A zero deficit selects nothing; an exact-cover selection yields no change.
+    #[test]
+    fn plan_shielded_inputs_zero_and_exact_yield_no_change() {
+        let token = ShieldedTokenType(HashOutput([2u8; 32]));
+        let coins = vec![qci(token, 500)];
+        let zero = plan_shielded_inputs(&coins, &[(token, 0)]).unwrap();
+        assert!(zero.coins.is_empty() && zero.change_by_token.is_empty());
+        let exact = plan_shielded_inputs(&coins, &[(token, 500)]).unwrap();
+        assert_eq!(exact.coins.len(), 1);
+        assert!(exact.change_by_token.is_empty());
     }
 }
