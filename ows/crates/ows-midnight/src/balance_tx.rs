@@ -2,18 +2,25 @@
 //! transaction against the indexer's UTXO set.
 //!
 //! v1 scope: the wallet injects its own **unshielded** NIGHT inputs (and a change output) to cover
-//! the transaction's unshielded outputs, preserving the existing ZK proofs. Shielded-input balancing
-//! and DUST fee registration are not handled yet — a transaction that needs either is rejected.
+//! the transaction's unshielded outputs, preserving the existing ZK proofs, and — when asked to pay
+//! fees on a chain that needs DUST — adds a signature-based **generationless** DUST fee registration
+//! funded by its own unregistered NIGHT (no proving). Shielded-input balancing and proof-bearing
+//! DUST spends are not handled — a transaction that needs either is rejected.
 
 use std::io::Cursor;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
     ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
 };
+use midnight_ledger::dust::{
+    DustActions, DustPublicKey, DustRegistration, INITIAL_DUST_PARAMETERS,
+};
 use midnight_ledger::structure::{
-    Intent, ProofMarker, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
+    Intent, LedgerParameters, ProofMarker, StandardTransaction, Transaction, UnshieldedOffer,
+    UtxoOutput, UtxoSpend,
 };
 use midnight_serialize::{
     tagged_deserialize, tagged_serialize, Deserializable as _, Serializable as _,
@@ -29,6 +36,9 @@ use transient_crypto::proofs::Proof as ZswapProof;
 use ows_core::sync_cache::SyncCacheScope;
 
 use crate::UnshieldedUtxo;
+
+mod fee_sizing;
+use fee_sizing::cover_dust_fee_registration;
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
@@ -194,7 +204,8 @@ fn wrap_proven_standard(
 }
 
 /// Resolve sender UTXOs and build the balanced unshielded offer (inputs to cover the outputs, plus a
-/// NIGHT change output), sorted for ledger validity.
+/// NIGHT change output), sorted for ledger validity. Also returns the selected UTXOs so the caller
+/// can size the generationless DUST fee allowance from their unregistered NIGHT.
 fn build_balanced_unshielded_offer(
     indexer_url: &str,
     sender_vk: &VerifyingKey,
@@ -202,7 +213,7 @@ fn build_balanced_unshielded_offer(
     has_fallible_unshielded: bool,
     outputs_in: Vec<UtxoOutput>,
     scope: &SyncCacheScope,
-) -> Result<UnshieldedOffer<MnSig, InMemoryDB>, std::io::Error> {
+) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
     if has_fallible_unshielded {
         return Err(err("fallible unshielded offers are not supported yet"));
     }
@@ -260,20 +271,46 @@ fn build_balanced_unshielded_offer(
     outputs.sort();
 
     // Start empty: `Intent::sign` appends signatures; pre-filling breaks well-formedness.
-    Ok(UnshieldedOffer {
+    let offer = UnshieldedOffer {
         inputs: inputs.into(),
         outputs: outputs.into(),
         signatures: vec![].into(),
-    })
+    };
+    Ok((offer, selected))
+}
+
+/// Give the signed intent a TTL an hour past the chain tip, matching the wallet SDK.
+fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
+    Timestamp::from_secs(dust_ctime.to_secs().saturating_add(3600))
+}
+
+/// Assemble the proven intent from the balanced offer plus optional dust actions.
+fn assemble_proven_intent(
+    offer: &UnshieldedOffer<MnSig, InMemoryDB>,
+    intent_in: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    dust_actions: Option<DustActions<MnSig, ProofMarker, InMemoryDB>>,
+    ttl: Timestamp,
+) -> Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
+    Intent {
+        guaranteed_unshielded_offer: Some(Sp::new(offer.clone())),
+        fallible_unshielded_offer: None,
+        actions: intent_in.actions.clone(),
+        dust_actions: dust_actions.map(Sp::new),
+        ttl,
+        binding_commitment: intent_in.binding_commitment,
+    }
 }
 
 /// Inject the wallet's unshielded inputs/change into a proven Standard transaction, preserving its
 /// existing proofs and shielded coins. Rejects transactions that would require shielded inputs.
+#[allow(clippy::too_many_arguments)]
 fn balance_unsealed_proven_standard_tx(
     indexer_url: &str,
+    crypto_provider: &MidnightCryptoProvider,
     sender_vk: &VerifyingKey,
     sender_addr: &str,
     tx_bytes: &[u8],
+    pay_fees: bool,
     scope: &SyncCacheScope,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut r: &[u8] = tx_bytes;
@@ -318,7 +355,7 @@ fn balance_unsealed_proven_standard_tx(
         })
         .unwrap_or_default();
 
-    let offer = build_balanced_unshielded_offer(
+    let (offer, selected) = build_balanced_unshielded_offer(
         indexer_url,
         sender_vk,
         sender_addr,
@@ -327,14 +364,42 @@ fn balance_unsealed_proven_standard_tx(
         scope,
     )?;
 
-    let intent_out: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> = Intent {
-        guaranteed_unshielded_offer: Some(Sp::new(offer)),
-        fallible_unshielded_offer: None,
-        actions: intent_in.actions.clone(),
-        dust_actions: None,
-        ttl: intent_in.ttl,
-        binding_commitment: intent_in.binding_commitment,
+    // On a chain with a live dust ledger (Preview/Preprod, mainnet too), fees are paid via a
+    // generationless DUST registration signed by the wallet (no proof). The registration and an
+    // hour-past-tip TTL both need the chain time, so fetch the tip once (it also carries the ledger
+    // parameters used to size the fee).
+    let (dust_actions, intent_ttl) = if pay_fees
+        && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url))
+    {
+        if intent_in.dust_actions.is_some() {
+            return Err(err(
+                "transaction already carries dust actions, which is unsupported",
+            ));
+        }
+        let (ledger_params, tip_secs) =
+            crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
+        let dust_ctime = Timestamp::from_secs(tip_secs);
+        let dust_pk = crypto_provider
+            .dust_public_key()
+            .map_err(|e| err(e.to_string()))?;
+        let night_vk = sender_vk.clone();
+        let registration = cover_dust_fee_registration(
+            &stx,
+            seg_id,
+            &intent_in,
+            &offer,
+            &selected,
+            dust_pk,
+            night_vk,
+            dust_ctime,
+            &ledger_params,
+        )?;
+        (Some(registration), chain_aligned_intent_ttl(dust_ctime))
+    } else {
+        (None, intent_in.ttl)
     };
+
+    let intent_out = assemble_proven_intent(&offer, &intent_in, dust_actions, intent_ttl);
     let tx_out = wrap_proven_standard(&stx, seg_id, intent_out);
 
     let imbalances = tx_balance_imbalances(&tx_out)?;
@@ -354,9 +419,10 @@ fn balance_unsealed_proven_standard_tx(
 /// wallet's own unshielded UTXOs, deriving the sender address/vk via the crypto provider and the
 /// indexer URL and sync scope from `chain_id`.
 ///
-/// v1 scope: unshielded-only (shielded-input balancing is rejected) and no DUST fee registration
-/// (so `pay_fees` on a chain that needs DUST is rejected). Returns the balanced-but-unsealed proven
-/// transaction bytes; signing and sealing are separate steps.
+/// v1 scope: unshielded-only (shielded-input balancing is rejected). When `pay_fees` is set on a
+/// chain that needs DUST, the wallet adds a generationless DUST fee registration funded by its own
+/// unregistered NIGHT (no proving). Returns the balanced-but-unsealed proven transaction bytes;
+/// signing and sealing are separate steps.
 pub fn balance_unsealed_proven_tx(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
@@ -373,21 +439,20 @@ pub fn balance_unsealed_proven_tx(
 
     let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
 
-    // Fee registration mints DUST from the wallet's own NIGHT, which the unshielded-only balancer
-    // does not do. A network with a live dust ledger is one where fees are paid in DUST, so reject
-    // pay_fees there rather than silently producing a fee-less tx.
-    if pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(&indexer_url)) {
-        return Err(err(
-            "paying fees via DUST registration is not supported yet",
-        ));
-    }
-
     let scope = SyncCacheScope {
         chain_id: Some(chain_id.to_string()),
         ..Default::default()
     };
 
-    balance_unsealed_proven_standard_tx(&indexer_url, &sender_vk, &sender_addr, tx_bytes, &scope)
+    balance_unsealed_proven_standard_tx(
+        &indexer_url,
+        crypto_provider,
+        &sender_vk,
+        &sender_addr,
+        tx_bytes,
+        pay_fees,
+        &scope,
+    )
 }
 
 #[cfg(test)]
@@ -615,4 +680,5 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(offer_sigs, 1, "the input signature stays on the offer");
     }
+
 }
