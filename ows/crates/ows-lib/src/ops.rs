@@ -585,7 +585,10 @@ pub fn prepare_signable_tx(
                 .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
         }
         Some(ows_midnight::UnsealedKind::ProofPreimage) => Err(OwsLibError::InvalidInput(
-            "Midnight proof-preimage transactions require proving, which is not supported yet".into(),
+            "Midnight balanceUnsealedTransaction expects a proven (proof,embedded-fr) transaction per \
+             the DApp Connector spec; received a proof-preimage transaction (the dapp must prove its \
+             own part before calling the wallet)"
+                .into(),
         )),
         None => Err(OwsLibError::InvalidInput(
             "unrecognized Midnight transaction (expected an unsealed proof or proof-preimage payload)"

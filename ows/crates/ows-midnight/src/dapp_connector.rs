@@ -2,14 +2,17 @@
 
 use serde::Deserialize;
 
-/// Pre-seal Midnight transaction shapes the wallet pipeline understands. Both carry an `embedded-fr`
-/// binding (sealing is still pending); they differ only in whether the proofs are still preimages
-/// (dapp pre-prove output) or full ZK proofs (dapp post-prove output).
+/// Pre-seal Midnight transaction shapes the wallet can classify by tag. Per the DApp Connector spec a
+/// `balanceUnsealedTransaction` arrives already **proven** (`proof,embedded-fr`) — "unsealed" means
+/// signatures/binding are still pending, not that proofs are missing. A `proof-preimage` blob is
+/// out-of-spec input here (the dapp is expected to prove its own part before calling the wallet); it is
+/// classified only so it can be rejected with a precise error rather than a vague "unrecognized".
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum UnsealedKind {
-    /// `proof-preimage,embedded-fr` — wallet performs balance → sign → prove → seal.
+    /// `proof-preimage,embedded-fr` — out-of-spec for `balanceUnsealedTransaction`; the dapp must
+    /// pre-prove. Rejected by the wallet pipeline.
     ProofPreimage,
-    /// `proof,embedded-fr` — wallet only needs to balance → sign → seal.
+    /// `proof,embedded-fr` — the spec-conformant input; the wallet balances → signs → seals.
     Proven,
 }
 
