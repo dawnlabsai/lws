@@ -82,29 +82,18 @@ pub struct DesiredInput {
     pub value: u128,
 }
 
-/// A parsed `makeIntent` request: the maker's inputs and desired outputs, the intent segment, and
-/// whether the (downstream) completed transaction should pay DUST fees.
+/// A parsed `makeIntent` request: the maker's inputs and desired outputs and the intent segment. Unlike
+/// the balancing methods, makeIntent builds a deliberately imbalanced maker offer and never pays fees —
+/// the taker completes and balances the swap — so there is no `payFees` option here.
 #[derive(Debug, Clone)]
 pub struct MakeIntentRequest {
     pub desired_inputs: Vec<DesiredInput>,
     pub desired_outputs: Vec<DesiredOutput>,
     pub intent_segment: u16,
-    pub pay_fees: bool,
-}
-
-fn default_pay_fees() -> bool {
-    true
 }
 
 fn default_intent_segment() -> u16 {
     DEFAULT_INTENT_SEGMENT
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OptionsJson {
-    #[serde(default = "default_pay_fees")]
-    pay_fees: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,12 +105,10 @@ struct MakeIntentJson {
     desired_outputs: Vec<DesiredOutput>,
     #[serde(default = "default_intent_segment")]
     intent_segment: u16,
-    #[serde(default)]
-    options: Option<OptionsJson>,
 }
 
-/// Parse a stringified DApp Connector `makeIntent` request. `payFees` defaults to true; `intentSegment`
-/// defaults to the connector convention.
+/// Parse a stringified DApp Connector `makeIntent` request. `intentSegment` defaults to the connector
+/// convention (segment 1) and must be >= 1.
 pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::Error> {
     let req: MakeIntentJson = serde_json::from_str(json)
         .map_err(|e| std::io::Error::other(format!("invalid makeIntent request JSON: {e}")))?;
@@ -130,11 +117,19 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
             "makeIntent requires at least one desired input or output",
         ));
     }
+    // The ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
+    // (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`), so the maker's
+    // intent must key at a fallible segment >= 1. makeTransfer hardcodes segment 1; makeIntent lets the
+    // dapp choose, so guard the lower bound here rather than build an offer the node will reject.
+    if req.intent_segment == 0 {
+        return Err(std::io::Error::other(
+            "makeIntent intentSegment must be >= 1: segment 0 is the guaranteed section, where the ledger rejects an intent",
+        ));
+    }
     Ok(MakeIntentRequest {
         desired_inputs: req.desired_inputs,
         desired_outputs: req.desired_outputs,
         intent_segment: req.intent_segment,
-        pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
     })
 }
 
@@ -464,17 +459,27 @@ mod tests {
         assert_eq!(req.desired_inputs[0].kind, TransferKind::Unshielded);
         assert_eq!(req.desired_outputs.len(), 1);
         assert_eq!(req.intent_segment, DEFAULT_INTENT_SEGMENT);
-        assert!(req.pay_fees);
     }
 
     #[test]
-    fn honours_intent_segment_and_pay_fees_false() {
+    fn honours_intent_segment_and_ignores_legacy_options() {
+        // makeIntent no longer honours `options.payFees` (the maker never pays fees); a legacy request
+        // that still carries it must be accepted with the field ignored, not rejected.
         let req = parse_make_intent_json(
             r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":3,"options":{"payFees":false}}"#,
         )
         .unwrap();
         assert_eq!(req.intent_segment, 3);
-        assert!(!req.pay_fees);
+    }
+
+    #[test]
+    fn rejects_intent_segment_zero() {
+        // Segment 0 is the transaction's guaranteed section; the ledger rejects an intent declared
+        // there, so the parse must reject it up front instead of building a doomed offer.
+        assert!(parse_make_intent_json(
+            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":0}"#
+        )
+        .is_err());
     }
 
     #[test]
