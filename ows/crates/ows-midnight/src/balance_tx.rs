@@ -531,7 +531,12 @@ fn plan_unsealed_proven_standard_tx(
     let tx: TxProven = tagged_deserialize(&mut r)
         .map_err(|e| err(format!("failed to parse proven tx bytes: {e}")))?;
     let Transaction::Standard(base) = tx else {
-        return Err(err("expected Standard transaction"));
+        // The only other Transaction variant is ClaimRewards — a system-issued mint claim that is
+        // claimed, not balanced with counter-offers, so it is not a balancing target.
+        return Err(err(
+            "balanceUnsealedTransaction expects a Standard transaction; a ClaimRewards mint claim \
+             is not a balancing target",
+        ));
     };
 
     // Plan a shielded deficit (e.g. a contract deposit) against the wallet's own shielded coins — a
