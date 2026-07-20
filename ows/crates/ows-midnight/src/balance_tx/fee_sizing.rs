@@ -126,6 +126,70 @@ fn sync_spendable_dust_state(
     ))
 }
 
+/// Fee-sizing twin of the signer's `authorize_dust`: build the same proof-preimage DUST spends via the
+/// crypto provider, then `mock_prove` the dust intent instead of really proving it. `mock_prove` yields
+/// a correctly-sized (but non-verifying, non-submittable) `ProofMarker` section whose fee and serialized
+/// size match the real proof's **exactly** — proofs are fixed-size — so the fee-convergence loop can
+/// size the section **offline, with no real proving keys**. The real, submittable section is built
+/// post-seam by the signer's [`MidnightCryptoProvider::authorize_dust`]; this only produces the number
+/// the fee loop needs.
+#[allow(dead_code)] // used by the deferred fee-sizing path wired in a later commit
+fn build_mock_dust_spends(
+    ctx: &DustFeeContext,
+    dust_state: &DustLocalState<InMemoryDB>,
+    fee_target: u128,
+    intent_ttl: Timestamp,
+) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
+    let spends = ctx
+        .crypto_provider
+        .build_preimage_dust_spends(dust_state.clone(), fee_target, ctx.dust_ctime)
+        .map_err(|e| err(e.to_string()))?;
+
+    let dust_preimage: DustActions<MnSig, ProofPreimageMarker, InMemoryDB> = DustActions {
+        spends: spends.into_iter().collect(),
+        registrations: vec![].into(),
+        ctime: ctx.dust_ctime,
+    };
+    let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> = Intent {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: vec![].into(),
+        dust_actions: Some(Sp::new(dust_preimage)),
+        ttl: intent_ttl,
+        binding_commitment: ctx.intent_in.binding_commitment,
+    };
+    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(ctx.seg_id, intent);
+    let stx: StandardTransaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+        StandardTransaction {
+            network_id: ctx.stx.network_id.clone(),
+            intents,
+            guaranteed_coins: None,
+            fallible_coins: MnHashMap::new(),
+            binding_randomness: Default::default(),
+        };
+    let tx: Transaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+        Transaction::Standard(stx);
+
+    let mock = tx
+        .mock_prove()
+        .map_err(|e| err(format!("mock-prove dust spends failed: {e:?}")))?;
+    let Transaction::Standard(mstx) = mock else {
+        return Err(err("mock-proven dust transaction was not Standard"));
+    };
+    let pair = mstx
+        .intents
+        .iter()
+        .next()
+        .ok_or_else(|| err("mock-proven dust transaction has no intent"))?;
+    let (_seg, intent) = pair.deref();
+    intent
+        .deref()
+        .dust_actions
+        .as_ref()
+        .map(|sp| sp.deref().clone())
+        .ok_or_else(|| err("mock-proven dust intent did not contain dust actions"))
+}
+
 /// The transaction context a DUST fee section is sized against: the proven standard tx and its
 /// single intent segment, the balanced unshielded offer and the UTXOs funding it, the wallet's
 /// dust key / night key, the crypto provider + indexer + scope (to sync a spendable dust state and
@@ -234,8 +298,12 @@ pub(super) fn cover_dust_fees(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_base_crypto::hash::HashOutput;
     use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
+    use midnight_coin_structure::coin::Info as CoinInfo;
     use midnight_ledger::dust::DustSecretKey;
+    use midnight_zswap::keys::SecretKeys;
+    use midnight_zswap::Output as ZswapOutput;
 
     // Unshielded role-0 seed for the abandon-phrase wallet at index 0; matches the signer's
     // address vectors.
@@ -352,6 +420,88 @@ mod tests {
         assert!(
             some.is_some(),
             "unregistered NIGHT should fund a registration"
+        );
+    }
+
+    /// Verifies the fee-sizing assumption the deferred-dust path relies on: `mock_prove` (offline, no
+    /// real proving keys) yields a transaction whose ledger fee equals the real-proven transaction's
+    /// fee — because ZK proofs are fixed-size, so the fee depends only on tx structure. Ignored by
+    /// default because real proving uses the (cached) CDN proving keys; run with `--ignored`.
+    #[test]
+    #[ignore = "real-proves with the cached/CDN proving keys; run explicitly"]
+    fn mock_prove_fee_matches_real_prove_fee() {
+        use midnight_ledger::structure::INITIAL_PARAMETERS;
+        use rand::rngs::{OsRng, StdRng};
+        use rand::{Rng as _, SeedableRng as _};
+
+        // A preimage tx with a few shielded outputs to a throwaway recipient (outputs need only a
+        // public key, so no funded wallet is required).
+        let mut rng = OsRng;
+        let keys = SecretKeys::from_rng_seed(&mut rng);
+        let cpk = keys.coin_public_key();
+        let token = ShieldedTokenType(HashOutput([9u8; 32]));
+        let outputs: Vec<_> = (0..3u128)
+            .map(|i| {
+                let coin = CoinInfo {
+                    nonce: rng.r#gen(),
+                    type_: token,
+                    value: 1_000 + i,
+                };
+                ZswapOutput::new(&mut rng, &coin, Some(1), &cpk, Some(keys.enc_public_key()))
+                    .expect("build output")
+            })
+            .collect();
+        let offer = ZswapOffer::new(vec![], outputs, vec![]).expect("build offer");
+        let binding_randomness = offer.binding_randomness();
+
+        let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> = Intent {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: Default::default(),
+        };
+        let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(1, intent);
+        let stx: StandardTransaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            StandardTransaction {
+                network_id: "preview".to_string(),
+                intents,
+                guaranteed_coins: Some(Sp::new(offer)),
+                fallible_coins: MnHashMap::new(),
+                binding_randomness,
+            };
+        let tx: Transaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            Transaction::Standard(stx);
+
+        // Mock prove — offline; fee-accurate by construction.
+        let tx_mock = tx.mock_prove().expect("mock_prove");
+        let fee_mock = tx_mock.fees(&INITIAL_PARAMETERS, false).expect("mock fees");
+
+        // Real prove with the local prover, then seal to the same binding form as mock_prove.
+        let scope = SyncCacheScope {
+            chain_id: Some("midnight:preview".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::cache_io::proving_keys_dir(&scope).expect("proving-key dir");
+        let prover = crate::Prover::new(dir);
+        let cost_model = &INITIAL_PARAMETERS.cost_model.runtime_cost_model;
+        let tx_real = crate::block_on(tx.prove(prover, cost_model)).expect("real prove");
+        let tx_real = tx_real.seal(StdRng::from_entropy());
+        let fee_real = tx_real.fees(&INITIAL_PARAMETERS, false).expect("real fees");
+
+        let mut mb = Vec::new();
+        tagged_serialize(&tx_mock, &mut mb).unwrap();
+        let mut rb = Vec::new();
+        tagged_serialize(&tx_real, &mut rb).unwrap();
+        eprintln!(
+            "mock: fee={fee_mock} size={} | real: fee={fee_real} size={}",
+            mb.len(),
+            rb.len()
+        );
+        assert_eq!(
+            fee_mock, fee_real,
+            "mock_prove fee must equal real-prove fee (fixed-size proofs)"
         );
     }
 }

@@ -24,8 +24,8 @@ use midnight_ledger::dust::{
     INITIAL_DUST_PARAMETERS,
 };
 use midnight_ledger::structure::{
-    Intent, LedgerParameters, ProofKind, ProofMarker, StandardTransaction, Transaction,
-    UnshieldedOffer, UtxoOutput, UtxoSpend,
+    Intent, LedgerParameters, ProofKind, ProofMarker, ProofPreimageMarker, StandardTransaction,
+    Transaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
 };
 use midnight_serialize::{
     tagged_deserialize, tagged_serialize, Deserializable as _, Serializable as _,
