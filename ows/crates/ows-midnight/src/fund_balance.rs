@@ -1,5 +1,6 @@
 //! `ows fund balance --chain midnight:*` display (unshielded + shielded balances, dust fee status).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use ows_core::Chain;
@@ -35,6 +36,22 @@ fn print_addresses(
     }
     eprintln!();
     Ok(())
+}
+
+/// Print one titled section of per-token balances — the amount right-aligned on stdout (so the
+/// numbers stay machine-readable) followed by the token type, with the header and any empty note on
+/// stderr. The unshielded and shielded sections share this so both render identically; `empty_note`
+/// (indented) is shown when the section has no tokens.
+fn print_token_balances(header: &str, balances: &BTreeMap<String, u128>, empty_note: &str) {
+    eprintln!("{header}");
+    if balances.is_empty() {
+        eprintln!("  {empty_note}");
+    } else {
+        for (token_type, amount) in balances {
+            println!("{amount:>24} {token_type}");
+        }
+    }
+    eprintln!();
 }
 
 /// How the dust ledger is handled for this run, decided before the concurrent sync so the dust
@@ -97,6 +114,7 @@ fn print_dust_status(
             match dust_balance {
                 Some(Ok((dust_utxo_count, dust_sum))) => {
                     eprintln!("  DUST UTXOs: {dust_utxo_count}");
+                    eprintln!("  DUST balance (specks): {dust_sum}");
                     eprintln!(
                         "  DUST balance: {} (best-effort, wall-clock time)",
                         format_dust_specks(dust_sum)
@@ -201,27 +219,20 @@ pub fn print_fund_balance(
         crypto_provider,
     )?;
 
-    if unshielded.is_empty() {
-        eprintln!("No Midnight unshielded tokens found for {address} on {chain_id}");
-        eprintln!();
-    } else {
-        eprintln!("Unshielded balances:");
-        for (token_type, amount) in unshielded {
-            println!("{amount:>24} {token_type}");
-        }
-        eprintln!();
-    }
+    print_token_balances(
+        "Unshielded balances:",
+        &unshielded,
+        &format!("none — no unshielded tokens found for {address} on {chain_id}"),
+    );
 
+    // Shielded balances need the crypto provider to sync; without it the section would always read
+    // empty, which is misleading, so it is omitted entirely rather than shown as "none".
     if crypto_provider.is_some() {
-        eprintln!("Shielded balances:");
-        if shielded.is_empty() {
-            eprintln!("  (none — no unspent shielded coins found after full sync)");
-        } else {
-            for (token_type, amount) in shielded {
-                println!("{amount:>24} {token_type}");
-            }
-        }
-        eprintln!();
+        print_token_balances(
+            "Shielded balances:",
+            &shielded,
+            "none — no unspent shielded coins found after full sync",
+        );
     }
 
     if needs_dust {

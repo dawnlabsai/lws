@@ -553,4 +553,19 @@ mod tests {
         assert!(is_dust_live(Some(1)));
         assert!(is_dust_live(Some(9_999)));
     }
+
+    #[test]
+    fn format_dust_specks_scales_by_specks_per_dust() {
+        // The fund-balance printer shows both the raw specks and this human decimal; keep the
+        // decimal faithful — one whole DUST is `SPECKS_PER_DUST` specks, and fractions round-trip.
+        let scale = midnight_ledger::structure::SPECKS_PER_DUST;
+        assert_eq!(format_dust_specks(0).parse::<f64>().unwrap(), 0.0);
+        assert_eq!(format_dust_specks(scale).parse::<f64>().unwrap(), 1.0);
+        assert_eq!(
+            format_dust_specks(scale * 2 + scale / 2)
+                .parse::<f64>()
+                .unwrap(),
+            2.5
+        );
+    }
 }
