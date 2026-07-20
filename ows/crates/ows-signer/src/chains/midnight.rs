@@ -3,13 +3,17 @@ use k256::schnorr::SigningKey;
 use midnight_base_crypto::signatures::{
     Signature as MnSignature, SigningKey as MidnightSigningKey,
 };
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin;
 use midnight_coin_structure::transfer;
 use midnight_ledger::dust::{
-    DustActions, DustLocalState, DustPublicKey, DustRegistration, DustSecretKey,
+    DustActions, DustLocalState, DustOutput, DustPublicKey, DustRegistration, DustSecretKey,
+    DustSpend,
 };
 use midnight_ledger::semantics::ZswapLocalStateExt as _;
-use midnight_ledger::structure::{Intent, ProofMarker, StandardTransaction, Transaction};
+use midnight_ledger::structure::{
+    Intent, LedgerParameters, ProofMarker, ProofPreimageMarker, StandardTransaction, Transaction,
+};
 use midnight_serialize::{
     tagged_deserialize, tagged_serialize, Deserializable, ScaleBigInt, Serializable,
 };
@@ -24,6 +28,7 @@ use rand::SeedableRng as _;
 use sha2::Digest;
 use std::ops::Deref as _;
 use transient_crypto::commitment::PedersenRandomness;
+use transient_crypto::proofs::ProvingProvider;
 
 use crate::curve::Curve;
 use crate::hd::DerivedKey;
@@ -572,6 +577,120 @@ impl MidnightCryptoProvider {
             .replay_events(&self.shielded_keys, std::iter::once(ev))
             .map_err(|e| SignerError::SigningFailed(format!("replay zswap event failed: {e:?}")))
     }
+
+    /// Build proof-preimage dust spends sufficient to cover `fee_dust`. Offline — no proving, no
+    /// network. The balancer uses this to size the fee; [`Self::authorize_dust`] uses it again to
+    /// produce the real, proved spends. The dust secret key stays inside the provider.
+    pub fn build_preimage_dust_spends(
+        &self,
+        st: DustLocalState<InMemoryDB>,
+        fee_dust: u128,
+        dust_ctime: Timestamp,
+    ) -> Result<Vec<DustSpend<ProofPreimageMarker, InMemoryDB>>, SignerError> {
+        select_dust_spends_preimage(st, &self.dust_sk, fee_dust, dust_ctime)
+    }
+
+    /// Authorize the wallet's DUST fee. Builds proof-preimage dust spends using the already-held
+    /// `dust_sk` and proves them into a submittable `DustActions` section. The bearer preimage is
+    /// born and consumed here — only the proven section leaves — so this runs **after** the policy
+    /// seam.
+    ///
+    /// `async` because proving is; the caller drives it with its own executor.
+    pub async fn authorize_dust<P: ProvingProvider>(
+        &self,
+        dust_state: &DustLocalState<InMemoryDB>,
+        plan: &DustSpendPlan,
+        ledger_params: &LedgerParameters,
+        prover: P,
+    ) -> Result<DustActions<MnSignature, ProofMarker, InMemoryDB>, SignerError> {
+        let spends = select_dust_spends_preimage(
+            dust_state.clone(),
+            &self.dust_sk,
+            plan.fee_dust,
+            plan.dust_ctime,
+        )?;
+
+        let dust_preimage: DustActions<MnSignature, ProofPreimageMarker, InMemoryDB> =
+            DustActions {
+                spends: spends.into_iter().collect(),
+                registrations: vec![].into(),
+                ctime: plan.dust_ctime,
+            };
+        let prove_intent: Intent<MnSignature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
+            Intent {
+                guaranteed_unshielded_offer: None,
+                fallible_unshielded_offer: None,
+                actions: vec![].into(),
+                dust_actions: Some(Sp::new(dust_preimage)),
+                ttl: plan.intent_ttl,
+                binding_commitment: plan.binding_commitment,
+            };
+        let (_seg, proven_intent) = prove_intent
+            .prove(
+                plan.seg_id,
+                prover,
+                &ledger_params.cost_model.runtime_cost_model,
+            )
+            .await
+            .map_err(|e| SignerError::SigningFailed(format!("prove dust spends failed: {e:?}")))?;
+        proven_intent
+            .dust_actions
+            .as_ref()
+            .map(|sp| sp.deref().clone())
+            .ok_or_else(|| {
+                SignerError::SigningFailed("proven dust intent has no dust actions".into())
+            })
+    }
+}
+
+/// Select just enough of the wallet's generated dust notes to pay `fee_dust`, building each spend's
+/// proof-preimage against the synced state. Targets a headroom over the fee (the spends themselves
+/// add to the fee, so the caller re-runs this with a higher target when needed).
+fn select_dust_spends_preimage(
+    mut st: DustLocalState<InMemoryDB>,
+    dsk: &DustSecretKey,
+    fee_dust: u128,
+    dust_ctime: Timestamp,
+) -> Result<Vec<DustSpend<ProofPreimageMarker, InMemoryDB>>, SignerError> {
+    let mut need = fee_dust.saturating_mul(2).saturating_add(100_000);
+    let mut spends = Vec::new();
+    for qdo in st.utxos().collect::<Vec<_>>() {
+        if need == 0 {
+            break;
+        }
+        let Some(gen_info) = st.generation_info(&qdo) else {
+            continue;
+        };
+        let value = DustOutput::from(qdo).updated_value(&gen_info, dust_ctime, &st.params);
+        if value == 0 {
+            continue;
+        }
+        let v_fee = u128::min(value, need);
+        let (st2, spend) = st
+            .spend(dsk, &qdo, v_fee, dust_ctime)
+            .map_err(|e| SignerError::SigningFailed(format!("dust spend build failed: {e}")))?;
+        st = st2;
+        spends.push(spend);
+        need = need.saturating_sub(v_fee);
+    }
+    if need > 0 {
+        return Err(SignerError::SigningFailed(
+            "insufficient DUST balance to pay fees via a proof-bearing dust spend".into(),
+        ));
+    }
+    Ok(spends)
+}
+
+/// The wallet's DUST fee plan for one intent segment: the converged fee target plus the timing/segment
+/// context the signer needs to build and prove the fee section. Sized by the balancer offline; the
+/// signer realizes it into a submittable section. `binding_commitment` is copied from the
+/// transaction's real intent so the proved section splices back in.
+pub struct DustSpendPlan {
+    pub fee_dust: u128,
+    pub dust_ctime: Timestamp,
+    pub intent_ttl: Timestamp,
+    pub seg_id: u16,
+    pub binding_commitment: PedersenRandomness,
 }
 
 /// Deserialize a balanced proven (`proof,embedded-fr`) Midnight Standard transaction that carries
@@ -890,6 +1009,24 @@ mod tests {
         assert_eq!(provider.dust_public_key().unwrap(), expect_dpk);
         // The shielded key never leaves the provider; its fingerprint is stable and non-zero.
         assert_ne!(provider.shielded_key_fingerprint().unwrap(), [0u8; 32]);
+    }
+
+    /// With an empty dust state (no generated dust notes) the spend selection can cover nothing and
+    /// errors before ever touching the prover — the reachable slice of the proof-bearing dust path
+    /// without real dust notes or proving keys.
+    #[test]
+    fn build_preimage_dust_spends_errors_when_the_wallet_has_no_dust() {
+        let provider = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&signing_key_blob()))
+            .unwrap();
+        let st = DustLocalState::new(midnight_ledger::dust::INITIAL_DUST_PARAMETERS);
+        let e = provider
+            .build_preimage_dust_spends(st, 10_000, Timestamp::from_secs(2_000))
+            .unwrap_err();
+        assert!(
+            format!("{e}").contains("insufficient DUST balance"),
+            "unexpected error: {e}"
+        );
     }
 
     // Role seeds for the abandon-phrase wallet at index 0

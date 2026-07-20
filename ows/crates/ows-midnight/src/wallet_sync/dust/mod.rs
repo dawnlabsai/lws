@@ -438,6 +438,19 @@ discarding stale snapshot and replaying from genesis",
     Ok(state)
 }
 
+/// Sync a **spendable** [`DustLocalState`] for this dust key — the same replay
+/// [`get_dust_balance_for_display`] uses, but returning the state itself so the balancer can build
+/// and prove `DustSpend`s to pay fees. Resumes from the disk snapshot when present (verified against
+/// the indexer HTTP tip), otherwise replays from genesis. The dust key stays in the crypto provider.
+pub(crate) async fn sync_spendable_dust_state(
+    indexer_url: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    scope: &SyncCacheScope,
+    current_block_height: Option<i64>,
+) -> Result<DustLocalState<InMemoryDB>, std::io::Error> {
+    sync_dust_local_state(indexer_url, crypto_provider, scope, current_block_height).await
+}
+
 /// DUST balance for `ows fund balance` — resumes the dust ledger from this dust key's disk
 /// snapshot when present, otherwise replays from genesis, then applies the ledger decay rules
 /// at `dust_ctime_unix_secs`. Returns `(utxo_count, summed_specks)`.

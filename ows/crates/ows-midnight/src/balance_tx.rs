@@ -3,9 +3,11 @@
 //!
 //! v1 scope: the wallet injects its own **unshielded** NIGHT inputs (and a change output) to cover
 //! the transaction's unshielded outputs, preserving the existing ZK proofs, and — when asked to pay
-//! fees on a chain that needs DUST — adds a signature-based **generationless** DUST fee registration
-//! funded by its own unregistered NIGHT (no proving). Shielded-input balancing and proof-bearing
-//! DUST spends are not handled — a transaction that needs either is rejected.
+//! fees on a chain that needs DUST — covers the fee with either a signature-based **generationless**
+//! DUST fee registration funded by its own unregistered NIGHT (no proving), or, when the wallet has
+//! no unregistered NIGHT capacity (its NIGHT is all registered for dust generation), a proof-bearing
+//! **DUST spend** of its generated dust. Shielded-input balancing is not handled — a transaction
+//! that needs it is rejected.
 
 use std::io::Cursor;
 use std::ops::Deref as _;
@@ -16,11 +18,12 @@ use midnight_coin_structure::coin::{
     ShieldedTokenType, TokenType as LedgerTokenType, UserAddress, NIGHT,
 };
 use midnight_ledger::dust::{
-    DustActions, DustPublicKey, DustRegistration, INITIAL_DUST_PARAMETERS,
+    DustActions, DustLocalState, DustPublicKey, DustRegistration, DustSpend,
+    INITIAL_DUST_PARAMETERS,
 };
 use midnight_ledger::structure::{
-    Intent, LedgerParameters, ProofMarker, StandardTransaction, Transaction, UnshieldedOffer,
-    UtxoOutput, UtxoSpend,
+    Intent, LedgerParameters, ProofKind, ProofMarker, StandardTransaction, Transaction,
+    UnshieldedOffer, UtxoOutput, UtxoSpend,
 };
 use midnight_serialize::{
     tagged_deserialize, tagged_serialize, Deserializable as _, Serializable as _,
@@ -29,7 +32,7 @@ use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
 use midnight_zswap::Offer as ZswapOffer;
-use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork};
+use ows_signer::chains::{DustSpendPlan, MidnightCryptoProvider, MidnightNetwork};
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::proofs::Proof as ZswapProof;
 
@@ -38,7 +41,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
-use fee_sizing::{cover_dust_fee_registration, DustFeeContext};
+use fee_sizing::{cover_dust_fees, DustFeeContext};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
@@ -279,6 +282,39 @@ fn build_balanced_unshielded_offer(
     Ok((offer, selected))
 }
 
+/// Build a proof-bearing dust-action section that spends the wallet's generated dust to pay `fee`.
+///
+/// The dust spend witnesses are built and proved **in the signer** — this hands the crypto provider
+/// its [`MidnightCryptoProvider::authorize_dust`] method, which selects dust notes against the synced
+/// state, builds a dust-only proof-preimage intent, and proves it with the local
+/// [`Prover`](crate::Prover) (DUST proving keys fetched on demand). Only the proven `DustActions`
+/// cross back, so no dust key material leaves the signer.
+fn build_proven_dust_spends(
+    ctx: &DustFeeContext,
+    dust_state: &DustLocalState<InMemoryDB>,
+    fee_target: u128,
+    intent_ttl: Timestamp,
+) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
+    let proving_key_dir = crate::cache_io::proving_keys_dir(ctx.scope)
+        .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
+    let prover = crate::Prover::new(proving_key_dir);
+
+    let plan = DustSpendPlan {
+        fee_dust: fee_target,
+        dust_ctime: ctx.dust_ctime,
+        intent_ttl,
+        seg_id: ctx.seg_id,
+        binding_commitment: ctx.intent_in.binding_commitment,
+    };
+    crate::block_on(ctx.crypto_provider.authorize_dust(
+        dust_state,
+        &plan,
+        ctx.ledger_params,
+        prover,
+    ))
+    .map_err(|e| err(format!("prove dust spends failed: {e}")))
+}
+
 /// Give the signed intent a TTL an hour past the chain tip, matching the wallet SDK.
 fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
     Timestamp::from_secs(dust_ctime.to_secs().saturating_add(3600))
@@ -364,9 +400,10 @@ fn balance_unsealed_proven_standard_tx(
         scope,
     )?;
 
-    // On a chain with a live dust ledger (Preview/Preprod, mainnet too), fees are paid via a
-    // generationless DUST registration signed by the wallet (no proof). The registration and an
-    // hour-past-tip TTL both need the chain time, so fetch the tip once (it also carries the ledger
+    // On a chain with a live dust ledger (Preview/Preprod, mainnet too), fees are paid with a DUST
+    // section: a generationless registration signed by the wallet (no proof) when it has unregistered
+    // NIGHT, otherwise a proof-bearing spend of its generated dust. Both that section and an
+    // hour-past-tip TTL need the chain time, so fetch the tip once (it also carries the ledger
     // parameters used to size the fee).
     let (dust_actions, intent_ttl) = if pay_fees
         && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url))
@@ -383,7 +420,7 @@ fn balance_unsealed_proven_standard_tx(
             .dust_public_key()
             .map_err(|e| err(e.to_string()))?;
         let night_vk = sender_vk.clone();
-        let registration = cover_dust_fee_registration(&DustFeeContext {
+        let dust_section = cover_dust_fees(&DustFeeContext {
             stx: &stx,
             seg_id,
             intent_in: &intent_in,
@@ -391,10 +428,13 @@ fn balance_unsealed_proven_standard_tx(
             selected: &selected,
             dust_pk,
             night_vk,
+            crypto_provider,
             dust_ctime,
             ledger_params: &ledger_params,
+            indexer_url,
+            scope,
         })?;
-        (Some(registration), chain_aligned_intent_ttl(dust_ctime))
+        (Some(dust_section), chain_aligned_intent_ttl(dust_ctime))
     } else {
         (None, intent_in.ttl)
     };
@@ -680,5 +720,4 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(offer_sigs, 1, "the input signature stays on the offer");
     }
-
 }
