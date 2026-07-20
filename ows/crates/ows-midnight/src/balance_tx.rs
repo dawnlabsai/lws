@@ -389,3 +389,150 @@ pub fn balance_unsealed_proven_tx(
 
     balance_unsealed_proven_standard_tx(&indexer_url, &sender_vk, &sender_addr, tx_bytes, &scope)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midnight_base_crypto::hash::HashOutput;
+    use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
+    use midnight_base_crypto::time::Timestamp;
+    use midnight_ledger::structure::IntentHash;
+    use ows_signer::chains::MidnightSigner;
+    use ows_signer::traits::ChainSigner;
+    use ows_signer::SecretBytes;
+    use transient_crypto::commitment::PureGeneratorPedersen;
+
+    // Unshielded role-0 seed for the abandon-phrase wallet at index 0; matches the signer's
+    // address vectors. A second valid seed drives the wrong-owner test.
+    const UNSHIELDED_SEED_HEX: &str =
+        "822fa63c57f6317cd51d12d80f0e64c2bc2164088dec1c71ca34a87a890190aa";
+    const OTHER_SEED_HEX: &str = "92933dd3dff04c57c9f8950d6e08bd5c6f295655c03627a658e09b0726558cad";
+
+    /// Pack a Midnight signing key the way `secret_to_signing_key` does: the `MNK1` magic followed
+    /// by three 32-byte role seeds. Only the unshielded seed is exercised by signing, so the
+    /// shielded/dust slots are filler.
+    fn packed_signing_key(unshielded_seed_hex: &str) -> SecretBytes {
+        let mut blob = b"MNK1".to_vec();
+        blob.extend_from_slice(&hex::decode(unshielded_seed_hex).unwrap());
+        blob.extend_from_slice(&[0x11u8; 32]);
+        blob.extend_from_slice(&[0x22u8; 32]);
+        SecretBytes::new(blob)
+    }
+
+    /// Build a minimal proven (`proof,embedded-fr`) unsealed Standard tx: one guaranteed unshielded
+    /// NIGHT input owned by `vk` plus a matching output, no contract calls / shielded coins / dust.
+    /// Structurally what the balancer emits, so it exercises sign → reattach → seal without a prover
+    /// or indexer.
+    fn build_proven_unshielded_tx(vk: &VerifyingKey) -> Vec<u8> {
+        let input = UtxoSpend {
+            value: 1_000_000,
+            owner: vk.clone(),
+            type_: NIGHT,
+            intent_hash: IntentHash(HashOutput([7u8; 32])),
+            output_no: 0,
+        };
+        let output = UtxoOutput {
+            value: 1_000_000,
+            owner: UserAddress::from(vk.clone()),
+            type_: NIGHT,
+        };
+        let offer = UnshieldedOffer {
+            inputs: vec![input].into(),
+            outputs: vec![output].into(),
+            signatures: vec![].into(),
+        };
+        let intent: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> = Intent {
+            guaranteed_unshielded_offer: Some(Sp::new(offer)),
+            fallible_unshielded_offer: None,
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: Default::default(),
+        };
+        let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(0, intent);
+        let stx = StandardTransaction {
+            network_id: "midnight:test".to_string(),
+            intents,
+            guaranteed_coins: None,
+            fallible_coins: MnHashMap::new(),
+            binding_randomness: Default::default(),
+        };
+        let tx: TxProven = Transaction::Standard(stx);
+        let mut out = Vec::new();
+        tagged_serialize(&tx, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn sign_then_encode_seals_a_tx_carrying_a_valid_signature() {
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let tx_bytes = build_proven_unshielded_tx(&vk);
+
+        // Sign: one detached signature over the intent's signing message, no seal.
+        let out = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
+        assert!(!out.signature.is_empty(), "expected a signature blob");
+
+        // It verifies against the intent's data_to_sign for the input owner — i.e. the detached
+        // step really signs the message the ledger's own Intent::sign would.
+        let mut r: &[u8] = tx_bytes.as_slice();
+        let parsed: TxProven = tagged_deserialize(&mut r).unwrap();
+        let Transaction::Standard(stx) = parsed else {
+            panic!("standard");
+        };
+        let pair = stx.intents.iter().next().unwrap();
+        let (seg_sp, intent_sp) = pair.deref();
+        let seg_id = *seg_sp.deref();
+        let intent = intent_sp.deref().clone();
+        let data = intent
+            .erase_proofs()
+            .erase_signatures()
+            .data_to_sign(seg_id);
+        let sig: MnSig = tagged_deserialize(&mut &out.signature[..]).unwrap();
+        assert!(
+            vk.verify(&data, &sig),
+            "signature must verify over data_to_sign"
+        );
+
+        // Encode: reattach + seal (keyless). The sealed Standard tx's guaranteed offer now carries
+        // the signature.
+        let sealed_bytes = signer.encode_signed_transaction(&tx_bytes, &out).unwrap();
+        let mut r2: &[u8] = sealed_bytes.as_slice();
+        let sealed: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
+            tagged_deserialize(&mut r2).unwrap();
+        let Transaction::Standard(sealed_stx) = sealed else {
+            panic!("standard");
+        };
+        let sealed_pair = sealed_stx.intents.iter().next().unwrap();
+        let (_seg, sealed_intent_sp) = sealed_pair.deref();
+        let sig_count = sealed_intent_sp
+            .deref()
+            .guaranteed_unshielded_offer
+            .as_ref()
+            .map(|o| o.deref().signatures.len())
+            .unwrap_or(0);
+        assert_eq!(sig_count, 1, "sealed tx should carry exactly one signature");
+    }
+
+    #[test]
+    fn sign_rejects_a_tx_whose_inputs_it_does_not_own() {
+        let signer = MidnightSigner::mainnet();
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let tx_bytes = build_proven_unshielded_tx(&vk);
+
+        // Sign the same tx with a different wallet key — the ownership check must reject it.
+        let wrong_key = packed_signing_key(OTHER_SEED_HEX);
+        let err = signer
+            .sign_transaction(wrong_key.expose(), &tx_bytes)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("owned by the signing key"),
+            "unexpected error: {err}"
+        );
+    }
+}
