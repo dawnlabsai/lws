@@ -21,7 +21,8 @@ mod wallet_sync;
 pub use async_runtime::block_on;
 pub use balance_tx::{authorize_proven_tx, plan_unsealed_proven_tx, BalancedPlan};
 pub use dapp_connector::{
-    classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
+    classify_unsealed_payload, parse_balance_unsealed_json, parse_connector_method,
+    BalanceUnsealedRequest, ConnectorMethod, UnsealedKind,
 };
 pub use fund_balance::print_fund_balance;
 pub use ledger_params::fetch_indexer_ledger_parameters;
