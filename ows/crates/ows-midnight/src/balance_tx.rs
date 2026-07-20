@@ -33,19 +33,20 @@ use midnight_serialize::{
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
+use midnight_zswap::local::State as ZswapLocalState;
 use midnight_zswap::Offer as ZswapOffer;
 use ows_signer::chains::{
-    DustSpendPlan, MidnightCryptoProvider, MidnightNetwork, ShieldedSpendPlan,
+    DustSpendPlan, MidnightCryptoProvider, MidnightNetwork, ShieldedAuthorized, ShieldedSpendPlan,
 };
 use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::Proof as ZswapProof;
+use transient_crypto::proofs::{Proof as ZswapProof, ProofPreimage};
 
 use ows_core::sync_cache::SyncCacheScope;
 
 use crate::UnshieldedUtxo;
 
 mod fee_sizing;
-use fee_sizing::{cover_dust_fees, DustFeeContext};
+use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
 
@@ -286,39 +287,6 @@ fn build_balanced_unshielded_offer(
     Ok((offer, selected))
 }
 
-/// Build a proof-bearing dust-action section that spends the wallet's generated dust to pay `fee`.
-///
-/// The dust spend witnesses are built and proved **in the signer** — this hands the crypto provider
-/// its [`MidnightCryptoProvider::authorize_dust`] method, which selects dust notes against the synced
-/// state, builds a dust-only proof-preimage intent, and proves it with the local
-/// [`Prover`](crate::Prover) (DUST proving keys fetched on demand). Only the proven `DustActions`
-/// cross back, so no dust key material leaves the signer.
-fn build_proven_dust_spends(
-    ctx: &DustFeeContext,
-    dust_state: &DustLocalState<InMemoryDB>,
-    fee_target: u128,
-    intent_ttl: Timestamp,
-) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
-    let proving_key_dir = crate::cache_io::proving_keys_dir(ctx.scope)
-        .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
-    let prover = crate::Prover::new(proving_key_dir);
-
-    let plan = DustSpendPlan {
-        fee_dust: fee_target,
-        dust_ctime: ctx.dust_ctime,
-        intent_ttl,
-        seg_id: ctx.seg_id,
-        binding_commitment: ctx.intent_in.binding_commitment,
-    };
-    crate::block_on(ctx.crypto_provider.authorize_dust(
-        dust_state,
-        &plan,
-        ctx.ledger_params,
-        prover,
-    ))
-    .map_err(|e| err(format!("prove dust spends failed: {e}")))
-}
-
 /// Give the signed intent a TTL an hour past the chain tip, matching the wallet SDK.
 fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
     Timestamp::from_secs(dust_ctime.to_secs().saturating_add(3600))
@@ -402,32 +370,51 @@ fn plan_shielded_inputs(
     })
 }
 
-/// Fund a proven transaction's shielded deficit (e.g. a contract deposit whose Zswap offer has
-/// outputs but no inputs) with the wallet's own shielded coins, preserving the existing proofs.
-///
-/// Mirrors how the DUST-spend fee path proves independently and folds in: per intent segment, select
-/// the wallet's coins into a proof-preimage Zswap offer (inputs + self-change) via the crypto
-/// provider, prove that fragment on its own with the local [`Prover`](crate::Prover), and merge the
-/// proven fragment into the already-proven `guaranteed_coins`. A proven transaction can't recompute
-/// its Pedersen binding, so the spent/created coins' binding randomness is added to
-/// `binding_randomness` directly. A transaction with no shielded deficit is returned untouched.
-fn attach_shielded_inputs(
-    stx: StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+/// The wallet's shielded funding plan for an unsealed proven tx: the per-segment [`ShieldedSpendPlan`]s
+/// (which coins to spend + change to mint) and the synced Zswap tree they were planned against — the
+/// signer re-spends against this same tree to build the real witnesses. Inert: it carries no spend
+/// witness, so it is not a bearer instrument.
+pub(super) struct ShieldedFundingPlan {
+    pub(super) plans: Vec<ShieldedSpendPlan>,
+    pub(super) tree: ZswapLocalState<InMemoryDB>,
+}
+
+/// A balanced-but-unauthorized transaction: everything needed to authorize an unsealed proven tx,
+/// minus the authorizing witnesses themselves. Produced by [`plan_unsealed_proven_tx`] (which syncs,
+/// selects, and fee-sizes with **no** real proving) and consumed by [`authorize_proven_tx`] after the
+/// policy seam. Carries no bearer instrument — the proof-preimage `spend()` witnesses are built later,
+/// in the signer.
+pub struct BalancedPlan {
+    base: StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    seg_id: u16,
+    intent_in: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    unshielded_offer: UnshieldedOffer<MnSig, InMemoryDB>,
+    intent_ttl: Timestamp,
+    shielded: Option<ShieldedFundingPlan>,
+    dust: DustFeePlan,
+}
+
+/// Plan the wallet's shielded funding for a proven tx's shielded deficit (e.g. a contract deposit
+/// whose Zswap offer has outputs but no inputs): sync the wallet, then per intent segment choose the
+/// coins to spend (whole, largest-first) and the self-change to mint — threading coin consumption
+/// across segments so no coin is planned twice. Pure selection over the synced coin set — no spend,
+/// no proving. Returns `None` when the tx has no shielded shortfall.
+fn plan_shielded_funding(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     indexer_url: &str,
     scope: &SyncCacheScope,
-) -> Result<StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>, std::io::Error>
-{
-    let Some(offer_sp) = stx.guaranteed_coins.as_ref() else {
-        return Ok(stx);
+) -> Result<Option<ShieldedFundingPlan>, std::io::Error> {
+    let Some(offer_sp) = base.guaranteed_coins.as_ref() else {
+        return Ok(None);
     };
     let deficits = if zswap_offer_needs_shielded_inputs(offer_sp.deref()) {
-        ledger_shielded_deficits(&Transaction::Standard(stx.clone()))?
+        ledger_shielded_deficits(&Transaction::Standard(base.clone()))?
     } else {
         Vec::new()
     };
     if deficits.is_empty() {
-        return Ok(stx);
+        return Ok(None);
     }
 
     let current_block_height = crate::tip_verify::fetch_current_block_height(indexer_url);
@@ -463,42 +450,30 @@ fn attach_shielded_inputs(
         });
     }
     if plans.is_empty() {
-        return Ok(stx);
+        return Ok(None);
     }
-
-    // The signer builds the proof-preimage spend witnesses from its held shielded keys and proves each
-    // fragment; only the proven offers cross back, so no key material reaches the balancer.
-    let prover = midnight_prover_for_scope(scope)?;
-    let authorized = crate::block_on(crypto_provider.authorize_shielded(&plans, &tree, prover))
-        .map_err(|e| err(e.to_string()))?;
-
-    let mut merged: ZswapOffer<ZswapProof, InMemoryDB> = offer_sp.deref().clone();
-    for (_segment, proven) in &authorized.proven {
-        merged = merged
-            .merge(proven)
-            .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
-    }
-
-    let mut stx = stx;
-    stx.guaranteed_coins = Some(Sp::new(merged));
-    // Proven txs cannot call `recompute_binding_randomness`; add the spend/change randomness directly.
-    stx.binding_randomness = stx.binding_randomness + authorized.binding_delta;
-    Ok(stx)
+    Ok(Some(ShieldedFundingPlan { plans, tree }))
 }
 
-/// Build the local [`Prover`](crate::Prover) for a sync scope's vault-rooted proving-key directory.
-/// Keyless: the prover holds proving/verifier keys, never a wallet secret.
-fn midnight_prover_for_scope(scope: &SyncCacheScope) -> Result<crate::Prover, std::io::Error> {
-    let dir = crate::cache_io::proving_keys_dir(scope)
+/// Build the local [`Prover`](crate::Prover) for a chain's vault-rooted proving-key directory.
+/// Keyless: the prover holds proving/verifier keys, never a wallet secret. A fresh one is built per
+/// authorized section so their proving randomness is independent.
+fn midnight_prover(chain_id: &str) -> Result<crate::Prover, std::io::Error> {
+    let scope = SyncCacheScope {
+        chain_id: Some(chain_id.to_string()),
+        ..Default::default()
+    };
+    let dir = crate::cache_io::proving_keys_dir(&scope)
         .ok_or_else(|| err("could not resolve the Midnight proving-key directory"))?;
     Ok(crate::Prover::new(dir))
 }
 
-/// Inject the wallet's own inputs into a proven Standard transaction, preserving its existing proofs:
-/// shielded inputs to fund a contract deposit (when the tx has a shielded deficit), then unshielded
-/// NIGHT inputs/change to cover the unshielded outputs.
+/// Plan (but do not authorize) the balancing of an already-proven (`proof,embedded-fr`) unsealed
+/// Standard transaction: parse it, plan the wallet's shielded funding, build the balanced unshielded
+/// offer, and size the DUST fee — all without real proving. The returned [`BalancedPlan`] carries no
+/// bearer instrument; the authorizing `spend()`/`prove()` happen later, in the signer, past the seam.
 #[allow(clippy::too_many_arguments)]
-fn balance_unsealed_proven_standard_tx(
+fn plan_unsealed_proven_standard_tx(
     indexer_url: &str,
     crypto_provider: &MidnightCryptoProvider,
     sender_vk: &VerifyingKey,
@@ -506,19 +481,19 @@ fn balance_unsealed_proven_standard_tx(
     tx_bytes: &[u8],
     pay_fees: bool,
     scope: &SyncCacheScope,
-) -> Result<Vec<u8>, std::io::Error> {
+) -> Result<BalancedPlan, std::io::Error> {
     let mut r: &[u8] = tx_bytes;
     let tx: TxProven = tagged_deserialize(&mut r)
         .map_err(|e| err(format!("failed to parse proven tx bytes: {e}")))?;
-    let Transaction::Standard(stx) = tx else {
+    let Transaction::Standard(base) = tx else {
         return Err(err("expected Standard transaction"));
     };
 
-    // Fund a shielded deficit (e.g. a contract deposit) with the wallet's own shielded coins before
-    // unshielded balancing — a no-op when the tx has no shielded shortfall.
-    let stx = attach_shielded_inputs(stx, crypto_provider, indexer_url, scope)?;
+    // Plan a shielded deficit (e.g. a contract deposit) against the wallet's own shielded coins — a
+    // no-op when the tx has no shielded shortfall. Pure selection: no spend, no prove.
+    let shielded = plan_shielded_funding(&base, crypto_provider, indexer_url, scope)?;
 
-    let pair = stx
+    let pair = base
         .intents
         .iter()
         .next()
@@ -552,12 +527,21 @@ fn balance_unsealed_proven_standard_tx(
         scope,
     )?;
 
+    // Size the DUST fee against a stand-in tx that already carries the shielded section (mock-proved,
+    // fixed-size), so the fee — which covers the whole tx — is right even though the real shielded
+    // proving is deferred past the seam.
+    let stx_for_sizing = match &shielded {
+        Some(s) => fee_sizing::splice_mock_shielded_for_sizing(&base, crypto_provider, s)?,
+        None => base.clone(),
+    };
+
     // On a chain with a live dust ledger (Preview/Preprod, mainnet too), fees are paid with a DUST
     // section: a generationless registration signed by the wallet (no proof) when it has unregistered
     // NIGHT, otherwise a proof-bearing spend of its generated dust. Both that section and an
     // hour-past-tip TTL need the chain time, so fetch the tip once (it also carries the ledger
-    // parameters used to size the fee).
-    let (dust_actions, intent_ttl) = if pay_fees
+    // parameters used to size the fee). The fee is sized here without real proving; the proof-bearing
+    // spend is realized post-seam by the signer.
+    let (dust, intent_ttl) = if pay_fees
         && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url))
     {
         if intent_in.dust_actions.is_some() {
@@ -572,8 +556,8 @@ fn balance_unsealed_proven_standard_tx(
             .dust_public_key()
             .map_err(|e| err(e.to_string()))?;
         let night_vk = sender_vk.clone();
-        let dust_section = cover_dust_fees(&DustFeeContext {
-            stx: &stx,
+        let dust = fee_sizing::size_dust_fee(&DustFeeContext {
+            stx: &stx_for_sizing,
             seg_id,
             intent_in: &intent_in,
             offer: &offer,
@@ -586,18 +570,97 @@ fn balance_unsealed_proven_standard_tx(
             indexer_url,
             scope,
         })?;
-        (Some(dust_section), chain_aligned_intent_ttl(dust_ctime))
+        (dust, chain_aligned_intent_ttl(dust_ctime))
     } else {
-        (None, intent_in.ttl)
+        (DustFeePlan::None, intent_in.ttl)
     };
 
-    let intent_out = assemble_proven_intent(&offer, &intent_in, dust_actions, intent_ttl);
-    let tx_out = wrap_proven_standard(&stx, seg_id, intent_out);
+    Ok(BalancedPlan {
+        base,
+        seg_id,
+        intent_in,
+        unshielded_offer: offer,
+        intent_ttl,
+        shielded,
+        dust,
+    })
+}
+
+/// Authorize a [`BalancedPlan`] into balanced-but-unsealed proven transaction bytes. The wallet's
+/// shielded/dust spend witnesses are built and proved **in the signer** — this hands the
+/// `crypto_provider` its [`MidnightCryptoProvider::authorize_shielded`] / `authorize_dust` methods,
+/// which build and consume the bearer preimage internally; only proven sections cross back. So this
+/// runs **after** the policy seam. The proven shielded fragments are merged into the guaranteed offer
+/// (folding in their binding-randomness delta, since a proven tx can't recompute its own Pedersen
+/// binding) and the DUST section attached; the tx is then serialized. Signing and sealing are separate
+/// downstream steps.
+pub fn authorize_proven_tx(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    plan: BalancedPlan,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut base = plan.base;
+
+    // Shielded: the signer builds + proves the witnesses; merge each proven fragment into the
+    // already-proven guaranteed offer.
+    if let Some(shielded) = plan.shielded {
+        let prover = midnight_prover(chain_id)?;
+        let authorized: ShieldedAuthorized = crate::block_on(crypto_provider.authorize_shielded(
+            &shielded.plans,
+            &shielded.tree,
+            prover,
+        ))
+        .map_err(|e| err(e.to_string()))?;
+        let mut merged = base
+            .guaranteed_coins
+            .as_ref()
+            .map(|sp| sp.deref().clone())
+            .ok_or_else(|| {
+                err("shielded authorization present but tx has no guaranteed coins offer")
+            })?;
+        for (_segment, proven) in &authorized.proven {
+            merged = merged
+                .merge(proven)
+                .map_err(|e| err(format!("merge shielded zswap offers: {e}")))?;
+        }
+        base.guaranteed_coins = Some(Sp::new(merged));
+        base.binding_randomness = base.binding_randomness + authorized.binding_delta;
+    }
+
+    // DUST: the registration was finalized during planning (keyless, no bearer instrument); the
+    // proof-bearing spend is realized here, in the signer.
+    let dust_actions = match plan.dust {
+        DustFeePlan::None => None,
+        DustFeePlan::Registration(reg) => Some(reg),
+        DustFeePlan::Spend {
+            plan: dust_plan,
+            dust_state,
+            ledger_params,
+        } => {
+            let prover = midnight_prover(chain_id)?;
+            let section = crate::block_on(crypto_provider.authorize_dust(
+                &dust_state,
+                &dust_plan,
+                &ledger_params,
+                prover,
+            ))
+            .map_err(|e| err(e.to_string()))?;
+            Some(section)
+        }
+    };
+
+    let intent_out = assemble_proven_intent(
+        &plan.unshielded_offer,
+        &plan.intent_in,
+        dust_actions,
+        plan.intent_ttl,
+    );
+    let tx_out = wrap_proven_standard(&base, plan.seg_id, intent_out);
 
     let imbalances = tx_balance_imbalances(&tx_out)?;
     if !imbalances.is_empty() {
         return Err(err(format!(
-            "balanced transaction is still ledger-imbalanced ({})",
+            "authorized transaction is still ledger-imbalanced ({})",
             imbalances.join("; ")
         )));
     }
@@ -607,20 +670,16 @@ fn balance_unsealed_proven_standard_tx(
     Ok(out)
 }
 
-/// Balance an already-proven (`proof,embedded-fr`) unsealed connector transaction against the
-/// wallet's own unshielded UTXOs, deriving the sender address/vk via the crypto provider and the
-/// indexer URL and sync scope from `chain_id`.
-///
-/// v1 scope: unshielded-only (shielded-input balancing is rejected). When `pay_fees` is set on a
-/// chain that needs DUST, the wallet adds a generationless DUST fee registration funded by its own
-/// unregistered NIGHT (no proving). Returns the balanced-but-unsealed proven transaction bytes;
-/// signing and sealing are separate steps.
-pub fn balance_unsealed_proven_tx(
+/// Plan the balancing of an already-proven (`proof,embedded-fr`) unsealed connector transaction
+/// against the wallet's own UTXOs, deriving the sender address/vk via the crypto provider and the
+/// indexer URL and sync scope from `chain_id`. The returned [`BalancedPlan`] is inert (no bearer
+/// instrument) — it is authorized into signable bytes by [`authorize_proven_tx`] after the policy seam.
+pub fn plan_unsealed_proven_tx(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     tx_bytes: &[u8],
     pay_fees: bool,
-) -> Result<Vec<u8>, std::io::Error> {
+) -> Result<BalancedPlan, std::io::Error> {
     let sender_addr = crypto_provider
         .addresses(&MidnightNetwork::from_chain_id(chain_id))
         .map_err(|e| err(e.to_string()))?
@@ -636,7 +695,7 @@ pub fn balance_unsealed_proven_tx(
         ..Default::default()
     };
 
-    balance_unsealed_proven_standard_tx(
+    plan_unsealed_proven_standard_tx(
         &indexer_url,
         crypto_provider,
         &sender_vk,

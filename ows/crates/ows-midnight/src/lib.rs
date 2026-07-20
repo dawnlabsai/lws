@@ -19,7 +19,7 @@ mod wallet;
 mod wallet_sync;
 
 pub use async_runtime::block_on;
-pub use balance_tx::balance_unsealed_proven_tx;
+pub use balance_tx::{authorize_proven_tx, plan_unsealed_proven_tx, BalancedPlan};
 pub use dapp_connector::{
     classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
 };

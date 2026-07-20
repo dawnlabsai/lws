@@ -567,13 +567,22 @@ pub fn prepare_signable_tx(
             let crypto_provider = MidnightSigner::from_chain_id(chain.chain_id)
                 .crypto_provider(key)
                 .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-            ows_midnight::balance_unsealed_proven_tx(
+
+            // Plan the balancing without proving (sync + select shielded/dust + size the fee): the
+            // returned plan is inert — it carries no bearer proof-preimage.
+            let plan = ows_midnight::plan_unsealed_proven_tx(
                 chain.chain_id,
                 &crypto_provider,
                 &request.tx_bytes,
                 request.pay_fees,
             )
-            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+
+            // ── POLICY SEAM ── TODO(policy): gate on `plan` here (the 2nd policy pass, over the plan's
+            // key-derived effects) before authorizing. `authorize_proven_tx` builds and proves the
+            // wallet's shielded/dust spend witnesses (the bearer instruments) in the signer.
+            ows_midnight::authorize_proven_tx(chain.chain_id, &crypto_provider, plan)
+                .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
         }
         Some(ows_midnight::UnsealedKind::ProofPreimage) => Err(OwsLibError::InvalidInput(
             "Midnight proof-preimage transactions require proving, which is not supported yet".into(),
