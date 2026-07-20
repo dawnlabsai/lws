@@ -1293,6 +1293,60 @@ mod tests {
     }
 
     #[test]
+    fn midnight_dust_address_carries_network_id_in_hrp() {
+        use bech32::primitives::decode::CheckedHrpstring;
+
+        // The dust address must carry the network id in its HRP, exactly like the
+        // unshielded/shielded addresses — a preview/preprod dust address must NOT be
+        // indistinguishable from a mainnet one. The underlying dust key (payload) is
+        // network-independent; ONLY the HRP differs.
+        let blob = signing_key_blob();
+        let mainnet = MidnightSigner::mainnet()
+            .derive_addresses(&blob)
+            .unwrap()
+            .dust;
+        let preview = MidnightSigner::preview()
+            .derive_addresses(&blob)
+            .unwrap()
+            .dust;
+        let preprod = MidnightSigner::preprod()
+            .derive_addresses(&blob)
+            .unwrap()
+            .dust;
+
+        // Each network stamps its own dust HRP.
+        assert!(
+            mainnet.starts_with("mn_dust1"),
+            "mainnet dust HRP: {mainnet}"
+        );
+        assert!(
+            preview.starts_with("mn_dust_preview1"),
+            "preview dust HRP: {preview}"
+        );
+        assert!(
+            preprod.starts_with("mn_dust_preprod1"),
+            "preprod dust HRP: {preprod}"
+        );
+
+        // The three addresses are distinct strings (a missing network id would make
+        // preview/preprod collide with mainnet)...
+        assert_ne!(mainnet, preview);
+        assert_ne!(mainnet, preprod);
+        assert_ne!(preview, preprod);
+
+        // ...yet decode to the SAME payload — proving the only difference is the
+        // network-id HRP, not the dust key.
+        let payload = |addr: &str| {
+            CheckedHrpstring::new::<Bech32m>(addr)
+                .unwrap()
+                .byte_iter()
+                .collect::<Vec<u8>>()
+        };
+        assert_eq!(payload(&mainnet), payload(&preview));
+        assert_eq!(payload(&mainnet), payload(&preprod));
+    }
+
+    #[test]
     fn midnight_preview_unshielded_address_matches_reencode() {
         let key = signing_key_blob();
         let mainnet_addr = MidnightSigner::mainnet().derive_address(&key).unwrap();
