@@ -5,6 +5,7 @@ use ows_core::{
     default_chain_for_type, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
     ALL_CHAIN_TYPES,
 };
+use ows_signer::chains::MidnightSigner;
 use ows_signer::{
     decrypt, encrypt, signer_for_chain, signer_for_chain_type, CryptoEnvelope, Curve, HdDeriver,
     Mnemonic, MnemonicStrength, SecretBytes,
@@ -560,12 +561,19 @@ pub fn prepare_signable_tx(
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
     match ows_midnight::classify_unsealed_payload(&request.tx_bytes) {
         Some(ows_midnight::UnsealedKind::Proven) => {
-            // TODO: balance the proven tx with the wallet's own unshielded UTXOs (unshielded-only,
-            // pay_fees per request), deriving the seeds/indexer URL/sync scope from key + chain.
-            let _ = (key, request.pay_fees);
-            Err(OwsLibError::InvalidInput(
-                "Midnight unsealed-tx balancing is not yet implemented".into(),
-            ))
+            // ows-lib holds the credential; ows-midnight never sees it. Build the Midnight crypto
+            // provider once here (it owns all the wallet's key material), then hand only
+            // `&crypto_provider` across the crate boundary to balance the proven tx.
+            let crypto_provider = MidnightSigner::from_chain_id(chain.chain_id)
+                .crypto_provider(key)
+                .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+            ows_midnight::balance_unsealed_proven_tx(
+                chain.chain_id,
+                &crypto_provider,
+                &request.tx_bytes,
+                request.pay_fees,
+            )
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
         }
         Some(ows_midnight::UnsealedKind::ProofPreimage) => Err(OwsLibError::InvalidInput(
             "Midnight proof-preimage transactions require proving, which is not supported yet".into(),

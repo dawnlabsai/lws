@@ -486,6 +486,18 @@ impl MidnightCryptoProvider {
         })
     }
 
+    /// Verifying key for the unshielded (Night) role — the counterpart to the signing key stored
+    /// in `seeds.unshielded`. The ledger `UtxoSpend.owner` field is this key.
+    pub fn unshielded_verifying_key(
+        &self,
+    ) -> Result<midnight_base_crypto::signatures::VerifyingKey, SignerError> {
+        midnight_base_crypto::signatures::SigningKey::from_bytes(self.seeds.unshielded.expose())
+            .map(|sk| sk.verifying_key())
+            .map_err(|e| {
+                SignerError::InvalidPrivateKey(format!("invalid midnight signing key: {e}"))
+            })
+    }
+
     /// Public key for the dust (registration/fee) role derived from the dust secret key.
     pub fn dust_public_key(&self) -> Result<DustPublicKey, SignerError> {
         Ok(DustPublicKey::from(self.dust_sk.clone()))
