@@ -249,41 +249,40 @@ fn wrap_proven_standard(
     })
 }
 
-/// Resolve sender UTXOs and build the wallet's balancing unshielded offer: inputs covering `need_night`
-/// (the NIGHT the wallet must supply, summed across every intent's guaranteed offer) plus a NIGHT change
-/// output, with `outputs_in` (the chosen intent's own guaranteed outputs) embedded so the offer can
-/// replace that intent's guaranteed offer. Sorted for ledger validity. Also returns the selected UTXOs
-/// so the caller can size the generationless DUST fee allowance from their unregistered NIGHT.
-fn build_balanced_unshielded_offer(
-    indexer_url: &str,
+/// The on-chain identity of an unshielded UTXO (producing intent hash + output index), used to keep the
+/// guaranteed offer and each per-segment fallible offer drawing **disjoint** coins from one pool.
+type UtxoKey = (String, i64);
+
+/// Build one balancing unshielded offer from a pre-fetched UTXO `pool`: select just enough sender NIGHT
+/// — skipping coins already `claimed` by another offer, so no coin is spent twice — to cover
+/// `need_night`, then emit those inputs plus `outputs_in` (the offer's own outputs, re-emitted) and a
+/// NIGHT change output. Records every coin it claims into `claimed` and returns the selected UTXOs so the
+/// caller can size the generationless DUST fee allowance from their unregistered NIGHT. Sorted for ledger
+/// validity; signatures are appended later by the signer, so the offer starts unsigned.
+fn build_night_offer(
+    pool: &[UnshieldedUtxo],
+    claimed: &mut Vec<UtxoKey>,
     sender_vk: &VerifyingKey,
     sender_addr: &str,
     need_night: u128,
-    has_fallible_unshielded: bool,
     outputs_in: Vec<UtxoOutput>,
-    scope: &SyncCacheScope,
 ) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
-    if has_fallible_unshielded {
-        return Err(err("fallible unshielded offers are not supported yet"));
-    }
-
-    let utxos = crate::block_on(
-        crate::wallet_sync::unshielded::get_unshielded_utxos_for_display(
-            indexer_url,
-            sender_addr,
-            scope,
-        ),
-    )?;
+    let available: Vec<UnshieldedUtxo> = pool
+        .iter()
+        .filter(|u| !claimed.contains(&(u.intent_hash.clone(), u.output_index)))
+        .cloned()
+        .collect();
 
     let selected = if need_night == 0 {
         vec![]
     } else {
-        select_utxos_for_night(&utxos, sender_addr, sender_vk, need_night)?
+        select_utxos_for_night(&available, sender_addr, sender_vk, need_night)?
     };
 
     let mut total_in = 0u128;
     let mut inputs: Vec<UtxoSpend> = Vec::new();
     for u in &selected {
+        claimed.push((u.intent_hash.clone(), u.output_index));
         total_in = total_in.saturating_add(u.value);
         let ih = parse_intent_hash_hex(&u.intent_hash)?;
         let out_no = u32::try_from(u.output_index).map_err(|_| err("output index out of range"))?;
@@ -329,13 +328,18 @@ fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
 /// Assemble the proven intent from the balanced offer plus optional dust actions.
 fn assemble_proven_intent(
     offer: &UnshieldedOffer<MnSig, InMemoryDB>,
+    fallible_offer: Option<&UnshieldedOffer<MnSig, InMemoryDB>>,
     intent_in: &Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     dust_actions: Option<DustActions<MnSig, ProofMarker, InMemoryDB>>,
     ttl: Timestamp,
 ) -> Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
     Intent {
         guaranteed_unshielded_offer: Some(Sp::new(offer.clone())),
-        fallible_unshielded_offer: None,
+        // Prefer the wallet's balancing fallible offer (which already re-emits the intent's own fallible
+        // outputs); otherwise carry through whatever the intent held.
+        fallible_unshielded_offer: fallible_offer
+            .map(|o| Sp::new(o.clone()))
+            .or_else(|| intent_in.fallible_unshielded_offer.clone()),
         actions: intent_in.actions.clone(),
         // Prefer the wallet's own dust section; otherwise carry through whatever the intent already
         // held — merging into a dapp intent must never silently drop its dust.
@@ -344,6 +348,21 @@ fn assemble_proven_intent(
             .map(Sp::new),
         ttl,
         binding_commitment: intent_in.binding_commitment,
+    }
+}
+
+/// Replace the fallible unshielded offer of the intent at `seg`, preserving everything else. Unshielded
+/// offers are signed (not Pedersen-committed), so this leaves the tx's `binding_randomness` untouched.
+/// A no-op when no intent sits at `seg`.
+fn attach_fallible_offer(
+    base: &mut StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    seg: u16,
+    offer: &UnshieldedOffer<MnSig, InMemoryDB>,
+) {
+    if let Some(intent_sp) = base.intents.get(&seg) {
+        let mut intent = intent_sp.deref().clone();
+        intent.fallible_unshielded_offer = Some(Sp::new(offer.clone()));
+        base.intents = base.intents.insert(seg, intent);
     }
 }
 
@@ -478,6 +497,9 @@ pub struct BalancedPlan {
     seg_id: u16,
     intent_in: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     unshielded_offer: UnshieldedOffer<MnSig, InMemoryDB>,
+    /// Per-segment fallible unshielded balancing offers (each funds one intent's fallible NIGHT deficit
+    /// in its own segment). Empty when no intent carries a fallible unshielded offer.
+    fallible_offers: Vec<(u16, UnshieldedOffer<MnSig, InMemoryDB>)>,
     intent_ttl: Timestamp,
     shielded: Option<ShieldedFundingPlan>,
     dust: DustFeePlan,
@@ -552,6 +574,14 @@ fn plan_shielded_funding(
     Ok(Some(ShieldedFundingPlan { plans, tree }))
 }
 
+/// One intent's fallible unshielded NIGHT deficit: the segment it sits in, the NIGHT the wallet must
+/// supply there, and that offer's own outputs (re-emitted by the balancing offer that replaces it).
+struct FallibleNightDeficit {
+    seg_id: u16,
+    need_night: u128,
+    outputs: Vec<UtxoOutput>,
+}
+
 /// Build the local [`Prover`](crate::Prover) for a chain's vault-rooted proving-key directory.
 /// Keyless: the prover holds proving/verifier keys, never a wallet secret. A fresh one is built per
 /// authorized section so their proving randomness is independent.
@@ -602,7 +632,7 @@ fn plan_unsealed_proven_standard_tx(
     let adding_dust =
         pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url));
     let mut need_night: u128 = 0;
-    let mut has_fallible_unshielded = false;
+    let mut fallible_deficits: Vec<FallibleNightDeficit> = Vec::new();
     let mut has_preexisting_dust = false;
     let mut chosen: Option<(
         u16,
@@ -623,7 +653,6 @@ fn plan_unsealed_proven_standard_tx(
                 ));
             }
         }
-        has_fallible_unshielded |= intent.fallible_unshielded_offer.is_some();
         if let Some(offer_sp) = intent.guaranteed_unshielded_offer.as_ref() {
             let offer = offer_sp.deref();
             // The wallet supplies (and signs) the balancing inputs; it cannot sign inputs the dapp put
@@ -637,6 +666,38 @@ fn plan_unsealed_proven_standard_tx(
                 if o.type_ == NIGHT {
                     need_night = need_night.saturating_add(o.value);
                 }
+            }
+        }
+        // A fallible unshielded offer is balanced in its own segment (each is checked independently), so
+        // its NIGHT deficit is collected per-segment rather than folded into `need_night`.
+        if let Some(foffer_sp) = intent.fallible_unshielded_offer.as_ref() {
+            let foffer = foffer_sp.deref();
+            if foffer.inputs.iter_deref().next().is_some() {
+                return Err(err(
+                    "transaction carries dapp-provided fallible unshielded inputs, which is unsupported",
+                ));
+            }
+            let mut fneed = 0u128;
+            let outputs: Vec<UtxoOutput> = foffer
+                .outputs
+                .iter_deref()
+                .map(|o| {
+                    if o.type_ == NIGHT {
+                        fneed = fneed.saturating_add(o.value);
+                    }
+                    UtxoOutput {
+                        value: o.value,
+                        owner: o.owner,
+                        type_: o.type_,
+                    }
+                })
+                .collect();
+            if fneed > 0 {
+                fallible_deficits.push(FallibleNightDeficit {
+                    seg_id,
+                    need_night: fneed,
+                    outputs,
+                });
             }
         }
         let is_lower = match &chosen {
@@ -662,23 +723,57 @@ fn plan_unsealed_proven_standard_tx(
         (seg_id, intent_in, outputs_in)
     };
 
-    let (offer, selected) = build_balanced_unshielded_offer(
-        indexer_url,
+    // Fetch the wallet's UTXOs once; the guaranteed offer and each per-segment fallible offer draw
+    // disjoint coins from this pool so no coin is spent twice.
+    let pool = crate::block_on(
+        crate::wallet_sync::unshielded::get_unshielded_utxos_for_display(
+            indexer_url,
+            sender_addr,
+            scope,
+        ),
+    )?;
+    let mut claimed: Vec<UtxoKey> = Vec::new();
+
+    let (offer, selected) = build_night_offer(
+        &pool,
+        &mut claimed,
         sender_vk,
         sender_addr,
         need_night,
-        has_fallible_unshielded,
         outputs_in,
-        scope,
     )?;
 
+    // Fund each fallible unshielded offer in its own segment from the same (now-partly-claimed) pool.
+    let mut fallible_offers: Vec<(u16, UnshieldedOffer<MnSig, InMemoryDB>)> = Vec::new();
+    for fd in &fallible_deficits {
+        let (foffer, _fselected) = build_night_offer(
+            &pool,
+            &mut claimed,
+            sender_vk,
+            sender_addr,
+            fd.need_night,
+            fd.outputs.clone(),
+        )?;
+        fallible_offers.push((fd.seg_id, foffer));
+    }
+
     // Size the DUST fee against a stand-in tx that already carries the shielded section (mock-proved,
-    // fixed-size), so the fee — which covers the whole tx — is right even though the real shielded
-    // proving is deferred past the seam.
-    let stx_for_sizing = match &shielded {
+    // fixed-size) and the fallible balancing offers, so the fee — which covers the whole tx — is right
+    // even though the real shielded proving is deferred past the seam.
+    let mut stx_for_sizing = match &shielded {
         Some(s) => fee_sizing::splice_mock_shielded_for_sizing(&base, crypto_provider, s)?,
         None => base.clone(),
     };
+    for (seg, foffer) in &fallible_offers {
+        attach_fallible_offer(&mut stx_for_sizing, *seg, foffer);
+    }
+    // The chosen intent is rebuilt (guaranteed offer + dust) during sizing and authorization, so its
+    // own fallible offer, if any, must be threaded into that rebuild rather than left where the rebuild
+    // would drop it.
+    let chosen_fallible = fallible_offers
+        .iter()
+        .find(|(s, _)| *s == seg_id)
+        .map(|(_, o)| o.clone());
 
     // On a chain with a live dust ledger (Preview/Preprod, mainnet too), fees are paid with a DUST
     // section: a generationless registration signed by the wallet (no proof) when it has unregistered
@@ -699,6 +794,7 @@ fn plan_unsealed_proven_standard_tx(
             seg_id,
             intent_in: &intent_in,
             offer: &offer,
+            fallible_offer: chosen_fallible.as_ref(),
             selected: &selected,
             dust_pk,
             night_vk,
@@ -718,6 +814,7 @@ fn plan_unsealed_proven_standard_tx(
         seg_id,
         intent_in,
         unshielded_offer: offer,
+        fallible_offers,
         intent_ttl,
         shielded,
         dust,
@@ -778,8 +875,23 @@ pub fn authorize_proven_tx(
         }
     };
 
+    // Fallible unshielded offers: attach each to the intent in its own segment. The chosen intent is
+    // rebuilt just below (guaranteed offer + dust), so its fallible offer is threaded into that rebuild
+    // instead; every other fallible offer is attached here directly.
+    let chosen_fallible = plan
+        .fallible_offers
+        .iter()
+        .find(|(s, _)| *s == plan.seg_id)
+        .map(|(_, o)| o.clone());
+    for (seg, foffer) in &plan.fallible_offers {
+        if *seg != plan.seg_id {
+            attach_fallible_offer(&mut base, *seg, foffer);
+        }
+    }
+
     let intent_out = assemble_proven_intent(
         &plan.unshielded_offer,
+        chosen_fallible.as_ref(),
         &plan.intent_in,
         dust_actions,
         plan.intent_ttl,
@@ -1187,8 +1299,13 @@ mod tests {
         let intent_in = intent_with(None, Some(dust_fee_registration(&vk)));
 
         // No dust of our own → the intent's existing dust survives.
-        let kept =
-            assemble_proven_intent(&empty_offer(), &intent_in, None, Timestamp::from_secs(0));
+        let kept = assemble_proven_intent(
+            &empty_offer(),
+            None,
+            &intent_in,
+            None,
+            Timestamp::from_secs(0),
+        );
         assert!(
             kept.dust_actions.is_some(),
             "merging must not drop the intent's own dust"
@@ -1198,6 +1315,7 @@ mod tests {
         let ours = dust_fee_registration(&vk);
         let replaced = assemble_proven_intent(
             &empty_offer(),
+            None,
             &intent_in,
             Some(ours.clone()),
             Timestamp::from_secs(0),
@@ -1219,6 +1337,7 @@ mod tests {
 
         let new_intent = assemble_proven_intent(
             &empty_offer(),
+            None,
             &empty_intent_skeleton(),
             None,
             Timestamp::from_secs(0),
@@ -1238,5 +1357,186 @@ mod tests {
             stx.binding_randomness, orig_binding,
             "a binding-neutral intent leaves binding_randomness untouched"
         );
+    }
+
+    /// The wallet's verifying-key as the lowercase hex the indexer reports for a UTXO owner.
+    fn sender_vk_hex() -> String {
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let mut raw = Vec::new();
+        vk.serialize(&mut raw).unwrap();
+        hex::encode(raw)
+    }
+
+    /// A sender-owned NIGHT UTXO for the coin pool; `ih_byte` makes each one a distinct coin.
+    fn night_pool_utxo(vk_hex: &str, value: u128, ih_byte: u8, out_idx: i64) -> UnshieldedUtxo {
+        UnshieldedUtxo {
+            token_type: "00".repeat(32),
+            value,
+            intent_hash: hex::encode([ih_byte; 32]),
+            output_index: out_idx,
+            owner: vk_hex.to_string(),
+            ctime_unix_secs: Some(1_000),
+            registered_for_dust_generation: false,
+        }
+    }
+
+    /// Two offers drawn from the same pool never spend the same coin: the second call skips the coin the
+    /// first claimed.
+    #[test]
+    fn build_night_offer_claims_disjoint_coins() {
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let vk_hex = sender_vk_hex();
+        let pool = vec![
+            night_pool_utxo(&vk_hex, 100, 1, 0),
+            night_pool_utxo(&vk_hex, 100, 2, 0),
+        ];
+        let mut claimed: Vec<UtxoKey> = Vec::new();
+
+        let (_o1, s1) = build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![]).unwrap();
+        let (_o2, s2) = build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![]).unwrap();
+
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s2.len(), 1);
+        assert_ne!(
+            s1[0].intent_hash, s2[0].intent_hash,
+            "coins must be disjoint"
+        );
+        assert_eq!(claimed.len(), 2);
+    }
+
+    /// Funding a fallible unshielded offer in its own segment nets that segment to zero — the core Gap B
+    /// invariant, checked via the ledger's own `balance()`.
+    #[test]
+    fn fallible_balancing_nets_the_segment_to_zero() {
+        let sk: [u8; 32] = hex::decode(UNSHIELDED_SEED_HEX)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk = MidnightSigningKey::from_bytes(&sk).unwrap().verifying_key();
+        let vk_hex = sender_vk_hex();
+
+        // A dapp fallible offer at segment 2: a 100-NIGHT output, no inputs (the deficit).
+        let dapp_out = UtxoOutput {
+            value: 100,
+            owner: UserAddress::from(vk.clone()),
+            type_: NIGHT,
+        };
+        let dapp_fallible = UnshieldedOffer {
+            inputs: vec![].into(),
+            outputs: vec![dapp_out.clone()].into(),
+            signatures: vec![].into(),
+        };
+        let mut intent = intent_with(None, None);
+        intent.fallible_unshielded_offer = Some(Sp::new(dapp_fallible));
+        let base = base_with_intents(vec![(2, intent)]);
+
+        // Before balancing, segment 2 is overspent by the 100-NIGHT output.
+        assert!(!tx_balance_imbalances(&Transaction::Standard(base.clone()))
+            .unwrap()
+            .is_empty());
+
+        // Build the wallet's fallible balancing offer (a 100-coin covers the 100 deficit; the dapp's
+        // output is re-emitted), attach it to segment 2, and confirm the segment nets to zero.
+        let pool = vec![night_pool_utxo(&vk_hex, 100, 1, 0)];
+        let mut claimed = Vec::new();
+        let (foffer, _) =
+            build_night_offer(&pool, &mut claimed, &vk, "sender", 100, vec![dapp_out]).unwrap();
+        let mut balanced = base;
+        attach_fallible_offer(&mut balanced, 2, &foffer);
+
+        let imbalances = tx_balance_imbalances(&Transaction::Standard(balanced)).unwrap();
+        assert!(
+            imbalances.is_empty(),
+            "fallible segment must be balanced: {imbalances:?}"
+        );
+    }
+
+    /// A proven tx whose single intent carries both a guaranteed and a fallible wallet input, at a
+    /// non-zero segment — the shape the signer must sign across both offers.
+    fn build_proven_tx_with_fallible(vk: &VerifyingKey) -> Vec<u8> {
+        let night_offer = |value: u128, ih: u8| UnshieldedOffer {
+            inputs: vec![UtxoSpend {
+                value,
+                owner: vk.clone(),
+                type_: NIGHT,
+                intent_hash: IntentHash(HashOutput([ih; 32])),
+                output_no: 0,
+            }]
+            .into(),
+            outputs: vec![UtxoOutput {
+                value,
+                owner: UserAddress::from(vk.clone()),
+                type_: NIGHT,
+            }]
+            .into(),
+            signatures: vec![].into(),
+        };
+        let intent: Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> = Intent {
+            guaranteed_unshielded_offer: Some(Sp::new(night_offer(1_000_000, 7))),
+            fallible_unshielded_offer: Some(Sp::new(night_offer(500_000, 8))),
+            actions: vec![].into(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(0),
+            binding_commitment: Default::default(),
+        };
+        let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(1, intent);
+        let stx = StandardTransaction {
+            network_id: "midnight:test".to_string(),
+            intents,
+            guaranteed_coins: None,
+            fallible_coins: MnHashMap::new(),
+            binding_randomness: Default::default(),
+        };
+        let tx: TxProven = Transaction::Standard(stx);
+        let mut out = Vec::new();
+        tagged_serialize(&tx, &mut out).unwrap();
+        out
+    }
+
+    /// Sign + seal a tx with both a guaranteed and a fallible wallet input: the sealed tx carries a
+    /// signature on *each* offer (the ledger's `Intent::sign` signs both).
+    #[test]
+    fn sign_and_seal_covers_the_fallible_offer_inputs() {
+        let signer = MidnightSigner::mainnet();
+        let key = packed_signing_key(UNSHIELDED_SEED_HEX);
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(UNSHIELDED_SEED_HEX).unwrap())
+            .unwrap()
+            .verifying_key();
+        let tx_bytes = build_proven_tx_with_fallible(&vk);
+
+        // Two signatures: one guaranteed input, one fallible input.
+        let out = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
+        let mut r: &[u8] = &out.signature[..];
+        let _a = MnSig::deserialize(&mut r, 0).unwrap();
+        let _b = MnSig::deserialize(&mut r, 0).unwrap();
+        assert!(r.is_empty(), "expected exactly two signatures");
+
+        // Seal: each offer carries its own input's signature.
+        let sealed_bytes = signer.encode_signed_transaction(&tx_bytes, &out).unwrap();
+        let mut sr: &[u8] = sealed_bytes.as_slice();
+        let sealed: Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB> =
+            tagged_deserialize(&mut sr).unwrap();
+        let Transaction::Standard(sealed_stx) = sealed else {
+            panic!("standard");
+        };
+        let pair = sealed_stx.intents.iter().next().unwrap();
+        let (_seg, intent_sp) = pair.deref();
+        let intent = intent_sp.deref();
+        let g_sigs = intent
+            .guaranteed_unshielded_offer
+            .as_ref()
+            .map(|o| o.deref().signatures.len())
+            .unwrap_or(0);
+        let f_sigs = intent
+            .fallible_unshielded_offer
+            .as_ref()
+            .map(|o| o.deref().signatures.len())
+            .unwrap_or(0);
+        assert_eq!(g_sigs, 1, "guaranteed input must be signed");
+        assert_eq!(f_sigs, 1, "fallible input must be signed");
     }
 }

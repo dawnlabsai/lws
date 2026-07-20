@@ -199,6 +199,9 @@ pub(super) struct DustFeeContext<'a> {
     pub(super) seg_id: u16,
     pub(super) intent_in: &'a Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     pub(super) offer: &'a UnshieldedOffer<MnSig, InMemoryDB>,
+    /// The chosen intent's own fallible balancing offer, if any — spliced into the sizing tx so the
+    /// fee covers the whole (guaranteed + fallible) intent the rebuild produces.
+    pub(super) fallible_offer: Option<&'a UnshieldedOffer<MnSig, InMemoryDB>>,
     pub(super) selected: &'a [UnshieldedUtxo],
     pub(super) dust_pk: DustPublicKey,
     pub(super) night_vk: VerifyingKey,
@@ -273,7 +276,13 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
     let tx_first = wrap_proven_standard(
         ctx.stx,
         ctx.seg_id,
-        assemble_proven_intent(ctx.offer, ctx.intent_in, Some(first), intent_ttl),
+        assemble_proven_intent(
+            ctx.offer,
+            ctx.fallible_offer,
+            ctx.intent_in,
+            Some(first),
+            intent_ttl,
+        ),
     );
     let mut fee_target = tx_first
         .fees(ctx.ledger_params, false)
@@ -293,7 +302,13 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
             let tx_check = wrap_proven_standard(
                 ctx.stx,
                 ctx.seg_id,
-                assemble_proven_intent(ctx.offer, ctx.intent_in, Some(reg.clone()), intent_ttl),
+                assemble_proven_intent(
+                    ctx.offer,
+                    ctx.fallible_offer,
+                    ctx.intent_in,
+                    Some(reg.clone()),
+                    intent_ttl,
+                ),
             );
             if dust_section_covers_fee(&tx_check, ctx.ledger_params)? {
                 return Ok(DustFeePlan::Registration(reg));
@@ -314,6 +329,7 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
             ctx.seg_id,
             assemble_proven_intent(
                 ctx.offer,
+                ctx.fallible_offer,
                 ctx.intent_in,
                 Some(dust_actions.clone()),
                 intent_ttl,
