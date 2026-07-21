@@ -266,6 +266,7 @@ fn build_night_offer(
     sender_addr: &str,
     need_night: u128,
     outputs_in: Vec<UtxoOutput>,
+    reserve: Option<&UnshieldedUtxo>,
 ) -> Result<(UnshieldedOffer<MnSig, InMemoryDB>, Vec<UnshieldedUtxo>), std::io::Error> {
     let available: Vec<UnshieldedUtxo> = pool
         .iter()
@@ -273,11 +274,25 @@ fn build_night_offer(
         .cloned()
         .collect();
 
-    let selected = if need_night == 0 {
+    let mut selected = if need_night == 0 {
         vec![]
     } else {
         select_utxos_for_night(&available, sender_addr, sender_vk, need_night)?
     };
+
+    // Reserve the best-Dust NIGHT coin for the generationless fee registration: spend it here so its
+    // unregistered-NIGHT capacity backs the registration. Balance-neutral — its value returns as
+    // change — and skipped when the payment already selected it or another offer claimed it, so the
+    // wallet reserves exactly one coin instead of over-rotating its NIGHT.
+    if let Some(r) = reserve {
+        let already = claimed.contains(&(r.intent_hash.clone(), r.output_index))
+            || selected
+                .iter()
+                .any(|u| u.intent_hash == r.intent_hash && u.output_index == r.output_index);
+        if !already {
+            selected.push(r.clone());
+        }
+    }
 
     let mut total_in = 0u128;
     let mut inputs: Vec<UtxoSpend> = Vec::new();
@@ -737,6 +752,23 @@ fn plan_unsealed_proven_standard_tx(
     )?;
     let mut claimed: Vec<UtxoKey> = Vec::new();
 
+    // When paying a DUST fee, fetch the chain tip up front so the best-Dust NIGHT coin can be reserved
+    // for the generationless registration before the balancing inputs are selected. Reusing this tip
+    // in the dust-sizing block below keeps it to a single fetch.
+    let dust_tip = if adding_dust {
+        Some(crate::block_on(crate::ledger_params::fetch_indexer_tip(
+            indexer_url,
+        ))?)
+    } else {
+        None
+    };
+    let registration_reserve = match &dust_tip {
+        Some((_, tip_secs)) => {
+            fee_sizing::pick_best_unregistered_for_dust(&pool, Timestamp::from_secs(*tip_secs))?
+        }
+        None => None,
+    };
+
     let (offer, selected) = build_night_offer(
         &pool,
         &mut claimed,
@@ -744,6 +776,7 @@ fn plan_unsealed_proven_standard_tx(
         sender_addr,
         need_night,
         outputs_in,
+        registration_reserve.as_ref(),
     )?;
 
     // Fund each fallible unshielded offer in its own segment from the same (now-partly-claimed) pool.
@@ -756,6 +789,7 @@ fn plan_unsealed_proven_standard_tx(
             sender_addr,
             fd.need_night,
             fd.outputs.clone(),
+            None,
         )?;
         fallible_offers.push((fd.seg_id, foffer));
     }
@@ -785,8 +819,7 @@ fn plan_unsealed_proven_standard_tx(
     // parameters used to size the fee). The fee is sized here without real proving; the proof-bearing
     // spend is realized post-seam by the signer.
     let (dust, intent_ttl) = if adding_dust {
-        let (ledger_params, tip_secs) =
-            crate::block_on(crate::ledger_params::fetch_indexer_tip(indexer_url))?;
+        let (ledger_params, tip_secs) = dust_tip.expect("dust tip fetched above when adding_dust");
         let dust_ctime = Timestamp::from_secs(tip_secs);
         let dust_pk = crypto_provider
             .dust_public_key()
@@ -1399,8 +1432,10 @@ mod tests {
         ];
         let mut claimed: Vec<UtxoKey> = Vec::new();
 
-        let (_o1, s1) = build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![]).unwrap();
-        let (_o2, s2) = build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![]).unwrap();
+        let (_o1, s1) =
+            build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![], None).unwrap();
+        let (_o2, s2) =
+            build_night_offer(&pool, &mut claimed, &vk, "sender", 60, vec![], None).unwrap();
 
         assert_eq!(s1.len(), 1);
         assert_eq!(s2.len(), 1);
@@ -1409,6 +1444,43 @@ mod tests {
             "coins must be disjoint"
         );
         assert_eq!(claimed.len(), 2);
+    }
+
+    /// With no NIGHT payment (need_night = 0) a reserved best-Dust coin is still spent — so its
+    /// unregistered-NIGHT capacity can back the generationless registration — and its value returns
+    /// as change, so the offer nets to zero (one input, matching output value).
+    #[test]
+    fn build_night_offer_reserves_the_dust_coin_balance_neutrally() {
+        let sk: [u8; 32] = hex::decode(UNSHIELDED_SEED_HEX)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk = MidnightSigningKey::from_bytes(&sk).unwrap().verifying_key();
+        let vk_hex = sender_vk_hex();
+
+        let reserve = night_pool_utxo(&vk_hex, 5_000_000, 7, 0);
+        let pool = vec![reserve.clone()];
+        let mut claimed = Vec::new();
+        let (offer, selected) = build_night_offer(
+            &pool,
+            &mut claimed,
+            &vk,
+            "sender",
+            0,
+            vec![],
+            Some(&reserve),
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1, "the reserved coin is spent");
+        assert_eq!(selected[0].intent_hash, reserve.intent_hash);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(offer.inputs.iter_deref().count(), 1);
+        let out_total: u128 = offer.outputs.iter_deref().map(|o| o.value).sum();
+        assert_eq!(
+            out_total, reserve.value,
+            "change returns the full input value"
+        );
     }
 
     /// Funding a fallible unshielded offer in its own segment nets that segment to zero — the core Gap B
@@ -1446,8 +1518,16 @@ mod tests {
         // output is re-emitted), attach it to segment 2, and confirm the segment nets to zero.
         let pool = vec![night_pool_utxo(&vk_hex, 100, 1, 0)];
         let mut claimed = Vec::new();
-        let (foffer, _) =
-            build_night_offer(&pool, &mut claimed, &vk, "sender", 100, vec![dapp_out]).unwrap();
+        let (foffer, _) = build_night_offer(
+            &pool,
+            &mut claimed,
+            &vk,
+            "sender",
+            100,
+            vec![dapp_out],
+            None,
+        )
+        .unwrap();
         let mut balanced = base;
         attach_fallible_offer(&mut balanced, 2, &foffer);
 

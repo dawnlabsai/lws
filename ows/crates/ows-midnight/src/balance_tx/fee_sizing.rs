@@ -2,6 +2,7 @@
 //! iterative sizing of the DUST fee section that balances a proven Standard transaction.
 
 use super::*;
+use midnight_ledger::structure::STARS_PER_NIGHT;
 
 /// Generationless DUST fee capacity from the selected UTXOs' *unregistered* NIGHT — how much fee the
 /// ledger will let those inputs pay without a dust spend. Mirrors the ledger's
@@ -31,6 +32,36 @@ fn dust_allowance_from_night_inputs(
         sum = sum.saturating_add(u128::min(vfull, dt.saturating_mul(rate)));
     }
     Ok(sum)
+}
+
+/// Pick the single unregistered NIGHT UTXO that generates the most DUST — the one to reserve for the
+/// wallet's generationless fee registration. Skips already-registered NIGHT, non-NIGHT tokens, coins
+/// below `STARS_PER_NIGHT` (too small to register), and coins without a block timestamp (their DUST
+/// capacity can't be sized). Returns `None` when nothing qualifies — e.g. all NIGHT is already
+/// registered — so the caller knows not to reserve one. Reserving exactly one, rather than rotating
+/// every NIGHT coin, is what keeps the wallet from over-spending its NIGHT to pay a DUST fee.
+pub(super) fn pick_best_unregistered_for_dust(
+    night_utxos: &[UnshieldedUtxo],
+    dust_ctime: Timestamp,
+) -> Result<Option<UnshieldedUtxo>, std::io::Error> {
+    let night_wire = crate::parse_token_type(Some("night"))?.to_wire_token_type();
+    let mut best: Option<(u128, UnshieldedUtxo)> = None;
+    for u in night_utxos {
+        if !u.token_type.eq_ignore_ascii_case(&night_wire)
+            || u.registered_for_dust_generation
+            || u.value < STARS_PER_NIGHT
+            || u.ctime_unix_secs.is_none()
+        {
+            continue;
+        }
+        // Generationless capacity scales linearly with value and elapsed time, so this ranks coins
+        // by how much DUST they can pay right now.
+        let allow = dust_allowance_from_night_inputs(std::slice::from_ref(u), dust_ctime)?;
+        if best.as_ref().map(|(a, _)| allow > *a).unwrap_or(true) {
+            best = Some((allow, u.clone()));
+        }
+    }
+    Ok(best.map(|(_, u)| u))
 }
 
 /// Cap the generationless allowance to a safe headroom over the fee estimate, erroring if the
@@ -516,6 +547,37 @@ mod tests {
         assert!(
             dust_allowance_from_night_inputs(&[night_utxo(1_000_000, false, None)], now).is_err()
         );
+    }
+
+    #[test]
+    fn pick_best_reserves_the_highest_capacity_unregistered_night() {
+        let now = Timestamp::from_secs(10_000);
+        let ct = Some(1_000u64);
+        // Same age, larger value → strictly higher generationless capacity (it scales with value).
+        let small = night_utxo(STARS_PER_NIGHT, false, ct);
+        let mut big = night_utxo(2 * STARS_PER_NIGHT, false, ct);
+        big.intent_hash = "aa".into();
+        let picked = pick_best_unregistered_for_dust(&[small, big.clone()], now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.value, big.value);
+    }
+
+    #[test]
+    fn pick_best_skips_registered_small_untimestamped_and_non_night() {
+        let now = Timestamp::from_secs(10_000);
+        let ct = Some(1_000u64);
+        let registered = night_utxo(STARS_PER_NIGHT, true, ct);
+        let too_small = night_utxo(STARS_PER_NIGHT - 1, false, ct);
+        let no_ctime = night_utxo(STARS_PER_NIGHT, false, None);
+        let mut non_night = night_utxo(STARS_PER_NIGHT, false, ct);
+        non_night.token_type = "ff".repeat(32);
+        assert!(pick_best_unregistered_for_dust(
+            &[registered, too_small, no_ctime, non_night],
+            now
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
