@@ -335,6 +335,52 @@ fn build_night_offer(
     Ok((offer, selected))
 }
 
+/// Build a fallible unshielded offer that consolidates several of the wallet's own NIGHT coins into a
+/// single change output back to itself. A wallet-built fallible NIGHT offer, spent on its own segment
+/// so the guaranteed section stays free for the DUST-registration cell — the mechanism behind moving
+/// the wallet's NIGHT off the (budget-tight) guaranteed section. Balance-neutral: the inputs equal the
+/// one change output, so the segment it is attached to nets to zero. Each spent coin is recorded in
+/// `claimed` so no other offer double-spends it.
+fn build_fallible_consolidation_offer(
+    coins: &[UnshieldedUtxo],
+    claimed: &mut Vec<UtxoKey>,
+    sender_vk: &VerifyingKey,
+    sender_addr: &str,
+) -> Result<UnshieldedOffer<MnSig, InMemoryDB>, std::io::Error> {
+    if coins.is_empty() {
+        return Err(err("fallible consolidation requires at least one coin"));
+    }
+    let mut total_in = 0u128;
+    let mut inputs: Vec<UtxoSpend> = Vec::new();
+    for u in coins {
+        claimed.push((u.intent_hash.clone(), u.output_index));
+        total_in = total_in.saturating_add(u.value);
+        let ih = parse_intent_hash_hex(&u.intent_hash)?;
+        let out_no = u32::try_from(u.output_index).map_err(|_| err("output index out of range"))?;
+        let vk = resolve_owner_vk(&u.owner, sender_addr, sender_vk)?;
+        inputs.push(UtxoSpend {
+            value: u.value,
+            owner: vk,
+            type_: NIGHT,
+            intent_hash: ih,
+            output_no: out_no,
+        });
+    }
+    let sender_user = UserAddress::from(inputs[0].owner.clone());
+    let mut outputs = vec![UtxoOutput {
+        value: total_in,
+        owner: sender_user,
+        type_: NIGHT,
+    }];
+    inputs.sort();
+    outputs.sort();
+    Ok(UnshieldedOffer {
+        inputs: inputs.into(),
+        outputs: outputs.into(),
+        signatures: vec![].into(),
+    })
+}
+
 /// Give the signed intent a TTL an hour past the chain tip, matching the wallet SDK.
 fn chain_aligned_intent_ttl(dust_ctime: Timestamp) -> Timestamp {
     Timestamp::from_secs(dust_ctime.to_secs().saturating_add(3600))
@@ -627,7 +673,7 @@ fn plan_unsealed_proven_standard_tx(
     let mut r: &[u8] = tx_bytes;
     let tx: TxProven = tagged_deserialize(&mut r)
         .map_err(|e| err(format!("failed to parse proven tx bytes: {e}")))?;
-    let Transaction::Standard(base) = tx else {
+    let Transaction::Standard(mut base) = tx else {
         // The only other Transaction variant is ClaimRewards — a system-issued mint claim that is
         // claimed, not balanced with counter-offers, so it is not a balancing target.
         return Err(err(
@@ -644,8 +690,23 @@ fn plan_unsealed_proven_standard_tx(
     // intent: sum the NIGHT the wallet must supply across all of them, reject shapes it cannot authorize,
     // and fold its inputs + change into a single chosen intent (the lowest segment) while leaving the
     // others intact.
-    let adding_dust =
-        pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url));
+    // Fees are paid from a DUST section, so one is added only on a live-DUST chain. When fees are
+    // requested but liveness can't be confirmed, fail loud rather than silently emit a fee-less tx the
+    // node would reject — the probe is fail-safe and cannot tell a genuinely fee-less network from a
+    // flaky probe, so on a fee-less network the caller opts out with `payFees: false`.
+    let adding_dust = if pay_fees {
+        if crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(indexer_url)) {
+            true
+        } else {
+            return Err(err(
+                "could not confirm the network's DUST ledger is live; refusing to build a fee-less \
+                 transaction the node may reject — retry, or pass payFees:false if this network has no \
+                 DUST fees",
+            ));
+        }
+    } else {
+        false
+    };
     let mut need_night: u128 = 0;
     let mut fallible_deficits: Vec<FallibleNightDeficit> = Vec::new();
     let mut has_preexisting_dust = false;
@@ -792,6 +853,41 @@ fn plan_unsealed_proven_standard_tx(
             None,
         )?;
         fallible_offers.push((fd.seg_id, foffer));
+    }
+
+    // On DUST-fee chains, rotate the wallet's remaining unregistered NIGHT (beyond the coin reserved
+    // for the registration) onto a fresh fallible segment: consolidate it into a single self-output so
+    // it is spent off the budget-tight guaranteed section. Balance-neutral (inputs equal the one
+    // change output), so it cannot unbalance the transaction; gated on a reservation existing and at
+    // least two leftover coins to fold.
+    //
+    // NOTE: structurally sound and balance-neutral (covered by tx_balance tests), but the submit-path
+    // interaction with DUST-generation registration has not been validated against a live prover /
+    // indexer — validate before relying on it for real NIGHT movement.
+    if adding_dust && registration_reserve.is_some() {
+        let night_wire = crate::parse_token_type(Some("night"))?.to_wire_token_type();
+        let leftovers: Vec<UnshieldedUtxo> = pool
+            .iter()
+            .filter(|u| !claimed.contains(&(u.intent_hash.clone(), u.output_index)))
+            .filter(|u| !u.registered_for_dust_generation)
+            .filter(|u| u.token_type.eq_ignore_ascii_case(&night_wire))
+            .cloned()
+            .collect();
+        if leftovers.len() >= 2 {
+            let coffer = build_fallible_consolidation_offer(
+                &leftovers,
+                &mut claimed,
+                sender_vk,
+                sender_addr,
+            )?;
+            // A fresh segment distinct from every existing intent and the chosen balancing segment.
+            let seg = fresh_segment_id(&base).max(seg_id.saturating_add(1));
+            let tip_secs = dust_tip.as_ref().map(|(_, t)| *t).unwrap_or(0);
+            let mut consolidation_intent = empty_intent_skeleton();
+            consolidation_intent.fallible_unshielded_offer = Some(Sp::new(coffer));
+            consolidation_intent.ttl = chain_aligned_intent_ttl(Timestamp::from_secs(tip_secs));
+            base.intents = base.intents.insert(seg, consolidation_intent);
+        }
     }
 
     // Size the DUST fee against a stand-in tx that already carries the shielded section (mock-proved,
@@ -1480,6 +1576,42 @@ mod tests {
         assert_eq!(
             out_total, reserve.value,
             "change returns the full input value"
+        );
+    }
+
+    /// Consolidating several of the wallet's own NIGHT coins into one self-output is balance-neutral:
+    /// attached to a fresh fallible segment, that segment nets to zero per the ledger's own balance().
+    #[test]
+    fn fallible_consolidation_offer_nets_the_segment_to_zero() {
+        let sk: [u8; 32] = hex::decode(UNSHIELDED_SEED_HEX)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk = MidnightSigningKey::from_bytes(&sk).unwrap().verifying_key();
+        let vk_hex = sender_vk_hex();
+
+        let coins = vec![
+            night_pool_utxo(&vk_hex, 100, 1, 0),
+            night_pool_utxo(&vk_hex, 250, 2, 0),
+        ];
+        let mut claimed = Vec::new();
+        let offer =
+            build_fallible_consolidation_offer(&coins, &mut claimed, &vk, "sender").unwrap();
+
+        // Both coins are spent and folded into a single change output of their full value.
+        assert_eq!(offer.inputs.iter_deref().count(), 2);
+        let out_total: u128 = offer.outputs.iter_deref().map(|o| o.value).sum();
+        assert_eq!(out_total, 350);
+        assert_eq!(claimed.len(), 2);
+
+        // On a fresh fallible segment, the ledger sees the segment as balanced.
+        let mut intent = empty_intent_skeleton();
+        intent.fallible_unshielded_offer = Some(Sp::new(offer));
+        let base = base_with_intents(vec![(3, intent)]);
+        let imbalances = tx_balance_imbalances(&Transaction::Standard(base)).unwrap();
+        assert!(
+            imbalances.is_empty(),
+            "consolidation must net to zero: {imbalances:?}"
         );
     }
 
