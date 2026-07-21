@@ -6,6 +6,7 @@
 //! [`ConnectorPlan`]) → policy seam → [`ConnectorPlan::authorize`] (build + prove + sign + seal). The
 //! plan carries no bearer instrument, so the seam can gate on it before any key-bearing work happens.
 
+use ows_core::policy::TransactionEffect;
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
@@ -124,9 +125,33 @@ impl ConnectorPlan {
             ),
         }
     }
-    // ── POLICY SEAM ── TODO(policy): `ConnectorPlan::effects()` belongs here — the wallet-relative
-    // movement each method contributes (request-derived for the `make*` methods, plan-derived for the
-    // `balance*` methods), for the seam to gate on before `authorize`. Not wired yet.
+    /// The wallet-relative net movement authorizing this plan will have — the view the policy seam gates
+    /// on, computed before any bearer instrument is built. Plan-derived for the `balance*` methods (from
+    /// the inert [`BalancedPlan`] the wallet already selected) and request-derived for the `make*`
+    /// methods (from the declared inputs/outputs, before any coin is chosen). One [`TransactionEffect`]
+    /// per value domain that nets non-zero.
+    pub fn effects(
+        &self,
+        chain_id: &str,
+        crypto_provider: &MidnightCryptoProvider,
+    ) -> Result<Vec<TransactionEffect>, std::io::Error> {
+        match self {
+            ConnectorPlan::BalanceUnsealed(plan) | ConnectorPlan::BalanceSealed(plan) => {
+                plan.effects(chain_id, crypto_provider)
+            }
+            ConnectorPlan::MakeTransfer(req) => {
+                make_transfer::effects(chain_id, crypto_provider, req)
+            }
+            ConnectorPlan::MakeIntent(req) => {
+                make_intent::request_effects(chain_id, crypto_provider, req)
+            }
+            // The wallet's movement in a merge is its own half — the `complement` it contributes and
+            // receives — not the maker's sealed bytes; request-derived exactly like a makeIntent.
+            ConnectorPlan::BalanceSealedMerge { complement, .. } => {
+                make_intent::request_effects(chain_id, crypto_provider, complement)
+            }
+        }
+    }
 }
 
 /// Parse a stringified connector request and plan it (inert) into a [`ConnectorPlan`], ready for the

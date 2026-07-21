@@ -291,6 +291,19 @@ pub(super) enum DustFeePlan {
     },
 }
 
+impl DustFeePlan {
+    /// The DUST this fee section actually burns from the wallet's holdings — the movement a policy
+    /// caps. A proof-bearing spend burns its sized `fee_dust` (the sum of its spends' public `v_fee`);
+    /// a generationless registration spends **no** held dust (it commits fresh NIGHT to dust
+    /// generation, so the wallet's dust balance is unchanged), and `None` burns nothing.
+    pub(super) fn dust_outflow(&self) -> u128 {
+        match self {
+            DustFeePlan::None | DustFeePlan::Registration(_) => 0,
+            DustFeePlan::Spend { plan, .. } => plan.fee_dust,
+        }
+    }
+}
+
 /// Whether `tx`'s DUST section covers the fee the node will charge. Mirrors the node's fee gate
 /// (`well_formed` computes `fees(params, true)` then rejects any segment/token whose `balance` of that
 /// fee goes negative): unlike `tx_balance_imbalances` (which uses `balance(None)` and so ignores the

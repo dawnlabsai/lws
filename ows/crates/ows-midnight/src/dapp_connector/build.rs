@@ -3,6 +3,7 @@
 //! against the network's Bech32m HRPs, and proving a constructed preimage into the unsealed bytes the
 //! balancing tail consumes.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use bech32::Hrp;
@@ -17,7 +18,9 @@ use midnight_ledger::structure::{
 };
 use midnight_serialize::{tagged_serialize, Deserializable};
 use midnight_storage::db::InMemoryDB;
+use ows_core::policy::TransactionEffect;
 use ows_core::sync_cache::SyncCacheScope;
+use ows_signer::chains::midnight::MidnightAddresses;
 use ows_signer::chains::MidnightSigner;
 use serde::{Deserialize, Deserializer};
 use transient_crypto::commitment::PedersenRandomness;
@@ -64,6 +67,54 @@ pub struct DesiredOutput {
     #[serde(deserialize_with = "deserialize_u128")]
     pub value: u128,
     pub recipient: String,
+}
+
+/// One wallet-relative movement a wallet-constructed request declares: a signed `value` (negative =
+/// outflow the wallet funds, positive = inflow the wallet receives) of `token_type` in `kind`'s domain.
+pub(super) struct Movement<'a> {
+    pub kind: TransferKind,
+    pub token_type: &'a str,
+    pub value: i128,
+}
+
+/// Fold the declared movements of a `make*` request into one [`TransactionEffect`] per domain
+/// (unshielded / shielded), keyed by the wallet's address for that domain; a domain/token that nets to
+/// zero is omitted. This is the request-derived counterpart to the plan-derived effects the `balance*`
+/// methods compute — the `make*` methods know their movement from the request alone, before any coin is
+/// selected.
+pub(super) fn effects_from_movements<'a>(
+    addresses: &MidnightAddresses,
+    movements: impl IntoIterator<Item = Movement<'a>>,
+) -> Result<Vec<TransactionEffect>, std::io::Error> {
+    let mut unshielded: BTreeMap<String, i128> = BTreeMap::new();
+    let mut shielded: BTreeMap<String, i128> = BTreeMap::new();
+    for m in movements {
+        let wire = parse_token_type(Some(m.token_type))?.to_wire_token_type();
+        let bucket = match m.kind {
+            TransferKind::Unshielded => &mut unshielded,
+            TransferKind::Shielded => &mut shielded,
+        };
+        *bucket.entry(wire).or_default() += m.value;
+    }
+
+    let mut effects = Vec::new();
+    for (address, bucket) in [
+        (&addresses.unshielded, unshielded),
+        (&addresses.shielded, shielded),
+    ] {
+        let diff: Vec<(String, i64)> = bucket
+            .into_iter()
+            .filter(|(_, v)| *v != 0)
+            .map(|(token, v)| (token, crate::balance_tx::clamp_i128_to_i64(v)))
+            .collect();
+        if !diff.is_empty() {
+            effects.push(TransactionEffect {
+                address: address.clone(),
+                diff,
+            });
+        }
+    }
+    Ok(effects)
 }
 
 /// Accept a u128 amount as either a JSON number or a decimal string. Routes through `serde_json::Value`

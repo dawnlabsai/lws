@@ -10,6 +10,7 @@ use midnight_coin_structure::coin::Info as CoinInfo;
 use midnight_ledger::structure::{
     Intent, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput,
 };
+use midnight_serialize::tagged_serialize;
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
 use midnight_storage::storage::HashMap as MnHashMap;
@@ -26,6 +27,7 @@ use super::build::{
     prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
     PreimageTx, TransferKind,
 };
+use ows_core::policy::TransactionEffect;
 
 /// The intent that carries the wallet's unshielded outputs keys at a fallible segment (>= 1): the
 /// ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
@@ -93,6 +95,29 @@ pub(super) fn authorize(
     let plan =
         crate::plan_unsealed_proven_tx(chain_id, crypto_provider, &proven_bytes, req.pay_fees)?;
     crate::authorize_proven_tx(chain_id, crypto_provider, plan)
+}
+
+/// The wallet-relative effects a `makeTransfer` will have, sized from the inert balance plan so the
+/// **DUST fee** the transfer burns is included — a `sum(|diff|)` cap at the policy seam must see it, and
+/// request-derived effects (outputs only) would under-state it. The outputs are **mock-proven** (proofs
+/// are fixed-size, so the sized fee matches the real one exactly) and the balancing is planned against
+/// the wallet's synced UTXOs; **no real proving happens here**, so a transfer denied at the seam never
+/// reaches [`authorize`]'s real proofs. `BalancedPlan::effects` then nets the wallet's inputs against its
+/// own change and outputs — the value to each recipient plus the dust fee.
+pub(super) fn effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeTransferRequest,
+) -> Result<Vec<TransactionEffect>, std::io::Error> {
+    let preimage = build_make_transfer_preimage(chain_id, req)?;
+    let mock_proven = preimage
+        .mock_prove()
+        .map_err(|e| err(format!("mock-prove makeTransfer for effect sizing: {e:?}")))?;
+    let mut bytes = Vec::new();
+    tagged_serialize(&mock_proven, &mut bytes)
+        .map_err(|e| err(format!("serialize mock-proven makeTransfer: {e}")))?;
+    let plan = crate::plan_unsealed_proven_tx(chain_id, crypto_provider, &bytes, req.pay_fees)?;
+    plan.effects(chain_id, crypto_provider)
 }
 
 /// Construct the `proof-preimage` transaction for a `makeTransfer`: recipient outputs and no inputs.
