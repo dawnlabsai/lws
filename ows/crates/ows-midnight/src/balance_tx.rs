@@ -485,6 +485,41 @@ fn guaranteed_outputs_of(
         .unwrap_or_default()
 }
 
+/// Pick the intent the wallet folds its balancing offer + dust fee into, or synthesize a fresh empty
+/// skeleton when there is none to reuse.
+///
+/// Reuse the lowest-segment existing intent (re-emitting its own guaranteed outputs) unless a fresh
+/// skeleton is required — which happens in two cases:
+/// - the tx carries **no reusable intent** at all: a pure-shielded MIP-0005/0006 zswap offer lives
+///   entirely in `guaranteed_coins`/`fallible_coins` and has an **empty** `intents` map, so the taker's
+///   dust fee has nowhere to go without a new intent; or
+/// - the tx **already carries a dust section**: an intent holds only one dust section and the wallet's
+///   dust needs its own timestamp, so it rides a brand-new intent (spec §L961-967).
+///
+/// The fresh skeleton sits at a new segment with no outputs to re-emit — every existing intent keeps its
+/// own guaranteed offer, so their outputs stay put — and is binding-neutral.
+fn balancing_intent(
+    base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    chosen: Option<(
+        u16,
+        Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    )>,
+    adding_dust: bool,
+    has_preexisting_dust: bool,
+) -> (
+    u16,
+    Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    Vec<UtxoOutput>,
+) {
+    match chosen {
+        Some((seg_id, intent_in)) if !(adding_dust && has_preexisting_dust) => {
+            let outputs_in = guaranteed_outputs_of(&intent_in);
+            (seg_id, intent_in, outputs_in)
+        }
+        _ => (fresh_segment_id(base), empty_intent_skeleton(), Vec::new()),
+    }
+}
+
 /// The wallet's inert shielded funding plan for one intent segment: the coins to spend — chosen whole
 /// and largest-first to cover each per-token deficit — and the self-change to mint per token. Built
 /// from the synced coin set alone (viewing + nullifier detection), it carries **no** spend witness, so
@@ -817,19 +852,11 @@ fn plan_unsealed_proven_standard_tx(
         }
     }
 
-    // Where the wallet folds its balancing inputs + dust. Normally it merges into an existing intent,
-    // re-emitting that intent's own guaranteed outputs. But when the tx already carries a dust section,
-    // the wallet's dust needs its own timestamp — an intent holds only one dust section — so it rides a
-    // brand-new intent at a fresh segment with an empty skeleton (no outputs to re-emit: every existing
-    // intent keeps its guaranteed offer, so its outputs stay put) per spec §L961-967.
-    let (seg_id, intent_in, outputs_in) = if adding_dust && has_preexisting_dust {
-        (fresh_segment_id(&base), empty_intent_skeleton(), Vec::new())
-    } else {
-        let (seg_id, intent_in) =
-            chosen.ok_or_else(|| err("expected at least one intent segment"))?;
-        let outputs_in = guaranteed_outputs_of(&intent_in);
-        (seg_id, intent_in, outputs_in)
-    };
+    // Where the wallet folds its balancing inputs + dust: an existing intent when there is one to reuse,
+    // else a fresh skeleton — a pure-shielded zswap offer (MIP-0005/0006) has empty intents, and a
+    // preexisting dust section blocks reuse (see `balancing_intent`).
+    let (seg_id, intent_in, outputs_in) =
+        balancing_intent(&base, chosen, adding_dust, has_preexisting_dust);
 
     // Fetch the wallet's UTXOs once; the guaranteed offer and each per-segment fallible offer draw
     // disjoint coins from this pool so no coin is spent twice.
@@ -1448,6 +1475,58 @@ mod tests {
         assert!(s.fallible_unshielded_offer.is_none());
         assert!(s.dust_actions.is_none());
         assert_eq!(s.actions.len(), 0);
+    }
+
+    /// A pure-shielded tx (a MIP-0005/0006 `zswapoffer` wraps into a Standard tx with an **empty**
+    /// `intents` map) has no intent to fold the taker's dust fee into. The balancer must synthesize a
+    /// fresh binding-neutral skeleton at segment 1 rather than error "expected at least one intent
+    /// segment" — this is the fix for balancing a bare zswap offer.
+    #[test]
+    fn empty_intents_get_a_fresh_balancing_skeleton() {
+        let base = base_with_intents(vec![]);
+        let (seg_id, intent_in, outputs_in) = balancing_intent(&base, None, true, false);
+        assert_eq!(
+            seg_id, 1,
+            "first fresh segment, never the guaranteed section 0"
+        );
+        assert!(intent_in.guaranteed_unshielded_offer.is_none());
+        assert!(intent_in.dust_actions.is_none());
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(0),
+            "a synthesized skeleton is binding-neutral"
+        );
+        assert!(outputs_in.is_empty());
+    }
+
+    /// With a reusable intent and no preexisting dust, the wallet folds into that intent (keeping its
+    /// segment and re-emitting its outputs) instead of synthesizing a new one.
+    #[test]
+    fn balancing_intent_reuses_an_existing_intent() {
+        let base = base_with_intents(vec![(3, intent_with(None, None))]);
+        let (seg_id, intent_in, _outputs) =
+            balancing_intent(&base, Some((3, intent_with(None, None))), true, false);
+        assert_eq!(seg_id, 3, "reused, not a fresh segment");
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(7),
+            "the existing intent, not a fresh skeleton"
+        );
+    }
+
+    /// A preexisting dust section forces a fresh skeleton even when a reusable intent exists, because an
+    /// intent holds only one dust section and the wallet's dust needs its own timestamp.
+    #[test]
+    fn preexisting_dust_forces_a_fresh_skeleton() {
+        let base = base_with_intents(vec![(3, intent_with(None, None))]);
+        let (seg_id, intent_in, _outputs) =
+            balancing_intent(&base, Some((3, intent_with(None, None))), true, true);
+        assert_eq!(seg_id, 4, "fresh, one past the existing max segment (3)");
+        assert_eq!(
+            intent_in.binding_commitment,
+            PedersenRandomness::from(0),
+            "a fresh skeleton, not the existing intent"
+        );
     }
 
     /// Merging into a dapp intent that already carries its own dust must not drop it when the wallet

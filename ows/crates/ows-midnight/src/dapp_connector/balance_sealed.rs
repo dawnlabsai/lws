@@ -5,20 +5,22 @@
 //! `balanceUnsealed` does. So the proven-maker path reuses the same `plan_unsealed_proven_tx` →
 //! `authorize_proven_tx` tail.
 //!
-//! Scope: a hex-encoded proven maker offer. A fully **sealed** maker (whose Zswap offers must be merged
-//! rather than balanced), a bare `zswapoffer` bech32, and MIP-0006 offer JSON are recognized only to be
-//! rejected with a precise error for now.
+//! Scope: a hex-encoded proven maker offer, or a bare MIP-0005 `zswapoffer` bech32 (wrapped into a
+//! proven zswap-only tx before balancing). A fully **sealed** maker (whose Zswap offers must be
+//! merged rather than balanced) and MIP-0006 offer JSON are recognized only to be rejected with a
+//! precise error for now.
 
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
+use super::mip6;
 use super::{classify_unsealed_payload, ConnectorPlan, UnsealedKind};
 
-/// A parsed `balanceSealedTransaction` request: the maker offer to complete (decoded bytes) and whether
-/// the wallet should pay DUST fees.
+/// A parsed `balanceSealedTransaction` request: the maker offer to complete (the raw input string —
+/// hex or a `zswapoffer` bech32) and whether the wallet should pay DUST fees.
 #[derive(Debug, Clone)]
 pub struct BalanceSealedRequest {
-    pub maker_tx: Vec<u8>,
+    pub maker_input: String,
     pub pay_fees: bool,
 }
 
@@ -43,37 +45,49 @@ struct BalanceSealedJson {
     options: Option<OptionsJson>,
 }
 
-/// Parse a stringified DApp Connector `balanceSealedTransaction` request into the maker offer bytes and
-/// fee preference. `payFees` defaults to true.
+/// Parse a stringified DApp Connector `balanceSealedTransaction` request into the raw maker offer
+/// string and fee preference. `payFees` defaults to true. The maker string is decoded later (it may
+/// be hex or a `zswapoffer` bech32), once the chain id is known.
 pub fn parse_balance_sealed_json(json: &str) -> Result<BalanceSealedRequest, std::io::Error> {
     let req: BalanceSealedJson = serde_json::from_str(json).map_err(|e| {
         std::io::Error::other(format!(
             "invalid balanceSealedTransaction request JSON: {e}"
         ))
     })?;
-    let clean = req.maker_tx.strip_prefix("0x").unwrap_or(&req.maker_tx);
-    let maker_tx = hex::decode(clean)
-        .map_err(|e| std::io::Error::other(format!("invalid maker transaction hex: {e}")))?;
     Ok(BalanceSealedRequest {
-        maker_tx,
+        maker_input: req.maker_tx,
         pay_fees: req.options.map(|o| o.pay_fees).unwrap_or(true),
     })
 }
 
-/// Plan a `balanceSealedTransaction`: decode the maker offer, and — for a proven offer — plan the
-/// taker's balancing inertly via the shared tail. Sealed / preimage / non-tx payloads are rejected.
+/// Decode the maker input into transaction bytes: a `zswapoffer…` bech32 is wrapped into a proven
+/// zswap-only tx (MIP-0005); anything else is treated as hex-encoded transaction bytes.
+fn decode_maker_input(chain_id: &str, input: &str) -> Result<Vec<u8>, std::io::Error> {
+    let trimmed = input.trim();
+    if trimmed.starts_with(mip6::ZSWAP_OFFER_BECH32_HRP) {
+        return mip6::wrap_zswap_offer_as_proven_tx(chain_id, trimmed);
+    }
+    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    hex::decode(clean)
+        .map_err(|e| std::io::Error::other(format!("invalid maker transaction hex: {e}")))
+}
+
+/// Plan a `balanceSealedTransaction`: decode the maker offer (hex tx or `zswapoffer` bech32) and —
+/// for a proven offer — plan the taker's balancing inertly via the shared tail. Sealed / preimage /
+/// non-tx payloads are rejected.
 pub(super) fn plan(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     json: &str,
 ) -> Result<ConnectorPlan, std::io::Error> {
     let request = parse_balance_sealed_json(json)?;
-    match classify_unsealed_payload(&request.maker_tx) {
+    let maker_tx = decode_maker_input(chain_id, &request.maker_input)?;
+    match classify_unsealed_payload(&maker_tx) {
         Some(UnsealedKind::Proven) => {
             let plan = crate::plan_unsealed_proven_tx(
                 chain_id,
                 crypto_provider,
-                &request.maker_tx,
+                &maker_tx,
                 request.pay_fees,
             )?;
             Ok(ConnectorPlan::BalanceSealed(Box::new(plan)))
@@ -84,8 +98,8 @@ pub(super) fn plan(
         )),
         None => Err(std::io::Error::other(
             "balanceSealedTransaction currently accepts only a proven (proof,embedded-fr) maker \
-             offer; a fully sealed maker offer (Zswap-offer merge), a zswapoffer bech32, and MIP-0006 \
-             offer JSON are not yet supported",
+             offer or a zswapoffer bech32; a fully sealed maker offer (Zswap-offer merge) and \
+             MIP-0006 offer JSON are not yet supported",
         )),
     }
 }
@@ -100,19 +114,36 @@ mod tests {
             r#"{"method":"balanceSealedTransaction","makerTx":"0x0102ab"}"#,
         )
         .unwrap();
-        assert_eq!(req.maker_tx, vec![0x01, 0x02, 0xab]);
+        assert_eq!(req.maker_input, "0x0102ab");
         assert!(req.pay_fees);
+        // The raw input decodes to the hex bytes (0x prefix stripped).
+        assert_eq!(
+            decode_maker_input("midnight:preview", &req.maker_input).unwrap(),
+            vec![0x01, 0x02, 0xab]
+        );
     }
 
     #[test]
     fn accepts_tx_alias_and_pay_fees_false() {
         let req = parse_balance_sealed_json(r#"{"tx":"00","options":{"payFees":false}}"#).unwrap();
-        assert_eq!(req.maker_tx, vec![0x00]);
+        assert_eq!(req.maker_input, "00");
         assert!(!req.pay_fees);
     }
 
     #[test]
     fn rejects_non_hex_maker_tx() {
-        assert!(parse_balance_sealed_json(r#"{"makerTx":"zz"}"#).is_err());
+        // Parsing keeps the raw string; the hex error surfaces at decode time.
+        let req = parse_balance_sealed_json(r#"{"makerTx":"zz"}"#).unwrap();
+        assert!(decode_maker_input("midnight:preview", &req.maker_input).is_err());
+    }
+
+    #[test]
+    fn zswapoffer_input_dispatches_to_the_offer_decoder() {
+        // A zswapoffer-prefixed input routes through the bech32 wrapper (a malformed one errors
+        // there, not as invalid hex — proving the dispatch).
+        let err = decode_maker_input("midnight:preview", "zswapoffer1notvalid")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zswap offer"), "unexpected error: {err}");
     }
 }
