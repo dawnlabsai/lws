@@ -27,11 +27,14 @@ use super::build::{
     PreimageTx, TransferKind,
 };
 
-/// The intent that carries the wallet's unshielded outputs must key at a fallible segment (>= 1): the
+/// The intent that carries the wallet's unshielded outputs keys at a fallible segment (>= 1): the
 /// ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
-/// (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`). The outputs still ride
-/// the guaranteed section — the intent's guaranteed offer and the transaction's guaranteed Zswap coins —
-/// so the transfer is unconditional; balancing draws the wallet's own inputs into this same intent.
+/// (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`). Unshielded NIGHT
+/// movement rides this segment's *fallible* offer, not the guaranteed one: only the guaranteed
+/// unshielded offer's cost counts toward the guaranteed section's tight `time_to_dismiss` budget, so
+/// funding a multi-UTXO NIGHT move in the guaranteed section overruns it (the node dismisses the tx).
+/// Shielded Zswap outputs still ride the guaranteed section. Balancing draws the wallet's own inputs
+/// into this same fallible offer.
 const MAKE_TRANSFER_INTENT_SEGMENT: u16 = 1;
 /// Segment 0 is the transaction's guaranteed section; a transfer's shielded outputs ride it so they
 /// execute unconditionally.
@@ -93,8 +96,9 @@ pub(super) fn authorize(
 }
 
 /// Construct the `proof-preimage` transaction for a `makeTransfer`: recipient outputs and no inputs.
-/// Unshielded outputs ride the guaranteed unshielded offer of a segment-0 intent; shielded outputs ride
-/// the guaranteed Zswap offer. Balancing (the wallet's own inputs + change + fee) comes later.
+/// Unshielded outputs ride the fallible unshielded offer of the maker intent (see
+/// [`MAKE_TRANSFER_INTENT_SEGMENT`]); shielded outputs ride the guaranteed Zswap offer. Balancing (the
+/// wallet's own inputs + change + fee) comes later.
 fn build_make_transfer_preimage(
     chain_id: &str,
     req: &MakeTransferRequest,
@@ -115,8 +119,8 @@ fn build_make_transfer_preimage(
 
     let mut rng = OsRng;
     let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> = Intent {
-        guaranteed_unshielded_offer: unshielded_offer.map(Sp::new),
-        fallible_unshielded_offer: None,
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: unshielded_offer.map(Sp::new),
         actions: vec![].into(),
         dust_actions: None,
         // The balancer re-aligns the TTL on the intent it owns (this one); a far-future stand-in avoids
@@ -269,7 +273,8 @@ mod tests {
 
     /// The ledger rejects an intent declared at segment 0 (the reserved guaranteed section) with
     /// `IntentAtGuaranteedSegmentId`, surfaced on-chain as `Custom error: 167`. Guard that makeTransfer
-    /// keys its intent at a fallible segment; the outputs still ride the guaranteed section.
+    /// keys its intent at a fallible segment (the unshielded NIGHT output rides that segment's fallible
+    /// offer — see [`make_transfer_night_output_rides_the_fallible_offer`]).
     ///
     /// A full ledger `well_formed` check can't stand in here: an outputs-only transfer is imbalanced
     /// until the wallet funds it, and `well_formed` runs `pedersen_check` (the balance check) *before*
@@ -297,6 +302,39 @@ mod tests {
         assert!(
             stx.intents.get(&MAKE_TRANSFER_INTENT_SEGMENT).is_some(),
             "the maker intent rides the fallible segment"
+        );
+    }
+
+    /// Unshielded NIGHT movement rides the *fallible* offer, never the guaranteed one: only the
+    /// guaranteed offer loads the guaranteed section's `time_to_dismiss` budget, so a multi-UTXO NIGHT
+    /// move funded there would overrun it and the node would dismiss the tx. The recipient output
+    /// therefore sits on the maker intent's fallible offer, where the balancer funds it in-segment.
+    #[test]
+    fn make_transfer_night_output_rides_the_fallible_offer() {
+        let req = MakeTransferRequest {
+            desired_outputs: vec![DesiredOutput {
+                kind: TransferKind::Unshielded,
+                token_type: "night".into(),
+                value: 1_000,
+                recipient: preview_unshielded_address(),
+            }],
+            pay_fees: true,
+        };
+        let tx = build_make_transfer_preimage("midnight:preview", &req).expect("build preimage");
+        let Transaction::Standard(stx) = &tx else {
+            panic!("expected a Standard transaction");
+        };
+        let intent = stx
+            .intents
+            .get(&MAKE_TRANSFER_INTENT_SEGMENT)
+            .expect("the maker intent rides the fallible segment");
+        assert!(
+            intent.guaranteed_unshielded_offer.is_none(),
+            "unshielded NIGHT movement must not ride the guaranteed offer (time_to_dismiss budget)"
+        );
+        assert!(
+            intent.fallible_unshielded_offer.is_some(),
+            "the NIGHT output rides the maker intent's fallible offer"
         );
     }
 
