@@ -77,8 +77,7 @@ $OWS sign tx --chain $CHAIN --wallet $WALLET --json --tx '{
 ```
 
 Expect: a proven, imbalanced maker offer. `sign tx` seals it as a **fully-sealed**
-(`proof,pedersen-schnorr`) offer — which is exactly what step 3a rejects. Shielded inputs are rejected by
-design for now (precise error).
+(`proof,pedersen-schnorr`) offer — which a taker completes by MERGING in its complement (step 3a).
 
 ## 3. balanceSealedTransaction — taker completes the maker offer
 
@@ -86,14 +85,15 @@ Feed a maker offer as `makerTx`; the taker's wallet funds the imbalance, balance
 **The accepted maker format matters:**
 
 ```sh
-# 3a. A FULLY-SEALED maker offer (proof,pedersen-schnorr — e.g. the step-2 output) is REJECTED:
+# 3a. A FULLY-SEALED maker offer (proof,pedersen-schnorr — e.g. the step-2 output) is completed by MERGING:
 $OWS sign tx --chain $CHAIN --wallet <taker-wallet> --json --tx '{
   "method": "balanceSealedTransaction",
   "makerTx": "<fully-sealed-maker-hex>",
   "options": { "payFees": true }
 }'
-#   → error: … received a fully sealed maker offer (proof,pedersen-schnorr); … not yet implemented.
-#            Provide … a proven (proof,embedded-fr) transaction … instead   (the deferred sealed-maker merge)
+#   → { … "transaction": "0x…merged+sealed hex" }
+#     the taker builds the per-token complement of the maker's imbalance, funds the merged tx's dust fee,
+#     seals its half, and Transaction::merge's the two into a balanced, submittable whole.
 
 # 3b. A PROVEN (proof,embedded-fr) maker offer is the happy path — balanced + sealed:
 $OWS sign tx --chain $CHAIN --wallet <taker-wallet> --json --tx '{
@@ -106,9 +106,19 @@ $OWS sign tx --chain $CHAIN --wallet <taker-wallet> --json --tx '{
 
 > **Note (changed since `--no-submit`):** the old `sign send-tx --no-submit` produced a
 > `proof,embedded-fr` offer that this method could complete directly. `sign tx`'s makeIntent output is
-> now *fully sealed*, so the step-2→step-3 chain lands on 3a (the deferred rejection). To exercise 3b you
-> need a `proof,embedded-fr` maker (e.g. `e2e/shielded-movement-cap/tx-proven.hex`). The taker needs
-> **dust** for fees; a freshly-funded wallet with only NIGHT and no dust cannot be the taker.
+> now *fully sealed*, so the step-2→step-3 chain lands on 3a — the taker completes it by MERGING (above).
+> Step 3b (a `proof,embedded-fr` maker, e.g. `e2e/shielded-movement-cap/tx-proven.hex`) still balances in
+> place. Either way the taker needs **dust** for fees; a freshly-funded wallet with only NIGHT and no dust
+> cannot be the taker.
+
+> **Supported maker shapes (in-place balancing).** The in-place proven path — 3b and
+> `balanceUnsealedTransaction` (§4) — balances a maker that carries **no unshielded inputs of its own**.
+> The taker supplies *and signs* the balancing inputs and cannot sign an input belonging to the maker, so
+> a proven tx that already holds foreign unshielded inputs is rejected (`transaction carries dapp-provided
+> unshielded inputs, which is unsupported`). A maker that funds its own unshielded side — e.g. a
+> `makeIntent` giving NIGHT — must therefore be **sealed** and completed via the merge path (3a), where its
+> inputs carry its own signature and the taker only adds its complement. In-place balancing is for
+> deficit-style and shielded-only (zswap) makers.
 
 ## 4. balanceUnsealedTransaction — regression (unchanged)
 
@@ -133,8 +143,14 @@ $OWS sign tx --chain $CHAIN --wallet $WALLET --json --tx '{
 
 ## Coverage note
 
-Deferred (reject with precise errors, pending swap-spec pinning + live validation):
-makeIntent **shielded inputs**; balanceSealed **sealed-maker merge** (3a), `zswapoffer` bech32,
-and MIP-0006 JSON.
+Now supported (previously deferred): `makeIntent` **shielded inputs** — whole-coin spend with per-token
+change to the maker, live-validated via the makeIntent → `balanceSealed` merge round-trip — and
+`balanceSealed` **MIP-0005** (`zswapoffer` bech32) / **MIP-0006** (offer-file JSON) inputs, which decode
+and balance. A pure-shielded offer wraps to a tx with no intent, so the balancer synthesizes a fresh
+intent to carry the taker's dust fee; MIP balancing is unit-tested, with a live run pending a
+DApp-produced offer artifact.
+
+Still out of spec (reject with a precise error): a `proof-preimage` maker, a pre-existing dust
+registration, and a `ClaimRewards` mint.
 
 See `e2e/results-2026-07-16.md` for a full live run with on-chain txhashes.
