@@ -395,7 +395,14 @@ fn assemble_proven_intent(
     ttl: Timestamp,
 ) -> Intent<MnSig, ProofMarker, PedersenRandomness, InMemoryDB> {
     Intent {
-        guaranteed_unshielded_offer: Some(Sp::new(offer.clone())),
+        // An empty balancing offer (no inputs, no outputs) carries nothing in the guaranteed section —
+        // e.g. a fee-less transfer whose NIGHT movement rides the fallible offer, so the wallet folds no
+        // guaranteed inputs here. Drop it to None rather than hand the ledger a degenerate 0-in/0-out
+        // offer; a non-empty offer (own re-emitted outputs, funding inputs, or the reserved dust coin)
+        // stays as-is.
+        guaranteed_unshielded_offer: (offer.inputs.iter_deref().next().is_some()
+            || offer.outputs.iter_deref().next().is_some())
+        .then(|| Sp::new(offer.clone())),
         // Prefer the wallet's balancing fallible offer (which already re-emits the intent's own fallible
         // outputs); otherwise carry through whatever the intent held.
         fallible_unshielded_offer: fallible_offer
@@ -1576,6 +1583,29 @@ mod tests {
         assert_eq!(
             out_total, reserve.value,
             "change returns the full input value"
+        );
+    }
+
+    /// A balancing offer with no inputs and no outputs carries nothing in the guaranteed section, so the
+    /// assembled intent drops it to None rather than emitting a degenerate 0-in/0-out offer — the shape a
+    /// fee-less transfer takes once its NIGHT movement rides the fallible offer.
+    #[test]
+    fn assemble_proven_intent_drops_an_empty_guaranteed_offer_to_none() {
+        let empty: UnshieldedOffer<MnSig, InMemoryDB> = UnshieldedOffer {
+            inputs: vec![].into(),
+            outputs: vec![].into(),
+            signatures: vec![].into(),
+        };
+        let intent = assemble_proven_intent(
+            &empty,
+            None,
+            &empty_intent_skeleton(),
+            None,
+            Timestamp::from_secs(0),
+        );
+        assert!(
+            intent.guaranteed_unshielded_offer.is_none(),
+            "an empty balancing offer must not become a guaranteed offer"
         );
     }
 
