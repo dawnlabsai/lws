@@ -491,16 +491,18 @@ impl MidnightCryptoProvider {
         Ok(DustPublicKey::from(self.dust_sk.clone()))
     }
 
-    /// Fold one decoded dust ledger event into the dust wallet state. The dust secret key stays
-    /// inside the provider; the caller receives the updated state.
+    /// Fold a batch of decoded dust ledger events into the dust wallet state in a single
+    /// `replay_events` call. Each replay ends with a Merkle rehash + generation-collapse over the
+    /// whole state, so folding many events per call amortizes that fixed cost. The dust secret key
+    /// stays inside the provider; the caller receives the updated state.
     pub fn fold_dust(
         &self,
         state: DustLocalState<InMemoryDB>,
-        ev: &midnight_ledger::events::Event<InMemoryDB>,
+        evs: &[midnight_ledger::events::Event<InMemoryDB>],
     ) -> Result<DustLocalState<InMemoryDB>, SignerError> {
         state
-            .replay_events(&self.dust_sk, std::iter::once(ev))
-            .map_err(|e| SignerError::SigningFailed(format!("replay dust event failed: {e:?}")))
+            .replay_events(&self.dust_sk, evs.iter())
+            .map_err(|e| SignerError::SigningFailed(format!("replay dust events failed: {e:?}")))
     }
 
     /// A 32-byte fingerprint of the shielded seed — the first 32 bytes of SHA-256(seed). Stable

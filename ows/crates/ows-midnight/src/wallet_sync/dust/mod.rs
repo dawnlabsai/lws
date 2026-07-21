@@ -29,9 +29,12 @@ const DUST_SYNC_MAX_ATTEMPTS: u32 = 4;
 /// frame right away, so the probe needs far less than the full-sync idle window.
 const DUST_PROBE_TIMEOUT_SECS: u64 = 15;
 
-/// Persist a progress snapshot every N applied events during a long replay, so a later run
-/// resumes near the tip even if this one is interrupted.
-const DUST_SNAPSHOT_INTERVAL: u64 = 1000;
+/// Fold decoded dust events in batches of this size rather than one at a time. Each
+/// `replay_events` call ends with a Merkle rehash + generation-collapse over the whole state, so
+/// folding N events per call (instead of N single-event calls) amortizes that fixed cost — the
+/// dominant expense of a cold genesis replay. A progress snapshot is written after each flush, so
+/// this also bounds resume granularity.
+const DUST_FOLD_BATCH: usize = 4096;
 
 const DUST_LEDGER_SUB: &str = r#"
 subscription DustLedgerEvents($id: Int) {
@@ -116,6 +119,24 @@ fn save_dust_snapshot(
             state_hex,
         },
     );
+}
+
+/// Fold the buffered dust events into `state` in a single `replay_events` call, then clear the
+/// buffer. Batching amortizes the Merkle rehash + generation-collapse the ledger runs at the end
+/// of every replay. A no-op (and no state clone) when the buffer is empty.
+fn fold_dust_batch(
+    crypto_provider: &MidnightCryptoProvider,
+    state: DustLocalState<InMemoryDB>,
+    batch: &mut Vec<Event<InMemoryDB>>,
+) -> Result<DustLocalState<InMemoryDB>, std::io::Error> {
+    if batch.is_empty() {
+        return Ok(state);
+    }
+    let folded = crypto_provider
+        .fold_dust(state, batch.as_slice())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    batch.clear();
+    Ok(folded)
 }
 
 /// Sync the dust ledger and return the local state: resume from this dust key's disk snapshot
@@ -224,6 +245,8 @@ discarding stale snapshot and replaying from genesis",
     let sync_started = Instant::now();
     let mut last_applied_at: Option<Instant> = None;
     let mut n_events: u64 = 0;
+    // Events decoded from frames but not yet folded into `state`; drained by `fold_dust_batch`.
+    let mut batch: Vec<Event<InMemoryDB>> = Vec::with_capacity(DUST_FOLD_BATCH);
 
     for attempt in 0..DUST_SYNC_MAX_ATTEMPTS {
         let mut ws = indexer_ws::connect_and_init(indexer_url, ws_idle, None).await?;
@@ -240,6 +263,7 @@ discarding stale snapshot and replaying from genesis",
         let dropped;
         loop {
             if last_applied_at.unwrap_or(sync_started).elapsed() > stall_timeout {
+                state = fold_dust_batch(crypto_provider, state, &mut batch)?;
                 save_dust_snapshot(
                     cache_path.as_deref(),
                     scope,
@@ -318,18 +342,22 @@ discarding stale snapshot and replaying from genesis",
                     let mut reader: &[u8] = &bytes;
                     let ev: Event<InMemoryDB> = tagged_deserialize(&mut reader)
                         .map_err(|e| std::io::Error::other(format!("decode dust event: {e}")))?;
-                    state = crypto_provider
-                        .fold_dust(state, &ev)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    n_events = n_events.saturating_add(1);
+                    batch.push(ev);
+                    // Track indexer activity per frame (not per fold), so buffering between
+                    // flushes can't trip the stall guard.
                     last_applied_at = Some(Instant::now());
 
-                    if n_events == 1 || n_events.is_multiple_of(1000) {
+                    // Fold in batches: one `replay_events` per batch amortizes its end-of-call
+                    // Merkle rehash + generation-collapse across many events. Flush at the tip too,
+                    // so `state` and the snapshot cursor never trail the parse cursor.
+                    let at_tip = max_id.is_some_and(|m| last_seen_id >= m);
+                    if batch.len() >= DUST_FOLD_BATCH || at_tip {
+                        let folded = batch.len() as u64;
+                        state = fold_dust_batch(crypto_provider, state, &mut batch)?;
+                        n_events = n_events.saturating_add(folded);
                         eprintln!(
                             "[ows-midnight] dust sync progress: last_seen_id={last_seen_id} max_id={max_id:?} events_applied={n_events}"
                         );
-                    }
-                    if n_events.is_multiple_of(DUST_SNAPSHOT_INTERVAL) {
                         save_dust_snapshot(
                             cache_path.as_deref(),
                             scope,
@@ -342,7 +370,7 @@ discarding stale snapshot and replaying from genesis",
                         );
                     }
 
-                    if max_id.is_some_and(|m| last_seen_id >= m) {
+                    if at_tip {
                         dropped = false;
                         break;
                     }
@@ -359,6 +387,10 @@ discarding stale snapshot and replaying from genesis",
         }
 
         drop(ws);
+
+        // Fold any buffered tail before persisting or breaking, so a resumed run never re-folds
+        // events already parsed here (the tip/complete/idle/drop exits all pass through here).
+        state = fold_dust_batch(crypto_provider, state, &mut batch)?;
 
         if dropped {
             save_dust_snapshot(
