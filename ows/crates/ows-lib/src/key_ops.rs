@@ -144,11 +144,7 @@ pub fn sign_message_with_api_key(
     let signer = signer_for_chain(chain);
     let output = signer.sign_message(key.expose(), msg_bytes)?;
 
-    Ok(crate::types::SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-        transaction: None,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign a raw 32-byte hash using an API token (agent mode).

@@ -27,7 +27,7 @@ pub fn run(
                 Some(index),
                 None,
             )?;
-            return print_result(&result.signature, result.recovery_id, json_output);
+            return print_result(&result, json_output);
         }
         let result = ows_lib::sign_message(
             wallet_name,
@@ -38,7 +38,7 @@ pub fn run(
             Some(index),
             None,
         )?;
-        return print_result(&result.signature, result.recovery_id, json_output);
+        return print_result(&result, json_output);
     }
 
     // Owner mode: resolve key directly (existing behavior)
@@ -68,26 +68,21 @@ pub fn run(
         signer.sign_message(key.expose(), &msg_bytes)?
     };
 
-    print_result(
-        &hex::encode(&output.signature),
-        output.recovery_id,
-        json_output,
-    )
+    // Encode per chain — Midnight prefixes the x-only pubkey to the BIP-340 signature; every other
+    // chain returns the hex signature as-is.
+    let result = ows_lib::sign_result_from_message_output(chain.chain_type, &output)?;
+    print_result(&result, json_output)
 }
 
-fn print_result(
-    signature: &str,
-    recovery_id: Option<u8>,
-    json_output: bool,
-) -> Result<(), CliError> {
+fn print_result(result: &ows_lib::SignResult, json_output: bool) -> Result<(), CliError> {
     if json_output {
         let obj = serde_json::json!({
-            "signature": signature,
-            "recovery_id": recovery_id,
+            "signature": result.signature,
+            "recovery_id": result.recovery_id,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
-        println!("{signature}");
+        println!("{}", result.signature);
     }
     Ok(())
 }

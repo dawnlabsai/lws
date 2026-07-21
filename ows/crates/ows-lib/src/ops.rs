@@ -695,11 +695,7 @@ pub fn sign_message(
     let signer = signer_for_chain(&chain);
     let output = signer.sign_message(key.expose(), &msg_bytes)?;
 
-    Ok(SignResult {
-        signature: hex::encode(&output.signature),
-        recovery_id: output.recovery_id,
-        transaction: None,
-    })
+    crate::types::sign_result_from_message_output(chain.chain_type, &output)
 }
 
 /// Sign EIP-712 typed structured data. Returns hex-encoded signature.
