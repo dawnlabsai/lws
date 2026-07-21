@@ -98,15 +98,40 @@ async fn run_zswap_replay(
                 snap.block_height_when_saved,
             ))
         });
+    // Live stream tip observed while validating a resume snapshot (None from genesis or an
+    // inconclusive probe). Used both to reject a stale snapshot and to skip the WebSocket
+    // catch-up when the snapshot already sits at the tip.
+    let mut live_tip: Option<i64> = None;
     if let Some((resumed_wallet, last, saved_max, saved_height)) = resumed {
-        wallet = resumed_wallet;
-        last_seen_id = last;
-        max_id = Some(saved_max);
-        saved_block_height = saved_height;
-        eprintln!(
-            "[ows-midnight] zswapLedgerEvents: resuming spend wallet from snapshot (event id {}, saved tip {saved_max})",
-            resume_subscribe_id(last_seen_id)
-        );
+        // Validate the snapshot's cursor against the live stream tip before trusting it. A cursor
+        // past the tip means an indexer/chain reset rewound the event ledger; resuming from it
+        // would subscribe past the tip and report the defunct chain's phantom balances. Probe only
+        // here (we have a snapshot to validate); an undetermined tip keeps the snapshot (fail-safe).
+        live_tip = match indexer_ws::probe_stream_max_id(indexer_url, ZSWAP_LEDGER_SUB).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[ows-midnight] zswapLedgerEvents: tip probe failed ({e}); keeping snapshot"
+                );
+                None
+            }
+        };
+        if crate::tip_verify::snapshot_stale_by_event_tip(last, live_tip) {
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents: snapshot tip {last} is past the live tip {}; \
+discarding stale snapshot and replaying from genesis",
+                live_tip.unwrap_or(-1)
+            );
+        } else {
+            wallet = resumed_wallet;
+            last_seen_id = last;
+            max_id = Some(saved_max);
+            saved_block_height = saved_height;
+            eprintln!(
+                "[ows-midnight] zswapLedgerEvents: resuming spend wallet from snapshot (event id {}, saved tip {saved_max})",
+                resume_subscribe_id(last_seen_id)
+            );
+        }
     } else {
         eprintln!("[ows-midnight] zswapLedgerEvents: replaying from genesis");
     }
@@ -124,8 +149,24 @@ async fn run_zswap_replay(
         last_event_at: None,
     };
 
-    // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
-    // already reflects the live tip — skip the WebSocket catch-up entirely.
+    // Event-tip fast path: the resume probe already learned the live stream tip. When the snapshot
+    // sits at it, the on-disk state is current — return it without a WebSocket catch-up, which
+    // would otherwise idle-wait a full window for a boundary frame that never comes once the block
+    // advanced but no new ledger events did. More reliable than the HTTP height check below, which
+    // misses whenever the block advanced with no zswap events.
+    if live_tip.is_some_and(|m| m > 0 && state.last_seen_id >= m) {
+        eprintln!(
+            "[ows-midnight] zswapLedgerEvents: snapshot already at live tip {}; using on-disk snapshot",
+            state.last_seen_id
+        );
+        return Ok(state);
+    }
+
+    // HTTP-tip fallback, used only when the event-tip probe above was inconclusive (`live_tip`
+    // is `None`): when the indexer's block height still matches the snapshot's, skip the WebSocket
+    // catch-up. With a known `live_tip` the event-tip fast path already decided, so this must not
+    // fire — otherwise a height that held steady while ledger events advanced would return a stale
+    // wallet.
     let snapshot_complete = state
         .max_id
         .is_some_and(|m| m > 0 && state.last_seen_id >= m);
@@ -133,6 +174,7 @@ async fn run_zswap_replay(
         current_block_height,
         saved_block_height,
         snapshot_complete,
+        live_tip,
     ) {
         eprintln!(
             "[ows-midnight] zswapLedgerEvents: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"

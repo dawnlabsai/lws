@@ -169,3 +169,101 @@ pub async fn subscribe(
     .await
     .map_err(transport_err)
 }
+
+/// Read budget for a stream-tip probe: a live indexer serves the first frame right away, so the
+/// probe needs far less than a full-sync idle window.
+const TIP_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// Probe an `id`-cursored indexer subscription (e.g. `zswapLedgerEvents`, `dustLedgerEvents`) for
+/// its live tip `maxId`, then disconnect. Subscribes from event id 0; the first data frame carries
+/// `maxId` = the current stream tip. Used to detect a resume snapshot whose saved cursor sits past
+/// the live tip (an indexer/chain reset). `Ok(None)` means the tip was undetermined (empty stream,
+/// GraphQL error, close, or idle window) — callers treat that as "unknown", never as stale.
+pub async fn probe_stream_max_id(
+    indexer_url: &str,
+    subscription_query: &str,
+) -> Result<Option<i64>, std::io::Error> {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let probe_timeout = Duration::from_secs(TIP_PROBE_TIMEOUT_SECS);
+    let mut ws = connect_and_init(indexer_url, probe_timeout, None).await?;
+    subscribe(
+        &mut ws,
+        "1",
+        subscription_query,
+        serde_json::json!({ "id": 0 }),
+    )
+    .await?;
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() > probe_timeout {
+            return Ok(None);
+        }
+        let msg = match tokio::time::timeout(probe_timeout, ws.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(e))) => return Err(transport_err(e)),
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+                continue;
+            }
+            Message::Close(_) => return Ok(None),
+            Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => continue,
+        };
+        let frame: WsFrame<serde_json::Value> =
+            serde_json::from_str(&text).map_err(transport_err)?;
+        match frame.r#type.as_str() {
+            "next" => {
+                let Some(payload) = frame.payload else {
+                    continue;
+                };
+                if payload.errors.is_some() {
+                    return Ok(None);
+                }
+                if let Some(max_id) = payload.data.as_ref().and_then(extract_max_id) {
+                    return Ok(Some(max_id));
+                }
+            }
+            "error" | "complete" => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+/// Pull `maxId` from a subscription payload's single event object. The field name varies by stream
+/// (`zswapLedgerEvents`, `dustLedgerEvents`, …), so one probe serves every `id`-cursored stream
+/// without a per-stream data type.
+fn extract_max_id(data: &serde_json::Value) -> Option<i64> {
+    data.as_object()?
+        .values()
+        .find_map(|v| v.get("maxId"))
+        .and_then(|m| m.as_i64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_max_id;
+
+    #[test]
+    fn extract_max_id_from_stream_payloads() {
+        let zswap = serde_json::json!({
+            "zswapLedgerEvents": { "id": 2, "raw": "0x00", "maxId": 4569 }
+        });
+        assert_eq!(extract_max_id(&zswap), Some(4569));
+        let dust = serde_json::json!({
+            "dustLedgerEvents": { "id": 1, "raw": "0x00", "maxId": 4572 }
+        });
+        assert_eq!(extract_max_id(&dust), Some(4572));
+        // A null event object (no data yet) reveals no tip.
+        assert_eq!(
+            extract_max_id(&serde_json::json!({ "zswapLedgerEvents": null })),
+            None
+        );
+        // No fields at all → no tip.
+        assert_eq!(extract_max_id(&serde_json::json!({})), None);
+    }
+}

@@ -156,25 +156,61 @@ async fn sync_dust_local_state(
                 snap.block_height_when_saved,
             ))
         });
+    // Live dust tip observed while validating a resume snapshot (None from genesis or an
+    // inconclusive probe). Used both to reject a stale snapshot and to skip the WebSocket
+    // catch-up when the snapshot already sits at the tip.
+    let mut live_tip: Option<i64> = None;
     if let Some((st, last, saved_max, saved_height)) = resumed {
-        state = st;
-        last_seen_id = last;
-        max_id = Some(saved_max);
-        saved_block_height = saved_height;
-        eprintln!(
-            "[ows-midnight] dust sync: resuming from event id {last_seen_id} (saved tip {saved_max})"
-        );
+        // Validate the snapshot's cursor against the live dust stream tip; a cursor past the tip
+        // means an indexer/chain reset rewound the ledger, so resuming would report phantom dust.
+        // Probe only here (we have a snapshot); an undetermined tip keeps the snapshot (fail-safe).
+        live_tip = match indexer_ws::probe_stream_max_id(indexer_url, DUST_LEDGER_SUB).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[ows-midnight] dust sync: tip probe failed ({e}); keeping snapshot");
+                None
+            }
+        };
+        if crate::tip_verify::snapshot_stale_by_event_tip(last, live_tip) {
+            eprintln!(
+                "[ows-midnight] dust sync: snapshot tip {last} is past the live tip {}; \
+discarding stale snapshot and replaying from genesis",
+                live_tip.unwrap_or(-1)
+            );
+        } else {
+            state = st;
+            last_seen_id = last;
+            max_id = Some(saved_max);
+            saved_block_height = saved_height;
+            eprintln!(
+                "[ows-midnight] dust sync: resuming from event id {last_seen_id} (saved tip {saved_max})"
+            );
+        }
     } else {
         eprintln!("[ows-midnight] dust sync: replaying from genesis");
     }
 
-    // Fast path: when the indexer's HTTP tip height matches the snapshot's, the snapshot
-    // already reflects the live tip — skip the WebSocket catch-up entirely.
+    // Event-tip fast path: the resume probe already learned the live dust tip. When the snapshot
+    // sits at it, the on-disk state is current — return it without a WebSocket catch-up, which the
+    // exclusive-cursor resume would otherwise stall on for a full idle window (it subscribes past
+    // the tip and receives no frame). More reliable than the HTTP height check below.
+    if live_tip.is_some_and(|m| m > 0 && last_seen_id >= m) {
+        eprintln!(
+            "[ows-midnight] dust sync: snapshot already at live tip {last_seen_id}; using on-disk snapshot"
+        );
+        return Ok(state);
+    }
+
+    // HTTP-tip fallback, used only when the event-tip probe above was inconclusive (`live_tip`
+    // is `None`): when the indexer's block height still matches the snapshot's, skip the WebSocket
+    // catch-up. With a known `live_tip` the event-tip fast path already decided, so this must not
+    // fire — otherwise a height that held steady while dust events advanced would return stale dust.
     let snapshot_complete = dust_at_chain_tip(last_seen_id, max_id);
     if crate::tip_verify::snapshot_fresh_by_http_tip(
         current_block_height,
         saved_block_height,
         snapshot_complete,
+        live_tip,
     ) {
         eprintln!(
             "[ows-midnight] dust sync: indexer block height unchanged ({saved_block_height}); using on-disk snapshot"
