@@ -15,6 +15,23 @@ pub fn evaluate_policies(policies: &[Policy], context: &PolicyContext) -> Policy
     PolicyResult::allowed()
 }
 
+/// Evaluate only the executable policies against a context — the consumers of
+/// `context.transaction.effects`. The declarative rules are deliberately skipped: they gate the
+/// transaction's shape and were already evaluated in the first pass, whereas only the executable
+/// programs read the wallet-relative effects a later pass fills in. Same AND semantics — short-circuits
+/// on the first denial, allows when no executable policy objects.
+pub fn evaluate_executable_policies(policies: &[Policy], context: &PolicyContext) -> PolicyResult {
+    for policy in policies {
+        if let Some(ref exe) = policy.executable {
+            let result = evaluate_executable(exe, policy.config.as_ref(), &policy.id, context);
+            if !result.allow {
+                return result;
+            }
+        }
+    }
+    PolicyResult::allowed()
+}
+
 /// Evaluate a single policy: declarative rules first, then executable (if any).
 fn evaluate_one(policy: &Policy, context: &PolicyContext) -> PolicyResult {
     // Declarative rules — fast, in-process
@@ -266,6 +283,24 @@ mod tests {
             config: None,
             action: PolicyAction::Deny,
         }
+    }
+
+    // --- evaluate_executable_policies: only the executable programs, declarative rules skipped ---
+
+    #[test]
+    fn executable_policies_skip_declarative_only() {
+        // A declarative rule that WOULD deny (chain not in the allowlist), with no executable. The full
+        // pass denies it; the executable-only pass must skip it and allow, because declarative rules are
+        // gated in the first pass — not re-run over effects in a later, executable-only pass.
+        let ctx = base_context(); // chain_id = eip155:8453
+        let policy = policy_with_rules(
+            "decl-only",
+            vec![PolicyRule::AllowedChains {
+                chain_ids: vec!["eip155:1".to_string()],
+            }],
+        );
+        assert!(!evaluate_policies(std::slice::from_ref(&policy), &ctx).allow);
+        assert!(evaluate_executable_policies(std::slice::from_ref(&policy), &ctx).allow);
     }
 
     // --- AllowedChains ---
