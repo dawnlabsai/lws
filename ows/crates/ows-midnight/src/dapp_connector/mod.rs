@@ -20,7 +20,8 @@ mod mip6;
 
 pub use balance_sealed::{parse_balance_sealed_json, BalanceSealedRequest};
 pub use balance_unsealed::{
-    classify_unsealed_payload, parse_balance_unsealed_json, BalanceUnsealedRequest, UnsealedKind,
+    classify_unsealed_payload, is_sealed_maker_payload, parse_balance_unsealed_json,
+    BalanceUnsealedRequest, UnsealedKind,
 };
 pub use build::{DesiredOutput, TransferKind};
 pub use make_intent::{parse_make_intent_json, DesiredInput, MakeIntentRequest};
@@ -75,6 +76,18 @@ pub enum ConnectorPlan {
     /// A `balanceSealedTransaction`: the taker's balancing of a proven maker offer, planned against
     /// the wallet's own inputs — the same shape as `BalanceUnsealed`.
     BalanceSealed(Box<BalancedPlan>),
+    /// A `balanceSealedTransaction` where the maker offer is fully SEALED (`proof,pedersen-schnorr`).
+    /// A sealed tx cannot be balanced in place (its binding fixes the value balance), so the taker
+    /// completes it by MERGING: it builds its own imbalanced half — the per-token complement of the
+    /// maker's imbalance — seals it, and `Transaction::merge`s the two. Carries the maker's sealed
+    /// bytes and that derived complement.
+    BalanceSealedMerge {
+        maker_tx: Vec<u8>,
+        complement: MakeIntentRequest,
+        /// Whether the taker funds the merged tx's DUST fee. Off (or a fee-less chain) → the merged tx
+        /// is value-balanced but carries no fee, so a live-DUST network rejects the submit.
+        pay_fees: bool,
+    },
 }
 
 impl ConnectorPlan {
@@ -98,6 +111,17 @@ impl ConnectorPlan {
             ConnectorPlan::BalanceSealed(plan) => {
                 crate::authorize_proven_tx(chain_id, crypto_provider, *plan)
             }
+            ConnectorPlan::BalanceSealedMerge {
+                maker_tx,
+                complement,
+                pay_fees,
+            } => balance_sealed::authorize_merge(
+                chain_id,
+                crypto_provider,
+                &maker_tx,
+                complement,
+                pay_fees,
+            ),
         }
     }
     // ── POLICY SEAM ── TODO(policy): `ConnectorPlan::effects()` belongs here — the wallet-relative

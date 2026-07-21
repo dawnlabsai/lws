@@ -28,7 +28,7 @@ use rand::rngs::{OsRng, StdRng};
 use rand::SeedableRng as _;
 use sha2::Digest;
 use std::ops::Deref as _;
-use transient_crypto::commitment::PedersenRandomness;
+use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::proofs::{Proof as ZswapProof, ProofPreimage, ProvingProvider};
 
 use crate::curve::Curve;
@@ -39,6 +39,9 @@ use ows_core::ChainType;
 
 /// A proven-but-unsealed Midnight Standard transaction (`proof,embedded-fr`).
 type TxProvenUnsealed = Transaction<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
+/// The sealed form of a Midnight transaction — the maker's offer, the taker's half after sealing, and
+/// their [`merge_sealed`] combination.
+type TxSealed = Transaction<MnSignature, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
 type StdTxProvenUnsealed =
     StandardTransaction<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
 type IntentProvenUnsealed = Intent<MnSignature, ProofMarker, PedersenRandomness, InMemoryDB>;
@@ -965,6 +968,63 @@ fn sign_proven_intent(private_key: &[u8], tx_bytes: &[u8]) -> Result<Vec<u8>, Si
     Ok(out)
 }
 
+/// Marker prefixing a sealed-offer **merge envelope**: `[MARKER][taker_len: u32 LE][taker][maker]`.
+/// `authorize_merge` (ows-midnight) packs the proven-unsealed taker half and the sealed maker offer into
+/// one blob; the sign pipeline signs the taker (which [`MidnightSigner::extract_signable_bytes`] returns),
+/// then [`MidnightSigner::encode_signed_transaction`] seals the taker and [`merge_sealed`]s it onto the
+/// maker. The marker is chosen not to collide with a tagged Midnight transaction header
+/// (`midnight:transaction…`), so a plain transaction is never mistaken for an envelope.
+const MERGE_ENVELOPE_MARKER: &[u8] = b"ows.midnight.merge.v1\0";
+
+/// Pack the taker half (proven-unsealed) and the sealed maker offer into a merge envelope. Public so
+/// `ows-midnight`'s `authorize_merge` can build it without re-implementing the layout; the sign pipeline
+/// unpacks it via [`unwrap_merge_envelope`].
+pub fn wrap_merge_envelope(taker: &[u8], maker: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MERGE_ENVELOPE_MARKER.len() + 4 + taker.len() + maker.len());
+    out.extend_from_slice(MERGE_ENVELOPE_MARKER);
+    out.extend_from_slice(&(taker.len() as u32).to_le_bytes());
+    out.extend_from_slice(taker);
+    out.extend_from_slice(maker);
+    out
+}
+
+/// Split a merge envelope into its `(taker, maker)` slices, or `None` when `bytes` is not an envelope —
+/// a normal transaction is not prefixed with the marker and passes through untouched.
+fn unwrap_merge_envelope(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if !bytes.starts_with(MERGE_ENVELOPE_MARKER) {
+        return None;
+    }
+    let rest = &bytes[MERGE_ENVELOPE_MARKER.len()..];
+    if rest.len() < 4 {
+        return None;
+    }
+    let taker_len = u32::from_le_bytes(rest[..4].try_into().ok()?) as usize;
+    let rest = &rest[4..];
+    if rest.len() < taker_len {
+        return None;
+    }
+    Some((&rest[..taker_len], &rest[taker_len..]))
+}
+
+/// Merge the taker's freshly sealed half onto the sealed maker offer, yielding the completed, submittable
+/// swap. Both halves must be sealed for `Transaction::merge` (it combines their binding markers); the
+/// tx-level binding randomness sums across them, so the merged whole is balanced with no re-seal.
+fn merge_sealed(maker_bytes: &[u8], taker_sealed_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+    let mut mr: &[u8] = maker_bytes;
+    let maker: TxSealed = tagged_deserialize(&mut mr)
+        .map_err(|e| SignerError::InvalidTransaction(format!("parse sealed maker offer: {e}")))?;
+    let mut tr: &[u8] = taker_sealed_bytes;
+    let taker: TxSealed = tagged_deserialize(&mut tr)
+        .map_err(|e| SignerError::InvalidTransaction(format!("parse sealed taker half: {e}")))?;
+    let merged = maker
+        .merge(&taker)
+        .map_err(|e| SignerError::SigningFailed(format!("merge maker and taker offers: {e:?}")))?;
+    let mut out = Vec::new();
+    tagged_serialize(&merged, &mut out)
+        .map_err(|e| SignerError::SigningFailed(format!("serialize merged tx: {e}")))?;
+    Ok(out)
+}
+
 /// Reattach the [`sign_proven_intent`] signatures to the balanced proven transaction and seal it.
 /// Keyless: `add_signatures` and `.seal()` take no key, only an RNG. Returns the sealed tx bytes.
 fn seal_signed_proven(tx_bytes: &[u8], signatures: &[u8]) -> Result<Vec<u8>, SignerError> {
@@ -1092,6 +1152,16 @@ impl ChainSigner for MidnightSigner {
         self.sign(private_key, message)
     }
 
+    /// The signable portion of a `signable_tx`. Identity for a plain proven transaction; for a
+    /// sealed-offer **merge envelope** it is the taker half (the sealed maker is already finalized and
+    /// needs no signature from this wallet), which [`encode_signed_transaction`] then seals and merges.
+    fn extract_signable_bytes<'a>(&self, tx_bytes: &'a [u8]) -> Result<&'a [u8], SignerError> {
+        match unwrap_merge_envelope(tx_bytes) {
+            Some((taker, _maker)) => Ok(taker),
+            None => Ok(tx_bytes),
+        }
+    }
+
     fn sign_transaction(
         &self,
         private_key: &[u8],
@@ -1106,12 +1176,17 @@ impl ChainSigner for MidnightSigner {
     }
 
     /// Reattach the [`sign_proven_intent`] signatures and seal the transaction. Keyless — the
-    /// `signature` blob carries everything the seal needs.
+    /// `signature` blob carries everything the seal needs. For a sealed-offer **merge envelope**, seal
+    /// the signed taker half and [`merge_sealed`] it onto the sealed maker — the completed swap.
     fn encode_signed_transaction(
         &self,
         tx_bytes: &[u8],
         signature: &SignOutput,
     ) -> Result<Vec<u8>, SignerError> {
+        if let Some((taker, maker)) = unwrap_merge_envelope(tx_bytes) {
+            let sealed_taker = seal_signed_proven(taker, &signature.signature)?;
+            return merge_sealed(maker, &sealed_taker);
+        }
         seal_signed_proven(tx_bytes, &signature.signature)
     }
 

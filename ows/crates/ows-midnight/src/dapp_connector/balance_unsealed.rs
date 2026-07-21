@@ -25,6 +25,10 @@ const TAG_PROOF_EMBEDDED_FR: &[u8] =
     b"midnight:transaction[v9](signature[v1],proof,embedded-fr[v1]):";
 const TAG_PROOF_PREIMAGE_EMBEDDED_FR: &[u8] =
     b"midnight:transaction[v9](signature[v1],proof-preimage,embedded-fr[v1]):";
+/// A fully sealed (`proof,pedersen-schnorr`) transaction — a maker offer whose Zswap offers must be
+/// *merged* with the taker's, not balanced against the wallet's own inputs.
+const TAG_PROOF_PEDERSEN_SCHNORR: &[u8] =
+    b"midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):";
 
 /// Classify a tagged v9 Midnight transaction blob, or `None` if it is already sealed (or another
 /// shape the wallet pipeline does not handle).
@@ -36,6 +40,13 @@ pub fn classify_unsealed_payload(tx_bytes: &[u8]) -> Option<UnsealedKind> {
     } else {
         None
     }
+}
+
+/// Whether the payload is a fully sealed Midnight transaction — a maker offer that must be completed
+/// by merging its Zswap offers with the taker's, rather than balanced. Recognized so the sealed path
+/// returns a precise error instead of a vague "unrecognized".
+pub fn is_sealed_maker_payload(tx_bytes: &[u8]) -> bool {
+    tx_bytes.starts_with(TAG_PROOF_PEDERSEN_SCHNORR)
 }
 
 /// A parsed `balanceUnsealedTransaction` connector request: the tagged v9 transaction to balance and
@@ -153,5 +164,16 @@ mod tests {
             classify_unsealed_payload(b"midnight:transaction[v9]sealed"),
             None
         );
+    }
+
+    #[test]
+    fn recognizes_a_sealed_maker_payload() {
+        // A sealed (proof,pedersen-schnorr) blob is recognized as sealed, and NOT as an unsealed kind.
+        assert!(is_sealed_maker_payload(TAG_PROOF_PEDERSEN_SCHNORR));
+        assert_eq!(classify_unsealed_payload(TAG_PROOF_PEDERSEN_SCHNORR), None);
+        // Proven / preimage / garbage are not sealed.
+        assert!(!is_sealed_maker_payload(TAG_PROOF_EMBEDDED_FR));
+        assert!(!is_sealed_maker_payload(TAG_PROOF_PREIMAGE_EMBEDDED_FR));
+        assert!(!is_sealed_maker_payload(b"not a midnight tx"));
     }
 }

@@ -3,6 +3,9 @@
 
 use super::*;
 use midnight_ledger::structure::STARS_PER_NIGHT;
+use rand::rngs::StdRng;
+use rand::SeedableRng as _;
+use transient_crypto::commitment::PureGeneratorPedersen;
 
 /// Generationless DUST fee capacity from the selected UTXOs' *unregistered* NIGHT — how much fee the
 /// ledger will let those inputs pay without a dust spend. Mirrors the ledger's
@@ -164,22 +167,49 @@ fn sync_spendable_dust_state(
 /// size the section **offline, with no real proving keys**. The real, submittable section is built
 /// post-seam by the signer's [`MidnightCryptoProvider::authorize_dust`]; this only produces the number
 /// the fee loop needs.
-#[allow(dead_code)] // used by the deferred fee-sizing path wired in a later commit
 fn build_mock_dust_spends(
     ctx: &DustFeeContext,
     dust_state: &DustLocalState<InMemoryDB>,
     fee_target: u128,
     intent_ttl: Timestamp,
 ) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
-    let spends = ctx
-        .crypto_provider
-        .build_preimage_dust_spends(dust_state.clone(), fee_target, ctx.dust_ctime)
+    mock_prove_dust_spends(
+        ctx.crypto_provider,
+        dust_state,
+        fee_target,
+        ctx.dust_ctime,
+        &ctx.stx.network_id,
+        ctx.seg_id,
+        ctx.intent_in.binding_commitment,
+        intent_ttl,
+    )
+}
+
+/// Mock-prove a DUST-spend section (offline, no proving keys) sized to `fee_target`, in an intent at
+/// `seg_id` bound to `binding_commitment`. `mock_prove` yields a correctly-sized (but non-verifying,
+/// non-submittable) `ProofMarker` section whose fee and serialized size match the real proof's exactly
+/// — proofs are fixed-size — so the fee-convergence loop can size the section offline. The real,
+/// submittable section is built post-seam by the signer's [`MidnightCryptoProvider::authorize_dust`].
+/// Shared by the balancer's [`size_dust_fee`] and the sealed-merge [`size_merge_dust_fee`].
+#[allow(clippy::too_many_arguments)]
+fn mock_prove_dust_spends(
+    crypto_provider: &MidnightCryptoProvider,
+    dust_state: &DustLocalState<InMemoryDB>,
+    fee_target: u128,
+    dust_ctime: Timestamp,
+    network_id: &str,
+    seg_id: u16,
+    binding_commitment: PedersenRandomness,
+    intent_ttl: Timestamp,
+) -> Result<DustActions<MnSig, ProofMarker, InMemoryDB>, std::io::Error> {
+    let spends = crypto_provider
+        .build_preimage_dust_spends(dust_state.clone(), fee_target, dust_ctime)
         .map_err(|e| err(e.to_string()))?;
 
     let dust_preimage: DustActions<MnSig, ProofPreimageMarker, InMemoryDB> = DustActions {
         spends: spends.into_iter().collect(),
         registrations: vec![].into(),
-        ctime: ctx.dust_ctime,
+        ctime: dust_ctime,
     };
     let intent: Intent<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> = Intent {
         guaranteed_unshielded_offer: None,
@@ -187,12 +217,12 @@ fn build_mock_dust_spends(
         actions: vec![].into(),
         dust_actions: Some(Sp::new(dust_preimage)),
         ttl: intent_ttl,
-        binding_commitment: ctx.intent_in.binding_commitment,
+        binding_commitment,
     };
-    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(ctx.seg_id, intent);
+    let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(seg_id, intent);
     let stx: StandardTransaction<MnSig, ProofPreimageMarker, PedersenRandomness, InMemoryDB> =
         StandardTransaction {
-            network_id: ctx.stx.network_id.clone(),
+            network_id: network_id.to_string(),
             intents,
             guaranteed_coins: None,
             fallible_coins: MnHashMap::new(),
@@ -395,6 +425,142 @@ pub(super) fn size_dust_fee(ctx: &DustFeeContext) -> Result<DustFeePlan, std::io
         }
     }
     Err(err("failed to cover the DUST fee"))
+}
+
+// ── Sealed-offer merge: DUST fee sizing against the *merged* transaction ──────────────────────────
+
+/// A fully sealed transaction — the maker's form and the taker's after sealing, the binding stage
+/// `Transaction::merge` operates on.
+type MergedTx = Transaction<MnSig, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
+
+/// Seal a clone of the taker's proven half — with `dust_actions` spliced into its intent at `dust_seg`,
+/// that intent's TTL set to `intent_ttl` — and merge it onto the sealed maker, producing the merged tx
+/// whose fee the sizing loop measures. Sealing/merging with a mock-proven DUST section is fine here:
+/// `merge` combines sections structurally (no proof verification) and `fees`/`balance` read the
+/// fixed-size proof bytes, not their validity.
+fn merged_with_taker_dust(
+    maker: &MergedTx,
+    taker_base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    dust_seg: u16,
+    dust_actions: Option<DustActions<MnSig, ProofMarker, InMemoryDB>>,
+    intent_ttl: Timestamp,
+) -> Result<MergedTx, std::io::Error> {
+    let mut base = taker_base.clone();
+    let intent_sp = base
+        .intents
+        .get(&dust_seg)
+        .ok_or_else(|| err("taker half is missing the complement intent segment"))?;
+    let mut intent = intent_sp.deref().clone();
+    intent.dust_actions = dust_actions.map(Sp::new);
+    intent.ttl = intent_ttl;
+    base.intents = base.intents.insert(dust_seg, intent);
+    let taker_sealed = Transaction::Standard(base).seal(StdRng::from_entropy());
+    maker
+        .merge(&taker_sealed)
+        .map_err(|e| err(format!("merge taker and maker for DUST sizing: {e:?}")))
+}
+
+/// Size the taker's DUST fee for a sealed-offer MERGE. Unlike [`size_dust_fee`] (which sizes against the
+/// wallet's own balancing tx), the fee here must cover the **merged** transaction — the maker's sealed
+/// bytes plus the taker's sealed half — because the fee covers the whole tx and the maker contributes
+/// real bytes but never pays. So each iteration mock-proves a candidate DUST section into the taker's
+/// complement intent (bound to `binding_commitment`), seals the taker half, merges it onto `maker`, and
+/// checks the merged tx's fee; converging in a few rounds. Returns the converged spend plan and the
+/// synced dust state — the real, submittable spend is proved post-seam by
+/// [`MidnightCryptoProvider::authorize_dust`].
+///
+/// Scope: the DUST-spend path only (the taker pays with its own generated dust). The generationless
+/// registration the balancer prefers needs the tx to spend the wallet's unregistered NIGHT, which the
+/// merge's taker complement need not do, so that path is out of scope here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn size_merge_dust_fee(
+    maker: &MergedTx,
+    taker_base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
+    dust_seg: u16,
+    binding_commitment: PedersenRandomness,
+    crypto_provider: &MidnightCryptoProvider,
+    dust_ctime: Timestamp,
+    ledger_params: &LedgerParameters,
+    indexer_url: &str,
+    scope: &SyncCacheScope,
+) -> Result<(DustSpendPlan, Box<DustLocalState<InMemoryDB>>), std::io::Error> {
+    const MAX_FEE_ITERS: usize = 8;
+    let intent_ttl = chain_aligned_intent_ttl(dust_ctime);
+
+    // First estimate: the merged fee with no DUST section yet.
+    let merged0 = merged_with_taker_dust(maker, taker_base, dust_seg, None, intent_ttl)?;
+    let mut fee_target = merged0
+        .fees(ledger_params, false)
+        .map_err(|e| err(format!("merged DUST fee estimate failed: {e:?}")))?;
+
+    // Syncing the spendable dust state is expensive; the merge always needs it (spend path), so pull
+    // it once up front.
+    let dust_state = sync_spendable_dust_state(indexer_url, crypto_provider, scope)?;
+
+    for attempt in 0..MAX_FEE_ITERS {
+        let dust_actions = mock_prove_dust_spends(
+            crypto_provider,
+            &dust_state,
+            fee_target,
+            dust_ctime,
+            &taker_base.network_id,
+            dust_seg,
+            binding_commitment,
+            intent_ttl,
+        )?;
+        let merged = merged_with_taker_dust(
+            maker,
+            taker_base,
+            dust_seg,
+            Some(dust_actions.clone()),
+            intent_ttl,
+        )?;
+        // Charge the node's real fee, enforcing the time-to-dismiss bound as `well_formed` does.
+        let fee = match merged.fees(ledger_params, true) {
+            Ok(fee) => fee,
+            // `OutsideTimeToDismiss` is a size-vs-compute bound, not a fee shortfall: the merged tx's
+            // proof-validation cost exceeds what its serialized size allows the node to spend dismissing
+            // it. A bigger DUST section can't fix that — below the size floor it only adds validation
+            // cost — so fail with a precise message rather than spinning the loop.
+            Err(e) if format!("{e:?}").contains("OutsideTimeToDismiss") => {
+                return Err(err(format!(
+                    "the merged transaction cannot satisfy the node's time-to-dismiss bound ({e:?}): \
+                     its proof-validation cost exceeds what its size allows, which a DUST fee cannot \
+                     change. The merged offer is too small for its proofs; a larger swap (e.g. \
+                     shielded coins on either side) clears the bound."
+                )));
+            }
+            Err(e) => return Err(err(format!("merged DUST fee check failed: {e:?}"))),
+        };
+        let balances = merged
+            .balance(Some(fee))
+            .map_err(|e| err(format!("merged balance check failed: {e:?}")))?;
+        if balances.into_iter().all(|(_, bal)| bal >= 0) {
+            return Ok((
+                DustSpendPlan {
+                    fee_dust: fee_target,
+                    dust_ctime,
+                    intent_ttl,
+                    seg_id: dust_seg,
+                    binding_commitment,
+                },
+                Box::new(dust_state),
+            ));
+        }
+
+        // The DUST section under-covers the fee: grow the target and re-size.
+        let dust_paid = sum_dust_v_fee(dust_actions.spends.iter_deref());
+        fee_target = fee
+            .max(fee_target.saturating_add(1))
+            .max(dust_paid.saturating_add(1));
+        if attempt + 1 == MAX_FEE_ITERS {
+            return Err(err(format!(
+                "failed to cover the merged DUST fee after {MAX_FEE_ITERS} attempts \
+                 (target={fee_target}, paid={dust_paid}, fee={fee})"
+            )));
+        }
+    }
+    Err(err("failed to cover the merged DUST fee"))
 }
 
 /// Fee-sizing twin of the signer's [`MidnightCryptoProvider::authorize_shielded`]: build the same
