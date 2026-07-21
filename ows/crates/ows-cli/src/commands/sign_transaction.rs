@@ -36,7 +36,8 @@ pub fn run(
     let key = super::resolve_signing_key(wallet_name, chain.chain_type, index)?;
 
     let tx_bytes = ows_lib::decode_tx_input(&chain, tx_hex)?;
-    let signable_tx = ows_lib::prepare_signable_tx(&chain, tx_bytes, &key)?;
+    // Owner mode: full authority, no policy gate.
+    let signable_tx = ows_lib::prepare_signable_tx(&chain, tx_bytes, &key, |_| Ok(()))?;
 
     let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&signable_tx)?;
