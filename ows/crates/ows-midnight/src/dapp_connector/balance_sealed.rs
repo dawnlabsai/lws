@@ -61,11 +61,22 @@ pub fn parse_balance_sealed_json(json: &str) -> Result<BalanceSealedRequest, std
 }
 
 /// Decode the maker input into transaction bytes: a `zswapoffer…` bech32 is wrapped into a proven
-/// zswap-only tx (MIP-0005); anything else is treated as hex-encoded transaction bytes.
+/// zswap-only tx (MIP-0005); a MIP-0006 offer JSON object is validated (gives/wants vs deltas, plus
+/// optional signature) and materialized; anything else is treated as hex-encoded transaction bytes.
 fn decode_maker_input(chain_id: &str, input: &str) -> Result<Vec<u8>, std::io::Error> {
     let trimmed = input.trim();
     if trimmed.starts_with(mip6::ZSWAP_OFFER_BECH32_HRP) {
         return mip6::wrap_zswap_offer_as_proven_tx(chain_id, trimmed);
+    }
+    if trimmed.starts_with('{') {
+        let v: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| std::io::Error::other(format!("invalid maker offer JSON: {e}")))?;
+        if mip6::is_mip6_offer_payload(&v) {
+            return mip6::materialize_validated_offer(chain_id, &v);
+        }
+        return Err(std::io::Error::other(
+            "maker input JSON is not a MIP-0006 offer (needs version, transaction, gives, wants)",
+        ));
     }
     let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     hex::decode(clean)

@@ -150,6 +150,235 @@ pub(super) fn wrap_zswap_offer_as_proven_tx(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------------------------
+// MIP-0006 offer-file (JSON) validation
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Mip6TokenAmountJson {
+    token: String,
+    amount: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Mip6AuthJson {
+    #[serde(rename = "signerPublicKey")]
+    signer_public_key: String,
+    signature: String,
+    scheme: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Mip6OfferPayloadJson {
+    version: u32,
+    transaction: String,
+    wants: Vec<Mip6TokenAmountJson>,
+    gives: Vec<Mip6TokenAmountJson>,
+    #[serde(default)]
+    auth: Option<Mip6AuthJson>,
+}
+
+/// Whether a JSON value looks like a MIP-0006 offer payload (has the four required fields).
+pub(super) fn is_mip6_offer_payload(v: &serde_json::Value) -> bool {
+    v.get("version").is_some()
+        && v.get("transaction").is_some()
+        && v.get("gives").is_some()
+        && v.get("wants").is_some()
+}
+
+fn shielded_token_wire(token: midnight_coin_structure::coin::ShieldedTokenType) -> String {
+    crate::parse_token_type(Some(&format!("0x{}", hex::encode(token.0 .0))))
+        .map(|t| t.to_wire_token_type())
+        .unwrap_or_else(|_| hex::encode(token.0 .0))
+}
+
+fn normalize_token_wire(token: &str) -> Result<String, std::io::Error> {
+    Ok(crate::parse_token_type(Some(token))
+        .map_err(|e| err(e.to_string()))?
+        .to_wire_token_type())
+}
+
+fn parse_amount_string(amount: &str) -> Result<u128, std::io::Error> {
+    amount
+        .trim()
+        .parse::<u128>()
+        .map_err(|e| err(format!("invalid MIP-0006 amount {amount:?}: {e}")))
+}
+
+/// Sum a MIP-0006 gives/wants list into a per-token map (tokens normalized to their wire form).
+fn advertised_token_map(
+    entries: &[Mip6TokenAmountJson],
+    label: &str,
+) -> Result<std::collections::BTreeMap<String, u128>, std::io::Error> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in entries {
+        let token = normalize_token_wire(&entry.token)?;
+        let amount = parse_amount_string(&entry.amount)?;
+        if amount == 0 {
+            return Err(err(format!(
+                "MIP-0006 {label} entry for token {token} must be non-zero"
+            )));
+        }
+        let slot = out.entry(token).or_insert(0u128);
+        *slot = slot
+            .checked_add(amount)
+            .ok_or_else(|| err(format!("MIP-0006 {label} amount overflow")))?;
+    }
+    Ok(out)
+}
+
+/// Extract the maker's actual gives/wants from a Zswap offer's deltas: a positive delta means the
+/// maker spends (gives) that token, a negative delta means it receives (wants) it.
+fn deltas_to_gives_wants(
+    offer: &ProvenZswapOffer,
+) -> (
+    std::collections::BTreeMap<String, u128>,
+    std::collections::BTreeMap<String, u128>,
+) {
+    let mut gives = std::collections::BTreeMap::new();
+    let mut wants = std::collections::BTreeMap::new();
+    for delta in offer.deltas.iter_deref() {
+        let token = shielded_token_wire(delta.token_type);
+        if delta.value > 0 {
+            *gives.entry(token).or_insert(0) += delta.value as u128;
+        } else if delta.value < 0 {
+            *wants.entry(token).or_insert(0) += delta.value.unsigned_abs();
+        }
+    }
+    (gives, wants)
+}
+
+fn compare_token_maps(
+    advertised: &std::collections::BTreeMap<String, u128>,
+    actual: &std::collections::BTreeMap<String, u128>,
+    label: &str,
+) -> Result<(), std::io::Error> {
+    if advertised == actual {
+        return Ok(());
+    }
+    Err(err(format!(
+        "MIP-0006 {label} does not match offer deltas (advertised={advertised:?}, actual={actual:?})"
+    )))
+}
+
+/// Canonicalize a JSON value per RFC 8785 (JCS) for the MIP-0006 offer payload: object keys sorted
+/// (ASCII order equals the UTF-16 code-unit order JCS mandates for these keys), no insignificant
+/// whitespace, arrays in order, and leaf strings/small integers via serde_json's escaping. Sufficient
+/// and faithful for the offer shape (strings, string amounts, one small version integer).
+fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let mut s = String::from("{");
+            for (i, (k, val)) in entries.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&serde_json::to_string(k).unwrap_or_default());
+                s.push(':');
+                s.push_str(&canonical_json(val));
+            }
+            s.push('}');
+            s
+        }
+        Value::Array(arr) => {
+            let mut s = String::from("[");
+            for (i, e) in arr.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&canonical_json(e));
+            }
+            s.push(']');
+            s
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Verify the optional MIP-0006 `auth`: a BIP-340 Schnorr signature by `signerPublicKey` over the
+/// SHA-256 of the canonical JSON offer with `auth` removed.
+fn verify_auth(payload: &serde_json::Value, auth: &Mip6AuthJson) -> Result<(), std::io::Error> {
+    use k256::schnorr::signature::Verifier as _;
+    use sha2::{Digest as _, Sha256};
+
+    if auth.scheme != "schnorr-bip340" {
+        return Err(err(format!(
+            "unsupported MIP-0006 auth scheme {:?} (expected schnorr-bip340)",
+            auth.scheme
+        )));
+    }
+
+    let mut unsigned = payload.clone();
+    if let Some(obj) = unsigned.as_object_mut() {
+        obj.remove("auth");
+    }
+    let digest: [u8; 32] = Sha256::digest(canonical_json(&unsigned).as_bytes()).into();
+
+    let pk_hex = auth
+        .signer_public_key
+        .strip_prefix("0x")
+        .unwrap_or(&auth.signer_public_key);
+    let pk_bytes =
+        hex::decode(pk_hex).map_err(|e| err(format!("invalid auth signerPublicKey hex: {e}")))?;
+    let pk: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| {
+        err(format!(
+            "auth signerPublicKey must be 32 bytes, got {}",
+            pk_bytes.len()
+        ))
+    })?;
+    let vk = k256::schnorr::VerifyingKey::from_bytes(&pk)
+        .map_err(|e| err(format!("invalid auth signerPublicKey: {e}")))?;
+
+    let sig_hex = auth.signature.strip_prefix("0x").unwrap_or(&auth.signature);
+    let sig_bytes =
+        hex::decode(sig_hex).map_err(|e| err(format!("invalid auth signature hex: {e}")))?;
+    let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice())
+        .map_err(|e| err(format!("invalid auth signature: {e}")))?;
+
+    vk.verify(&digest, &sig)
+        .map_err(|_| err("MIP-0006 auth signature verification failed"))
+}
+
+/// Validate a MIP-0006 offer payload and return proven maker transaction bytes for balancing. The
+/// `transaction` field must be a `zswapoffer` bech32; the advertised gives/wants must match the
+/// offer's actual deltas; and the optional `auth` signature (if present) must verify.
+pub(super) fn materialize_validated_offer(
+    chain_id: &str,
+    v: &serde_json::Value,
+) -> Result<Vec<u8>, std::io::Error> {
+    let payload: Mip6OfferPayloadJson = serde_json::from_value(v.clone())
+        .map_err(|e| err(format!("invalid MIP-0006 offer JSON: {e}")))?;
+    if payload.version != 1 {
+        return Err(err(format!(
+            "unsupported MIP-0006 version {} (expected 1)",
+            payload.version
+        )));
+    }
+    let transaction = payload.transaction.trim();
+    if !transaction.starts_with(ZSWAP_OFFER_BECH32_HRP) {
+        return Err(err(
+            "MIP-0006 transaction field must be a zswapoffer… bech32 string (MIP-0005); use \
+             balanceSealedTransaction with proven hex for a full maker transaction",
+        ));
+    }
+
+    let offer = decode_zswap_offer_bech32(transaction)?;
+    let (actual_gives, actual_wants) = deltas_to_gives_wants(&offer);
+    let advertised_gives = advertised_token_map(&payload.gives, "gives")?;
+    let advertised_wants = advertised_token_map(&payload.wants, "wants")?;
+    compare_token_maps(&advertised_gives, &actual_gives, "gives")?;
+    compare_token_maps(&advertised_wants, &actual_wants, "wants")?;
+
+    if let Some(auth) = &payload.auth {
+        verify_auth(v, auth)?;
+    }
+
+    wrap_zswap_offer_as_proven_tx(chain_id, transaction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +455,73 @@ mod tests {
             super::super::classify_unsealed_payload(&bytes),
             Some(super::super::UnsealedKind::Proven)
         );
+    }
+
+    fn mip6_json(bech32: &str, give_amount: &str, want_amount: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "transaction": bech32,
+            "gives": [{"token": hex::encode([1u8; 32]), "amount": give_amount}],
+            "wants": [{"token": hex::encode([2u8; 32]), "amount": want_amount}],
+        })
+    }
+
+    #[test]
+    fn mip6_offer_matching_deltas_materializes_to_proven() {
+        let bech32 = encode_zswap_offer_bech32(&sample_offer(100, 50)).unwrap();
+        let bytes =
+            materialize_validated_offer("midnight:preview", &mip6_json(&bech32, "100", "50"))
+                .unwrap();
+        assert_eq!(
+            super::super::classify_unsealed_payload(&bytes),
+            Some(super::super::UnsealedKind::Proven)
+        );
+    }
+
+    #[test]
+    fn mip6_rejects_mismatch_bad_version_and_non_zswapoffer() {
+        let bech32 = encode_zswap_offer_bech32(&sample_offer(100, 50)).unwrap();
+        // Advertised gives (99) does not match the offer's actual deltas (100).
+        assert!(
+            materialize_validated_offer("midnight:preview", &mip6_json(&bech32, "99", "50"))
+                .is_err()
+        );
+        // Wrong version.
+        let mut bad_version = mip6_json(&bech32, "100", "50");
+        bad_version["version"] = serde_json::json!(2);
+        assert!(materialize_validated_offer("midnight:preview", &bad_version).is_err());
+        // transaction is not a zswapoffer bech32.
+        let mut not_offer = mip6_json(&bech32, "100", "50");
+        not_offer["transaction"] = serde_json::json!("0x010203");
+        assert!(materialize_validated_offer("midnight:preview", &not_offer).is_err());
+    }
+
+    #[test]
+    fn mip6_auth_signature_verifies_and_rejects_tampering() {
+        use k256::schnorr::signature::Signer as _;
+        use sha2::{Digest as _, Sha256};
+
+        let bech32 = encode_zswap_offer_bech32(&sample_offer(100, 50)).unwrap();
+        let unsigned = mip6_json(&bech32, "100", "50");
+
+        // Sign the SHA-256 of the canonical (auth-free) offer with a BIP-340 key.
+        let sk = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32]).unwrap();
+        let digest: [u8; 32] = Sha256::digest(canonical_json(&unsigned).as_bytes()).into();
+        let sig: k256::schnorr::Signature = sk.sign(&digest);
+
+        let mut signed = unsigned.clone();
+        signed["auth"] = serde_json::json!({
+            "signerPublicKey": hex::encode(sk.verifying_key().to_bytes()),
+            "signature": hex::encode(sig.to_bytes()),
+            "scheme": "schnorr-bip340",
+        });
+        assert!(materialize_validated_offer("midnight:preview", &signed).is_ok());
+
+        // A tampered signature is rejected.
+        let mut tampered = signed.clone();
+        let mut bad_sig = sig.to_bytes();
+        bad_sig[0] ^= 0xff;
+        tampered["auth"]["signature"] = serde_json::json!(hex::encode(bad_sig));
+        assert!(materialize_validated_offer("midnight:preview", &tampered).is_err());
     }
 }
