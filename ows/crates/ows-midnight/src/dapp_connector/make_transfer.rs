@@ -24,8 +24,8 @@ use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
     decode_shielded_recipient, decode_unshielded_recipient, err, far_future_ttl,
-    prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
-    PreimageTx, TransferKind,
+    mock_prove_unsealed, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
+    DesiredOutput, PreimageTx, TransferKind,
 };
 use ows_core::policy::TransactionEffect;
 
@@ -110,9 +110,9 @@ pub(super) fn effects(
     req: &MakeTransferRequest,
 ) -> Result<Vec<TransactionEffect>, std::io::Error> {
     let preimage = build_make_transfer_preimage(chain_id, req)?;
-    let mock_proven = preimage
-        .mock_prove()
-        .map_err(|e| err(format!("mock-prove makeTransfer for effect sizing: {e:?}")))?;
+    // Mock-prove into the *unsealed* proven form (`mock_prove` would seal it, and the balancer only
+    // consumes unsealed proven bytes). Fixed-size proofs → the sized fee equals the real one.
+    let mock_proven = mock_prove_unsealed(preimage)?;
     let mut bytes = Vec::new();
     tagged_serialize(&mock_proven, &mut bytes)
         .map_err(|e| err(format!("serialize mock-proven makeTransfer: {e}")))?;
@@ -361,6 +361,59 @@ mod tests {
             intent.fallible_unshielded_offer.is_some(),
             "the NIGHT output rides the maker intent's fallible offer"
         );
+    }
+
+    /// A valid preview *shielded* address — a shielded output carries a real ZK proof, so it exercises
+    /// the mock prover (an unshielded output has no proof to size).
+    fn preview_shielded_address() -> String {
+        let mut blob = b"MNK1".to_vec();
+        blob.extend_from_slice(&[0x11u8; 32]);
+        blob.extend_from_slice(&[0x22u8; 32]);
+        blob.extend_from_slice(&[0x33u8; 32]);
+        MidnightSigner::preview()
+            .derive_addresses(&blob)
+            .expect("derive addresses")
+            .shielded
+    }
+
+    /// Regression guard for the effect-sizing prover: `mock_prove_unsealed` must yield the **unsealed**
+    /// proven form (`proof,embedded-fr`) that the balancer and merge fee sizing consume — the plain ledger
+    /// `mock_prove` seals to `proof,pedersen-schnorr`, which cannot re-parse as unsealed and so silently
+    /// breaks the whole make* effects path. Uses a shielded output so a real output proof is mock-sized.
+    #[test]
+    fn mock_prove_unsealed_yields_unsealed_proven_not_sealed() {
+        use midnight_ledger::structure::ProofMarker;
+        use midnight_serialize::tagged_deserialize;
+        type UnsealedProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
+
+        let req = MakeTransferRequest {
+            desired_outputs: vec![DesiredOutput {
+                kind: TransferKind::Shielded,
+                token_type: "night".into(),
+                value: 1_000,
+                recipient: preview_shielded_address(),
+            }],
+            pay_fees: true,
+        };
+        let preimage =
+            build_make_transfer_preimage("midnight:preview", &req).expect("build preimage");
+
+        // The plain ledger mock seals: its output is tagged pedersen-schnorr and must NOT parse as unsealed.
+        let sealed = preimage.mock_prove().expect("mock_prove");
+        let mut sealed_bytes = Vec::new();
+        tagged_serialize(&sealed, &mut sealed_bytes).unwrap();
+        assert!(
+            tagged_deserialize::<UnsealedProven>(&mut &sealed_bytes[..]).is_err(),
+            "mock_prove output is sealed and must not re-parse as unsealed proven"
+        );
+
+        // The effect-sizing prover keeps it unsealed: its output round-trips as embedded-fr.
+        let unsealed = mock_prove_unsealed(preimage).expect("mock_prove_unsealed");
+        let mut unsealed_bytes = Vec::new();
+        tagged_serialize(&unsealed, &mut unsealed_bytes).unwrap();
+        let back: UnsealedProven = tagged_deserialize(&mut &unsealed_bytes[..])
+            .expect("mock_prove_unsealed output must re-parse as unsealed proven (embedded-fr)");
+        assert!(matches!(back, Transaction::Standard(_)));
     }
 
     #[test]

@@ -233,3 +233,65 @@ pub(super) fn prove_to_unsealed_bytes(
     tagged_serialize(&proven, &mut out).map_err(|e| err(format!("serialize proven tx: {e}")))?;
     Ok(out)
 }
+
+/// The builtin circuits a mock prover can size. A preimage for anything else (e.g. a contract call) has
+/// a variable proof size the mock cannot stand in for, so it is rejected — matching the ledger's own mock.
+const MOCK_PROVABLE_CIRCUITS: &[&str] = &[
+    "midnight/zswap/spend",
+    "midnight/zswap/output",
+    "midnight/dust/spend",
+];
+
+/// A [`ProvingProvider`](transient_crypto::proofs::ProvingProvider) that emits correctly-*sized* but
+/// non-verifying proofs for the builtin circuits — a reimplementation of the ledger's own (crate-private)
+/// mock prover. [`Transaction::mock_prove`] also mocks proofs, but it *seals* its output to
+/// `proof,pedersen-schnorr`; driving [`Transaction::prove`] with this provider instead keeps the result
+/// **unsealed** (`proof,embedded-fr`) — the form the balancing tail and the sealed-merge fee sizing
+/// consume. ZK proofs are fixed-size, so a fee sized against the mock matches the real one exactly.
+struct UnsealedMockProver;
+
+impl transient_crypto::proofs::ProvingProvider for UnsealedMockProver {
+    async fn check(
+        &self,
+        preimage: &transient_crypto::proofs::ProofPreimage,
+    ) -> Result<Vec<Option<usize>>, anyhow::Error> {
+        if MOCK_PROVABLE_CIRCUITS.contains(&preimage.key_location.0.as_ref()) {
+            Ok(vec![])
+        } else {
+            anyhow::bail!(
+                "cannot mock-prove non-builtin circuit {:?}",
+                preimage.key_location.0
+            )
+        }
+    }
+    async fn prove(
+        self,
+        preimage: &transient_crypto::proofs::ProofPreimage,
+        _overwrite_binding_input: Option<transient_crypto::curve::Fr>,
+    ) -> Result<transient_crypto::proofs::Proof, anyhow::Error> {
+        let size = match preimage.key_location.0.as_ref() {
+            "midnight/zswap/spend" => midnight_zswap::INPUT_PROOF_SIZE,
+            "midnight/zswap/output" => midnight_zswap::OUTPUT_PROOF_SIZE,
+            "midnight/dust/spend" => midnight_ledger::dust::DUST_SPEND_PROOF_SIZE,
+            other => anyhow::bail!("cannot mock-prove non-builtin circuit {other:?}"),
+        };
+        Ok(transient_crypto::proofs::Proof(vec![0xde; size]))
+    }
+    fn split(&mut self) -> Self {
+        UnsealedMockProver
+    }
+}
+
+/// Mock-prove a wallet-constructed preimage into a proven, still-**unsealed** (`proof,embedded-fr`)
+/// transaction — the mock-proving twin of [`prove_preimage`]. Emits fixed-size, non-verifying proofs with
+/// no proving keys, network, or real proving, so an effect sized against the result gets the exact fee
+/// while a plan denied at the policy seam never triggers real proving. Only builtin circuits are
+/// mock-provable (a contract call is rejected). Unlike [`Transaction::mock_prove`], the output is *not*
+/// sealed, so it round-trips as the unsealed proven form the balancer and merge fee sizing expect.
+pub(super) fn mock_prove_unsealed(preimage: PreimageTx) -> Result<ProvenTx, std::io::Error> {
+    crate::block_on(preimage.prove(
+        UnsealedMockProver,
+        &onchain_runtime::cost_model::INITIAL_COST_MODEL,
+    ))
+    .map_err(|e| err(format!("mock-prove constructed preimage: {e}")))
+}
