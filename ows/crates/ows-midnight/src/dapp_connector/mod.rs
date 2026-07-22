@@ -149,9 +149,93 @@ pub fn plan_connector_tx(
     }
 }
 
+/// Normalize a raw `--tx` argument into a canonical DApp Connector request JSON. A JSON object passes
+/// through untouched; a bare `zswapoffer…` bech32 (MIP-0005) or a bare hex transaction is wrapped into
+/// the request that carries it, so the wallet accepts an offer or a proven transaction directly without
+/// the caller writing the envelope. A fully sealed maker becomes a `balanceSealedTransaction` (it is
+/// completed by merging, not balanced in place); any other hex a `balanceUnsealedTransaction`.
+pub fn normalize_connector_request(raw: &str) -> Result<String, std::io::Error> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') {
+        return Ok(raw.to_string());
+    }
+    if trimmed.starts_with(mip6::ZSWAP_OFFER_BECH32_HRP) {
+        return Ok(sealed_request_json(trimmed));
+    }
+    // Not JSON and not a bech32 offer: the only remaining accepted form is a bare hex transaction.
+    let hex_body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let bytes = hex::decode(hex_body).map_err(|e| {
+        std::io::Error::other(format!(
+            "Midnight --tx must be a DApp Connector request JSON, a zswapoffer bech32 offer, or a hex transaction: {e}"
+        ))
+    })?;
+    // A sealed maker is completed by merging, so it rides balanceSealedTransaction; every other proven
+    // shape is balanced in place by balanceUnsealedTransaction (the wallet's original method).
+    if is_sealed_maker_payload(&bytes) {
+        Ok(sealed_request_json(trimmed))
+    } else {
+        Ok(
+            serde_json::json!({ "method": "balanceUnsealedTransaction", "tx": trimmed })
+                .to_string(),
+        )
+    }
+}
+
+fn sealed_request_json(maker: &str) -> String {
+    serde_json::json!({ "method": "balanceSealedTransaction", "makerTx": maker }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn method_of(json: &str) -> ConnectorMethod {
+        parse_connector_method(json).unwrap()
+    }
+
+    fn field_of(json: &str, key: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(json).unwrap()[key]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn bare_zswapoffer_wraps_as_balance_sealed() {
+        let out = normalize_connector_request("zswapoffer1qqqmakeroffer").unwrap();
+        assert_eq!(method_of(&out), ConnectorMethod::BalanceSealed);
+        assert_eq!(field_of(&out, "makerTx"), "zswapoffer1qqqmakeroffer");
+    }
+
+    #[test]
+    fn bare_sealed_maker_hex_wraps_as_balance_sealed() {
+        let sealed_hex =
+            hex::encode(b"midnight:transaction[v9](signature[v1],proof,pedersen-schnorr[v1]):body");
+        let out = normalize_connector_request(&sealed_hex).unwrap();
+        assert_eq!(method_of(&out), ConnectorMethod::BalanceSealed);
+        assert_eq!(field_of(&out, "makerTx"), sealed_hex);
+    }
+
+    #[test]
+    fn bare_unsealed_hex_wraps_as_balance_unsealed() {
+        let unsealed_hex =
+            hex::encode(b"midnight:transaction[v9](signature[v1],proof,embedded-fr[v1]):body");
+        let out = normalize_connector_request(&unsealed_hex).unwrap();
+        assert_eq!(method_of(&out), ConnectorMethod::BalanceUnsealed);
+        assert_eq!(field_of(&out, "tx"), unsealed_hex);
+    }
+
+    #[test]
+    fn json_request_passes_through_unchanged() {
+        let json = r#"{"method":"makeTransfer","desiredOutputs":[]}"#;
+        let out = normalize_connector_request(json).unwrap();
+        assert_eq!(method_of(&out), ConnectorMethod::MakeTransfer);
+    }
+
+    #[test]
+    fn neither_json_nor_bech32_nor_hex_is_rejected() {
+        assert!(normalize_connector_request("not a transaction").is_err());
+    }
 
     #[test]
     fn absent_method_defaults_to_balance_unsealed() {

@@ -531,12 +531,15 @@ pub fn sign_transaction(
 }
 
 /// Decode the `--tx` input into transaction bytes. A hex decode for every chain; Midnight's input is
-/// a DApp Connector request (JSON, not hex), so it is carried through unchanged for the key-aware
-/// preparation step to parse. Needs no signing key, so it can run before policy evaluation on the
-/// agent path.
+/// a DApp Connector request, normalized here into canonical request JSON — a bare `zswapoffer` bech32
+/// or a bare hex transaction is wrapped into the request that carries it, so a caller can hand over an
+/// offer or a proven transaction without writing the envelope. Normalizing before the key-aware step
+/// also lets the agent path's policy pass classify the request. Needs no signing key.
 pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8>, OwsLibError> {
     if chain.chain_type == ChainType::Midnight {
-        return Ok(tx_input.as_bytes().to_vec());
+        let request = ows_midnight::normalize_connector_request(tx_input)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+        return Ok(request.into_bytes());
     }
     let clean = tx_input.strip_prefix("0x").unwrap_or(tx_input);
     hex::decode(clean)
@@ -1202,6 +1205,15 @@ fn extract_json_field(json_str: &str, field: &str) -> Result<String, OwsLibError
 mod tests {
     use super::*;
     use ows_core::OwsError;
+
+    #[test]
+    fn decode_tx_input_wraps_a_bare_midnight_offer_as_a_connector_request() {
+        let chain = parse_chain("midnight:preview").unwrap();
+        let bytes = decode_tx_input(&chain, "zswapoffer1qqqmakeroffer").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["method"], "balanceSealedTransaction");
+        assert_eq!(json["makerTx"], "zswapoffer1qqqmakeroffer");
+    }
 
     // ---- helpers ----
 
