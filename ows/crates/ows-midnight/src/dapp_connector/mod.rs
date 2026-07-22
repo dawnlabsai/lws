@@ -146,10 +146,19 @@ impl ConnectorPlan {
                 make_intent::request_effects(chain_id, crypto_provider, req)
             }
             // The wallet's movement in a merge is its own half — the `complement` it contributes and
-            // receives — not the maker's sealed bytes; request-derived exactly like a makeIntent.
-            ConnectorPlan::BalanceSealedMerge { complement, .. } => {
-                make_intent::request_effects(chain_id, crypto_provider, complement)
-            }
+            // receives — plus the merged DUST fee it funds; sized against the maker's sealed bytes so a
+            // movement cap sees the burn (see [`balance_sealed::merge_effects`]).
+            ConnectorPlan::BalanceSealedMerge {
+                maker_tx,
+                complement,
+                pay_fees,
+            } => balance_sealed::merge_effects(
+                chain_id,
+                crypto_provider,
+                maker_tx,
+                complement,
+                *pay_fees,
+            ),
         }
     }
 }

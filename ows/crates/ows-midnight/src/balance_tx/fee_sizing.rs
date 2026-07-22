@@ -654,7 +654,7 @@ fn mock_prove_shielded_offer(
 /// (segment 0 → guaranteed, segment N>=1 → `fallible_coins[N]`), mirroring the real placement in
 /// [`authorize_proven_tx`] so the sized fee matches the real tx's serialized byte length. Returns
 /// `base` untouched when there is no shielded funding.
-pub(super) fn splice_mock_shielded_for_sizing(
+pub(crate) fn splice_mock_shielded_for_sizing(
     base: &StandardTransaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>,
     crypto_provider: &MidnightCryptoProvider,
     shielded: &ShieldedFundingPlan,

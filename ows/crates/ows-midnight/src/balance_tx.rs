@@ -48,7 +48,7 @@ use ows_core::sync_cache::SyncCacheScope;
 use crate::{TokenType, UnshieldedUtxo};
 
 mod fee_sizing;
-pub(crate) use fee_sizing::size_merge_dust_fee;
+pub(crate) use fee_sizing::{size_merge_dust_fee, splice_mock_shielded_for_sizing};
 use fee_sizing::{DustFeeContext, DustFeePlan};
 
 type TxProven = Transaction<MnSig, ProofMarker, PedersenRandomness, InMemoryDB>;
@@ -662,6 +662,22 @@ impl BalancedPlan {
     }
 }
 
+/// The wallet-relative DUST effect for a fee that burns `dust_outflow` — a negative diff in the `dust`
+/// domain keyed by the wallet's dust address — or `None` when the fee burns nothing. The single source
+/// for the dust effect's shape, shared by the balancer's [`plan_effects`] and the sealed-merge effects.
+pub(crate) fn dust_outflow_effect(
+    dust_address: String,
+    dust_outflow: u128,
+) -> Option<TransactionEffect> {
+    (dust_outflow != 0).then(|| TransactionEffect {
+        address: dust_address,
+        diff: vec![(
+            "dust".to_string(),
+            clamp_i128_to_i64(-(dust_outflow as i128)),
+        )],
+    })
+}
+
 /// Compute the wallet-relative net effects from a balanced plan's already-decided parts. Pure over its
 /// inputs (no key, no network), so it is the unit-tested core of [`BalancedPlan::effects`]:
 ///
@@ -724,14 +740,8 @@ fn plan_effects(
             diff: shielded_diff,
         });
     }
-    if dust_outflow != 0 {
-        effects.push(TransactionEffect {
-            address: addresses.dust.clone(),
-            diff: vec![(
-                "dust".to_string(),
-                clamp_i128_to_i64(-(dust_outflow as i128)),
-            )],
-        });
+    if let Some(effect) = dust_outflow_effect(addresses.dust.clone(), dust_outflow) {
+        effects.push(effect);
     }
     effects
 }
