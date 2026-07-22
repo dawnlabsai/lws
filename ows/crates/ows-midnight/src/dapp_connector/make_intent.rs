@@ -33,7 +33,9 @@ use std::collections::BTreeMap;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
-use midnight_coin_structure::coin::{Info as CoinInfo, QualifiedInfo, ShieldedTokenType};
+use midnight_coin_structure::coin::{
+    Info as CoinInfo, QualifiedInfo, ShieldedTokenType, UserAddress,
+};
 use midnight_ledger::structure::{
     Intent, ProofMarker, ProofPreimageMarker, StandardTransaction, Transaction, UnshieldedOffer,
     UtxoOutput, UtxoSpend,
@@ -357,40 +359,10 @@ fn build_unshielded_offer(
             sender_addr,
             &Default::default(),
         ))?;
-        for d in inputs_requested {
-            if d.value == 0 {
-                return Err(err("desired input value must be greater than zero"));
-            }
-            let wire = parse_token_type(Some(&d.token_type))?.to_wire_token_type();
-            let type_ = wire_type_to_unshielded(&d.token_type)?;
-            let selected = crate::balance_tx::select_utxos_for_token(
-                &utxos,
-                sender_addr,
-                sender_vk,
-                &wire,
-                d.value,
-            )?;
-            let mut total = 0u128;
-            for u in &selected {
-                total = total.saturating_add(u.value);
-                inputs.push(UtxoSpend {
-                    value: u.value,
-                    owner: crate::balance_tx::resolve_owner_vk(&u.owner, sender_addr, sender_vk)?,
-                    type_,
-                    intent_hash: crate::balance_tx::parse_intent_hash_hex(&u.intent_hash)?,
-                    output_no: u32::try_from(u.output_index)
-                        .map_err(|_| err("output index out of range"))?,
-                });
-            }
-            let change = total.saturating_sub(d.value);
-            if change > 0 {
-                outputs.push(UtxoOutput {
-                    value: change,
-                    owner: maker,
-                    type_,
-                });
-            }
-        }
+        let (mut selected_inputs, mut change_outputs) =
+            select_unshielded_inputs(&utxos, inputs_requested, sender_addr, sender_vk, maker)?;
+        inputs.append(&mut selected_inputs);
+        outputs.append(&mut change_outputs);
     }
 
     for d in outputs_requested {
@@ -411,6 +383,66 @@ fn build_unshielded_offer(
         outputs: outputs.into(),
         signatures: vec![].into(),
     }))
+}
+
+/// Select the maker's unshielded input coins for each requested input from `utxos`, plus the per-row
+/// whole-coin change back to `maker`.
+///
+/// A `claimed` set threads across rows so a coin picked for one row is excluded from the next — without
+/// it, two rows of the same token both select the same largest coin and the offer double-spends it (the
+/// balancer's `build_night_offer` uses the same guard). Pure over `utxos` — no network — so it is unit
+/// testable.
+fn select_unshielded_inputs(
+    utxos: &[crate::UnshieldedUtxo],
+    inputs_requested: &[&DesiredInput],
+    sender_addr: &str,
+    sender_vk: &VerifyingKey,
+    maker: UserAddress,
+) -> Result<(Vec<UtxoSpend>, Vec<UtxoOutput>), std::io::Error> {
+    let mut inputs: Vec<UtxoSpend> = Vec::new();
+    let mut change: Vec<UtxoOutput> = Vec::new();
+    let mut claimed: Vec<(String, i64)> = Vec::new();
+    for d in inputs_requested {
+        if d.value == 0 {
+            return Err(err("desired input value must be greater than zero"));
+        }
+        let wire = parse_token_type(Some(&d.token_type))?.to_wire_token_type();
+        let type_ = wire_type_to_unshielded(&d.token_type)?;
+        let available: Vec<crate::UnshieldedUtxo> = utxos
+            .iter()
+            .filter(|u| !claimed.contains(&(u.intent_hash.clone(), u.output_index)))
+            .cloned()
+            .collect();
+        let selected = crate::balance_tx::select_utxos_for_token(
+            &available,
+            sender_addr,
+            sender_vk,
+            &wire,
+            d.value,
+        )?;
+        let mut total = 0u128;
+        for u in &selected {
+            claimed.push((u.intent_hash.clone(), u.output_index));
+            total = total.saturating_add(u.value);
+            inputs.push(UtxoSpend {
+                value: u.value,
+                owner: crate::balance_tx::resolve_owner_vk(&u.owner, sender_addr, sender_vk)?,
+                type_,
+                intent_hash: crate::balance_tx::parse_intent_hash_hex(&u.intent_hash)?,
+                output_no: u32::try_from(u.output_index)
+                    .map_err(|_| err("output index out of range"))?,
+            });
+        }
+        let owed = total.saturating_sub(d.value);
+        if owed > 0 {
+            change.push(UtxoOutput {
+                value: owed,
+                owner: maker,
+                type_,
+            });
+        }
+    }
+    Ok((inputs, change))
 }
 
 /// Build a Zswap offer of shielded outputs to their recipients, bound to `segment`.
@@ -447,6 +479,50 @@ fn build_shielded_output_offer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_base_crypto::signatures::SigningKey as MidnightSigningKey;
+
+    /// A sender-owned NIGHT UTXO. `owner == "sender"` matches the sender address directly (no vk hex
+    /// needed), and `token_type` is the NIGHT wire (32 zero bytes).
+    fn night_utxo(value: u128, ih_byte: u8, out_idx: i64) -> crate::UnshieldedUtxo {
+        crate::UnshieldedUtxo {
+            token_type: "00".repeat(32),
+            value,
+            intent_hash: hex::encode([ih_byte; 32]),
+            output_index: out_idx,
+            owner: "sender".to_string(),
+            ctime_unix_secs: Some(1_000),
+            registered_for_dust_generation: false,
+        }
+    }
+
+    fn night_input(value: u128) -> DesiredInput {
+        DesiredInput {
+            kind: TransferKind::Unshielded,
+            token_type: "night".to_string(),
+            value,
+        }
+    }
+
+    /// Two `desiredInputs` rows for the same token must select DISTINCT coins: the `claimed` set stops
+    /// the second row from re-picking the first row's coin, which would double-spend it.
+    #[test]
+    fn same_token_desired_inputs_claim_disjoint_coins() {
+        let seed = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let vk = MidnightSigningKey::from_bytes(&hex::decode(seed).unwrap())
+            .unwrap()
+            .verifying_key();
+        // Two equal NIGHT coins; each row needs one coin's worth.
+        let pool = vec![night_utxo(100, 1, 0), night_utxo(100, 2, 1)];
+        let d1 = night_input(60);
+        let d2 = night_input(60);
+        let (inputs, _change) =
+            select_unshielded_inputs(&pool, &[&d1, &d2], "sender", &vk, vk.clone().into()).unwrap();
+        assert_eq!(inputs.len(), 2, "one coin selected per row");
+        assert_ne!(
+            inputs[0].output_no, inputs[1].output_no,
+            "the two rows must not double-select the same coin"
+        );
+    }
 
     #[test]
     fn parses_inputs_outputs_and_defaults() {
