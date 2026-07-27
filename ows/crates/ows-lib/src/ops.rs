@@ -366,6 +366,10 @@ pub fn import_wallet_private_key(
             getrandom::getrandom(&mut random_bip32).map_err(|e| {
                 OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
             })?;
+            let mut random_ed25519 = vec![0u8; 32];
+            getrandom::getrandom(&mut random_ed25519).map_err(|e| {
+                OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
+            })?;
 
             match source_curve {
                 ows_signer::Curve::Secp256k1 => KeyPair {
@@ -392,11 +396,7 @@ pub fn import_wallet_private_key(
                     ed25519: ed25519_key_hex
                         .map(decode_hex_key)
                         .transpose()?
-                        .unwrap_or_else(|| {
-                            let mut k = vec![0u8; 32];
-                            let _ = getrandom::getrandom(&mut k);
-                            k
-                        }),
+                        .unwrap_or(random_ed25519),
                     ed25519_bip32: key_bytes,
                 },
             }

@@ -50,25 +50,9 @@ impl CardanoSigner {
     }
 
     /// Reconstruct an `XPrv` from the 64-byte extended private key produced by CIP-1852
-    /// derivation. Chain code is set to zeroes because it is not needed for signing or
-    /// public-key derivation — only the scalar (kL) and extension (kR) matter.
-    ///
-    /// The scalar (kL, first 32 bytes) is clamped per the BIP32-Ed25519 spec so that
-    /// the XPrv construction never panics regardless of the key source.
+    /// derivation. See [`xprv_from_extended_bytes`].
     fn xprv_from_extended(extended_key: &[u8]) -> Result<XPrv, SignerError> {
-        if extended_key.len() != 64 {
-            return Err(SignerError::InvalidPrivateKey(format!(
-                "Cardano requires a 64-byte extended private key, got {}",
-                extended_key.len()
-            )));
-        }
-        let mut sk = [0u8; 64];
-        sk.copy_from_slice(extended_key);
-        // Clamp kL per BIP32-Ed25519 / CIP-1852 so the scalar is always valid.
-        sk[0] &= 0b1111_1000;
-        sk[31] &= 0b0001_1111;
-        sk[31] |= 0b0100_0000;
-        Ok(XPrv::from_extended_and_chaincode(&sk, &[0u8; 32]))
+        xprv_from_extended_bytes(extended_key)
     }
 
     /// Compute the blake2b-224 hash (28 bytes) of the given data.
@@ -279,13 +263,7 @@ pub fn payment_key_path(account: u32, index: u32) -> String {
 /// Reward address = header_byte || blake2b-224(stake_pubkey)
 /// Header: 0b1110_0000 | network_tag (0xE1 mainnet, 0xE0 testnet)
 pub fn reward_address(stake_key: &[u8], mainnet: bool) -> Result<String, SignerError> {
-    if stake_key.len() != 64 {
-        return Err(SignerError::InvalidPrivateKey(
-            "stake key must be 64-byte extended private key".into(),
-        ));
-    }
-    let sk: &[u8; 64] = stake_key.try_into().unwrap();
-    let xprv = XPrv::from_extended_and_chaincode(sk, &[0u8; 32]);
+    let xprv = xprv_from_extended_bytes(stake_key)?;
     let pub_key = xprv.public();
     let pub_key_bytes = pub_key.public_key_bytes();
 
@@ -312,15 +290,33 @@ pub fn reward_address(stake_key: &[u8], mainnet: bool) -> Result<String, SignerE
 ///
 /// Used internally to step from the account key to payment/staking key.
 pub fn derive_child_soft(extended_key: &[u8], index: u32) -> Result<Vec<u8>, SignerError> {
-    if extended_key.len() != 64 {
-        return Err(SignerError::InvalidPrivateKey(
-            "expected 64-byte extended private key".into(),
-        ));
-    }
-    let sk: &[u8; 64] = extended_key.try_into().unwrap();
-    let parent = XPrv::from_extended_and_chaincode(sk, &[0u8; 32]);
+    let parent = xprv_from_extended_bytes(extended_key)?;
     let child = parent.derive(DerivationScheme::V2, index);
     Ok(child.extended_secret_key_bytes().to_vec())
+}
+
+/// Reconstruct an `XPrv` from a 64-byte extended private key. Chain code is set to
+/// zeroes because it is not needed for signing or public-key derivation — only the
+/// scalar (kL) and extension (kR) matter.
+///
+/// The scalar (kL, first 32 bytes) is clamped per the BIP32-Ed25519 spec so that the
+/// XPrv construction never panics and always yields a valid Ed25519 scalar,
+/// regardless of the key source. All XPrv construction from raw bytes must go
+/// through this helper so addresses and signatures stay consistent.
+fn xprv_from_extended_bytes(extended_key: &[u8]) -> Result<XPrv, SignerError> {
+    if extended_key.len() != 64 {
+        return Err(SignerError::InvalidPrivateKey(format!(
+            "Cardano requires a 64-byte extended private key, got {}",
+            extended_key.len()
+        )));
+    }
+    let mut sk = [0u8; 64];
+    sk.copy_from_slice(extended_key);
+    // Clamp kL per BIP32-Ed25519 / CIP-1852 so the scalar is always valid.
+    sk[0] &= 0b1111_1000;
+    sk[31] &= 0b0001_1111;
+    sk[31] |= 0b0100_0000;
+    Ok(XPrv::from_extended_and_chaincode(&sk, &[0u8; 32]))
 }
 
 #[cfg(test)]
@@ -570,5 +566,27 @@ mod tests {
             addr.starts_with("stake_test1"),
             "testnet reward address must start with 'stake_test1', got: {addr}"
         );
+    }
+
+    #[test]
+    fn test_reward_address_clamps_malformed_key() {
+        // A key with no BIP32-Ed25519 clamp bits set must not panic and must
+        // produce the same address as its pre-clamped equivalent, keeping
+        // address derivation consistent with the (clamping) signing path.
+        let unclamped = [0xFFu8; 64];
+        let mut clamped = unclamped;
+        clamped[0] &= 0b1111_1000;
+        clamped[31] &= 0b0001_1111;
+        clamped[31] |= 0b0100_0000;
+        assert_eq!(
+            reward_address(&unclamped, true).unwrap(),
+            reward_address(&clamped, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_derive_child_soft_rejects_bad_length() {
+        assert!(derive_child_soft(&[0u8; 32], 0).is_err());
+        assert!(reward_address(&[0u8; 32], true).is_err());
     }
 }
