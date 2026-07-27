@@ -22,3 +22,13 @@ Get test USDC on Base Sepolia: https://faucet.circle.com
     node examples/x402-pay-request.js
     node examples/x402-discover-services.js
     node examples/agent-with-policy.js
+
+## Community Extensions
+
+Projects that extend the OWS policy engine for a specific use case:
+
+| Project | Extends | Description |
+|---|---|---|
+| [ZKX](https://github.com/TechCortes/ZKX-Zero-Knowledge-Proof-for-Agentic-Banking) | Policy Engine | Registers a `zkx:kyc` feature — anonymous micropayments under a FATF Rec. 16 threshold, Groth16 zero-knowledge proof of identity above it. No PII ever collected or transmitted. |
+
+Building something on OWS? Open a PR adding it here.
