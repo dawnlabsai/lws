@@ -3,7 +3,7 @@ use crate::traits::{ChainSigner, SignOutput, SignerError};
 use bech32::{Bech32, Hrp};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use ed25519_bip32::{DerivationScheme, XPrv};
+use ed25519_bip32::XPrv;
 use ows_core::ChainType;
 
 /// Cardano network tag used in address header byte.
@@ -286,18 +286,13 @@ pub fn reward_address(stake_key: &[u8], mainnet: bool) -> Result<String, SignerE
         .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))
 }
 
-/// Derive a child key one level deeper using V2 derivation (soft).
-///
-/// Used internally to step from the account key to payment/staking key.
-pub fn derive_child_soft(extended_key: &[u8], index: u32) -> Result<Vec<u8>, SignerError> {
-    let parent = xprv_from_extended_bytes(extended_key)?;
-    let child = parent.derive(DerivationScheme::V2, index);
-    Ok(child.extended_secret_key_bytes().to_vec())
-}
-
 /// Reconstruct an `XPrv` from a 64-byte extended private key. Chain code is set to
 /// zeroes because it is not needed for signing or public-key derivation — only the
-/// scalar (kL) and extension (kR) matter.
+/// scalar (kL) and extension (kR) matter. Child derivation is deliberately NOT
+/// offered on keys reconstructed this way: BIP32-Ed25519 child derivation is keyed
+/// by the chain code, and a zero chain code would make sibling public keys
+/// enumerable from a single exposed public key. Path derivation happens in
+/// `HdDeriver`, which carries the real chain code.
 ///
 /// The scalar (kL, first 32 bytes) is clamped per the BIP32-Ed25519 spec so that the
 /// XPrv construction never panics and always yields a valid Ed25519 scalar,
@@ -585,8 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_child_soft_rejects_bad_length() {
-        assert!(derive_child_soft(&[0u8; 32], 0).is_err());
+    fn test_reward_address_rejects_bad_length() {
         assert!(reward_address(&[0u8; 32], true).is_err());
     }
 }
