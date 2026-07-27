@@ -1,6 +1,15 @@
 const { getWallet, signMessage, signTypedData, signTransaction } = require("@open-wallet-standard/core");
 const { toAccount } = require("viem/accounts");
 
+// Encode a bigint as the core's EIP-712 parser expects a uint value: even-length
+// hex. Decimal uints above 2^128 are rejected, and hex must have an even number
+// of digits. Negative values fall back to decimal (int types).
+function bigintToOwsHex(value) {
+  if (value < 0n) return value.toString();
+  const hex = value.toString(16);
+  return `0x${hex.length % 2 === 1 ? `0${hex}` : hex}`;
+}
+
 function owsToViemAccount(walletNameOrId, options = {}) {
   const chain = options.chain ?? "eip155:1";
   const wallet = getWallet(walletNameOrId, options.vaultPath);
@@ -33,7 +42,23 @@ function owsToViemAccount(walletNameOrId, options = {}) {
       return serializeTransaction(transaction, { r, s, yParity });
     },
     async signTypedData(typedData) {
-      const result = signTypedData(walletNameOrId, chain, JSON.stringify(typedData), options.passphrase, options.index, options.vaultPath);
+      const { getTypesForEIP712Domain } = require("viem");
+      // viem's signTypedData action adds EIP712Domain to `types` before calling an
+      // account; a direct account.signTypedData() call does not. Add it when absent
+      // so the core resolves the domain type. A caller-supplied EIP712Domain wins.
+      const payload = {
+        ...typedData,
+        types: {
+          EIP712Domain: getTypesForEIP712Domain({ domain: typedData.domain }),
+          ...typedData.types,
+        },
+      };
+      // The core parses the JSON payload and expects uint values as even-length hex.
+      // JSON.stringify cannot serialize bigints, so encode them here.
+      const json = JSON.stringify(payload, (_key, value) =>
+        typeof value === "bigint" ? bigintToOwsHex(value) : value
+      );
+      const result = signTypedData(walletNameOrId, chain, json, options.passphrase, options.index, options.vaultPath);
       return result.signature.startsWith("0x") ? result.signature : `0x${result.signature}`;
     },
   });

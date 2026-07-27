@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWallet, getWallet, signMessage as owsSignMessage } from '@open-wallet-standard/core';
+import { createWallet, getWallet, signMessage as owsSignMessage, importWalletPrivateKey } from '@open-wallet-standard/core';
+import { privateKeyToAccount } from 'viem/accounts';
 import { owsToViemAccount } from '../src/viem.js';
 
 describe('@open-wallet-standard/adapters — viem', () => {
@@ -58,6 +59,27 @@ describe('@open-wallet-standard/adapters — viem', () => {
     const account = owsToViemAccount(walletName, { vaultPath: vaultDir });
     const td = { domain: { name: 'T', version: '1', chainId: '1', verifyingContract: '0x0000000000000000000000000000000000000001' }, types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], M: [{ name: 'c', type: 'string' }] }, primaryType: 'M', message: { c: 'D' } };
     assert.equal(await account.signTypedData(td), await account.signTypedData(td));
+  });
+  it('signTypedData matches viem for a uint256-bearing message', async () => {
+    // A wallet imported from a known key so the signature can be compared to
+    // viem's own privateKeyToAccount. The message carries uint256 bigints and
+    // omits EIP712Domain, matching how a real viem walletClient signs.
+    const pkVault = mkdtempSync(join(tmpdir(), 'ows-viem-pk-'));
+    const pk = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+    importWalletPrivateKey('viem-pk-test', pk.slice(2), undefined, pkVault, 'evm');
+    const account = owsToViemAccount('viem-pk-test', { chain: 'eip155:1', vaultPath: pkVault });
+    const reference = privateKeyToAccount(pk);
+    const typedData = {
+      domain: { name: 'Test', version: '1', chainId: 1, verifyingContract: '0x0000000000000000000000000000000000000001' },
+      types: { Msg: [{ name: 'id', type: 'uint256' }, { name: 'ids', type: 'uint256[]' }] },
+      primaryType: 'Msg',
+      message: { id: 2n ** 200n, ids: [0n, 1n, 2n ** 256n - 1n] },
+    };
+    try {
+      assert.equal(await account.signTypedData(typedData), await reference.signTypedData(typedData));
+    } finally {
+      rmSync(pkVault, { recursive: true, force: true });
+    }
   });
   it('signTransaction returns RLP-encoded signed transaction', async () => {
     const account = owsToViemAccount(walletName, { vaultPath: vaultDir });
