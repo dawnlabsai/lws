@@ -77,11 +77,25 @@ impl Drop for KeyPair {
 
 impl KeyPair {
     /// Get the key for a given curve.
-    fn key_for_curve(&self, curve: ows_signer::Curve) -> &[u8] {
+    ///
+    /// Errors for `Ed25519Bip32` when the wallet predates Cardano support and
+    /// has no such key — a fabricated fallback key would be predictable and
+    /// any funds sent to its addresses stealable.
+    fn key_for_curve(&self, curve: ows_signer::Curve) -> Result<&[u8], OwsLibError> {
         match curve {
-            ows_signer::Curve::Secp256k1 => &self.secp256k1,
-            ows_signer::Curve::Ed25519 => &self.ed25519,
-            ows_signer::Curve::Ed25519Bip32 => &self.ed25519_bip32,
+            ows_signer::Curve::Secp256k1 => Ok(&self.secp256k1),
+            ows_signer::Curve::Ed25519 => Ok(&self.ed25519),
+            ows_signer::Curve::Ed25519Bip32 => {
+                if self.ed25519_bip32.is_empty() {
+                    Err(OwsLibError::InvalidInput(
+                        "this wallet was created before Cardano support and has no \
+                         Ed25519-BIP32 key; re-import the wallet to enable Cardano"
+                            .into(),
+                    ))
+                } else {
+                    Ok(&self.ed25519_bip32)
+                }
+            }
         }
     }
 
@@ -109,12 +123,14 @@ impl KeyPair {
         let ed = obj["ed25519"]
             .as_str()
             .ok_or_else(|| OwsLibError::InvalidInput("missing ed25519 key".into()))?;
-        // Optional — absent in wallets created before Cardano support.
+        // Optional — absent in wallets created before Cardano support. Kept
+        // empty in that case; Cardano operations on such wallets fail with an
+        // actionable error instead of using a predictable placeholder key.
         let ed25519_bip32 = if let Some(hex_str) = obj["ed25519_bip32"].as_str() {
             hex::decode(hex_str)
                 .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519_bip32 hex: {e}")))?
         } else {
-            vec![0u8; 64]
+            Vec::new()
         };
         Ok(KeyPair {
             secp256k1: hex::decode(secp)
@@ -131,7 +147,11 @@ fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, O
     let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
     for ct in &ALL_CHAIN_TYPES {
         let signer = signer_for_chain(*ct);
-        let key = keys.key_for_curve(signer.curve());
+        // Legacy wallets have no Ed25519-BIP32 key; skip those chains rather
+        // than derive addresses from a placeholder.
+        let Ok(key) = keys.key_for_curve(signer.curve()) else {
+            continue;
+        };
         let address = signer.derive_address(key)?;
         let chain = default_chain_for_type(*ct);
         accounts.push(WalletAccount {
@@ -168,7 +188,7 @@ pub(crate) fn secret_to_signing_key(
             // JSON key pair — extract the right key for this chain's curve
             let keys = KeyPair::from_json_bytes(secret.expose())?;
             let signer = signer_for_chain(chain_type);
-            Ok(SecretBytes::from_slice(keys.key_for_curve(signer.curve())))
+            Ok(SecretBytes::from_slice(keys.key_for_curve(signer.curve())?))
         }
     }
 }
@@ -1197,6 +1217,30 @@ mod tests {
     use super::*;
     use ows_core::OwsError;
 
+    #[test]
+    fn legacy_keypair_without_bip32_key_refuses_cardano() {
+        // Wallet JSON from before Cardano support: no ed25519_bip32 field.
+        let legacy = serde_json::json!({
+            "secp256k1": hex::encode([7u8; 32]),
+            "ed25519": hex::encode([9u8; 32]),
+        })
+        .to_string();
+        let keys = KeyPair::from_json_bytes(legacy.as_bytes()).unwrap();
+
+        // Non-Cardano curves still work.
+        assert!(keys.key_for_curve(ows_signer::Curve::Secp256k1).is_ok());
+        assert!(keys.key_for_curve(ows_signer::Curve::Ed25519).is_ok());
+
+        // The missing key must be an error, never a predictable placeholder.
+        assert!(keys.key_for_curve(ows_signer::Curve::Ed25519Bip32).is_err());
+
+        // Account derivation skips Cardano instead of failing or deriving
+        // an address from a known key.
+        let accounts = derive_all_accounts_from_keys(&keys).unwrap();
+        assert!(accounts.iter().all(|a| !a.chain_id.starts_with("cardano:")));
+        assert!(accounts.iter().any(|a| a.chain_id.starts_with("eip155:")));
+    }
+
     // ---- helpers ----
 
     /// Build a private-key wallet directly in the vault, bypassing
@@ -1209,14 +1253,16 @@ mod tests {
     ) -> WalletInfo {
         let key_bytes = hex::decode(privkey_hex).unwrap();
 
-        // Generate a random ed25519 key for the other curve
+        // Generate random keys for the other curves
         let mut ed_key = vec![0u8; 32];
         getrandom::getrandom(&mut ed_key).unwrap();
+        let mut bip32_key = vec![0u8; 64];
+        getrandom::getrandom(&mut bip32_key).unwrap();
 
         let keys = KeyPair {
             secp256k1: key_bytes,
             ed25519: ed_key,
-            ed25519_bip32: vec![0u8; 64],
+            ed25519_bip32: bip32_key,
         };
         let accounts = derive_all_accounts_from_keys(&keys).unwrap();
         let payload = keys.to_json_bytes();
