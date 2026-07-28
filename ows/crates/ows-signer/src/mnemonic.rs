@@ -1,5 +1,5 @@
 use crate::zeroizing::SecretBytes;
-use coins_bip39::{English, Mnemonic as Bip39Mnemonic};
+use coins_bip39::{English, Mnemonic as Bip39Mnemonic, Wordlist};
 
 /// Mnemonic strength / word count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,33 @@ impl Mnemonic {
             .to_seed(pass)
             .expect("seed derivation should not fail");
         SecretBytes::new(seed.to_vec())
+    }
+
+    /// Recover the raw BIP-39 entropy bytes encoded by this mnemonic.
+    ///
+    /// Each word encodes 11 bits; the trailing `word_count / 3` bits are the
+    /// checksum and are discarded. Needed by Cardano's Icarus (CIP-3) master
+    /// key generation, which is keyed on the entropy rather than the seed.
+    pub fn to_entropy(&self) -> SecretBytes {
+        let mut phrase = self.inner.to_phrase();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        let entropy_bits = words.len() * 11 - words.len() / 3;
+        let mut entropy = vec![0u8; entropy_bits / 8];
+        let mut bit = 0usize;
+        for word in &words {
+            let index = English::get_index(word).expect("phrase was validated on construction");
+            for i in (0..11).rev() {
+                if bit == entropy_bits {
+                    break;
+                }
+                if (index >> i) & 1 == 1 {
+                    entropy[bit / 8] |= 1 << (7 - (bit % 8));
+                }
+                bit += 1;
+            }
+        }
+        zeroize::Zeroize::zeroize(unsafe { phrase.as_mut_vec() });
+        SecretBytes::new(entropy)
     }
 
     /// Returns the number of words in this mnemonic.

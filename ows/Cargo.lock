@@ -1750,6 +1750,7 @@ dependencies = [
  "k256",
  "libc",
  "ows-core",
+ "pbkdf2",
  "rand 0.8.5",
  "ripemd",
  "scrypt",

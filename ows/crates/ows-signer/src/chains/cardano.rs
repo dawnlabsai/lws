@@ -600,6 +600,54 @@ mod tests {
         assert!(reward_address(&[0u8; 32], true).is_err());
     }
 
+    // === Cross-implementation vectors ===
+    // Generated with @emurgo/cardano-serialization-lib-nodejs 12.x:
+    // Bip32PrivateKey.from_bip39_entropy(entropy, "") → 1852'/1815'/0' → role/index,
+    // EnterpriseAddress / RewardAddress. Any mismatch here means addresses are
+    // incompatible with mainstream Cardano wallets (Daedalus, Yoroi, Eternl, Lucid).
+
+    #[test]
+    fn test_addresses_match_cardano_serialization_lib() {
+        let cases = [
+            (
+                ABANDON_PHRASE,
+                "addr1vy8ac7qqy0vtulyl7wntmsxc6wex80gvcyjy33qffrhm7ss7lxrqp",
+                "addr_test1vq8ac7qqy0vtulyl7wntmsxc6wex80gvcyjy33qffrhm7ss9hjl0y",
+                "stake1u8j40zgr2gy4788kl54h6x3gu0pukq5lfr8nflufpg5dzaskqlx2l",
+            ),
+            (
+                "eight country switch draw meat scout mystery blade tip drift \
+                 useless good keep usage title",
+                "addr1vyv7qlaucathxkwkc503ujw0rv9lfj2rkj96feyst2rs9eqmvfvmx",
+                "addr_test1vqv7qlaucathxkwkc503ujw0rv9lfj2rkj96feyst2rs9eqqyas5r",
+                "stake1ux2436tfe25727kul3qtnyr7k72rvw6ep7h59ll53suwhzq05v5j9",
+            ),
+        ];
+        for (phrase, mainnet_addr, testnet_addr, stake_addr) in cases {
+            let mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+            let key = derive_payment_key(&mnemonic);
+            assert_eq!(
+                CardanoSigner::mainnet().derive_address(&key).unwrap(),
+                mainnet_addr
+            );
+            assert_eq!(
+                CardanoSigner::testnet().derive_address(&key).unwrap(),
+                testnet_addr
+            );
+            let stake_key = HdDeriver::derive_from_mnemonic(
+                &mnemonic,
+                "",
+                &staking_key_path(0),
+                Curve::Ed25519Bip32,
+            )
+            .unwrap();
+            assert_eq!(
+                reward_address(stake_key.expose(), true).unwrap(),
+                stake_addr
+            );
+        }
+    }
+
     #[test]
     fn test_sign_message_is_domain_separated_from_transaction_signing() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
