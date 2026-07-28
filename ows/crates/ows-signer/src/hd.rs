@@ -36,6 +36,15 @@ impl HdDeriver {
         match curve {
             Curve::Secp256k1 => Self::derive_secp256k1(seed, path),
             Curve::Ed25519 => Self::derive_ed25519(seed, path),
+            // Icarus (CIP-3) is keyed on the mnemonic ENTROPY, which cannot be
+            // recovered from the BIP-39 seed. Deriving Cardano keys from the
+            // seed would produce addresses incompatible with the rest of the
+            // Cardano ecosystem, so it is refused here.
+            Curve::Ed25519Bip32 => Err(HdError::DerivationFailed(
+                "Cardano (Icarus/CIP-3) derivation requires the mnemonic; \
+                 use derive_from_mnemonic"
+                    .into(),
+            )),
         }
     }
 
@@ -46,8 +55,17 @@ impl HdDeriver {
         path: &str,
         curve: Curve,
     ) -> Result<SecretBytes, HdError> {
-        let seed = mnemonic.to_seed(passphrase);
-        Self::derive(seed.expose(), path, curve)
+        match curve {
+            Curve::Ed25519Bip32 => {
+                Self::validate_path(path)?;
+                let entropy = mnemonic.to_entropy();
+                Self::derive_cardano_icarus(entropy.expose(), passphrase, path)
+            }
+            _ => {
+                let seed = mnemonic.to_seed(passphrase);
+                Self::derive(seed.expose(), path, curve)
+            }
+        }
     }
 
     /// Like `derive_from_mnemonic`, but checks the global key cache first.
@@ -72,6 +90,7 @@ impl HdDeriver {
         hasher.update(match curve {
             Curve::Secp256k1 => b"secp256k1" as &[u8],
             Curve::Ed25519 => b"ed25519",
+            Curve::Ed25519Bip32 => b"ed25519-bip32",
         });
         let cache_key = hex::encode(hasher.finalize());
 
@@ -190,6 +209,77 @@ impl HdDeriver {
         chain_code.zeroize();
         Ok(SecretBytes::new(key))
     }
+
+    /// CIP-1852 / BIP32-Ed25519 derivation for Cardano using the Icarus
+    /// master key generation scheme (CIP-3), the standard used by Cardano
+    /// software wallets (Daedalus/Shelley, Yoroi, Eternl, Lucid, ...).
+    ///
+    /// Root key construction (CIP-3 "Icarus"):
+    /// - `PBKDF2-HMAC-SHA512(password = passphrase, salt = mnemonic entropy,
+    ///   iterations = 4096, output = 96 bytes)`
+    /// - Bit-tweak the first 32 bytes to a valid Ed25519 extended scalar
+    /// - Bytes 64..96 are the chain code
+    ///
+    /// Verified against the official CIP-3 test vectors (see tests below).
+    fn derive_cardano_icarus(
+        entropy: &[u8],
+        passphrase: &str,
+        path: &str,
+    ) -> Result<SecretBytes, HdError> {
+        use ed25519_bip32::{DerivationScheme, XPrv};
+        use zeroize::Zeroize;
+
+        let mut master = [0u8; 96];
+        pbkdf2::pbkdf2_hmac::<Sha512>(passphrase.as_bytes(), entropy, 4096, &mut master);
+
+        // Tweak the scalar (kL) per CIP-3:
+        //   - Clear bottom 3 bits of byte 0 (multiple of cofactor 8)
+        //   - Clear the highest and third-highest bits of byte 31
+        //   - Set the second-highest bit of byte 31
+        master[0] &= 0b1111_1000;
+        master[31] &= 0b0001_1111;
+        master[31] |= 0b0100_0000;
+
+        let extended_key: [u8; 64] = master[..64].try_into().unwrap();
+        let chain_code: [u8; 32] = master[64..96].try_into().unwrap();
+
+        let mut root = XPrv::from_extended_and_chaincode(&extended_key, &chain_code);
+        master.zeroize();
+
+        // --- Child derivation following CIP-1852 path ---
+        // Path format: m/purpose'/coin_type'/account'/role/index
+        // Example: m/1852'/1815'/0'/0/0
+        // DerivationIndex is u32; hardened indices have bit 31 set (0x80000000)
+        let components: Vec<(u32, bool)> = if path == "m" {
+            vec![]
+        } else {
+            path[2..]
+                .split('/')
+                .map(|c| {
+                    let hardened = c.ends_with('\'');
+                    let index_str = c.trim_end_matches('\'');
+                    let index: u32 = index_str
+                        .parse()
+                        .map_err(|_| HdError::InvalidPath(format!("invalid index: {}", c)))?;
+                    Ok((index, hardened))
+                })
+                .collect::<Result<Vec<_>, HdError>>()?
+        };
+
+        for (index, hardened) in &components {
+            let di: u32 = if *hardened {
+                0x8000_0000u32 | index
+            } else {
+                *index
+            };
+            let child = root.derive(DerivationScheme::V2, di);
+            root = child;
+        }
+
+        // Return the 64-byte extended private key (kL || kR), without chain code
+        let secret_bytes = root.extended_secret_key_bytes().to_vec();
+        Ok(SecretBytes::new(secret_bytes))
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +339,44 @@ mod tests {
                 .unwrap();
 
         assert_eq!(key1.expose(), key2.expose());
+    }
+
+    // === CIP-3 Icarus master key test vectors ===
+    // Source: https://github.com/cardano-foundation/CIPs/blob/master/CIP-0003/Icarus.md
+
+    const ICARUS_PHRASE: &str = "eight country switch draw meat scout mystery blade tip drift \
+         useless good keep usage title";
+
+    #[test]
+    fn test_cip3_icarus_master_key_no_passphrase() {
+        let mnemonic = Mnemonic::from_phrase(ICARUS_PHRASE).unwrap();
+        let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", "m", Curve::Ed25519Bip32).unwrap();
+        // First 64 bytes of the official 96-byte master key vector (kL || kR).
+        assert_eq!(
+            hex::encode(key.expose()),
+            "c065afd2832cd8b087c4d9ab7011f481ee1e0721e78ea5dd609f3ab3f156d245\
+             d176bd8fd4ec60b4731c3918a2a72a0226c0cd119ec35b47e4d55884667f552a"
+        );
+    }
+
+    #[test]
+    fn test_cip3_icarus_master_key_with_passphrase() {
+        let mnemonic = Mnemonic::from_phrase(ICARUS_PHRASE).unwrap();
+        let key =
+            HdDeriver::derive_from_mnemonic(&mnemonic, "foo", "m", Curve::Ed25519Bip32).unwrap();
+        assert_eq!(
+            hex::encode(key.expose()),
+            "70531039904019351e1afb361cd1b312a4d0565d4ff9f8062d38acf4b15cce41\
+             d7b5738d9c893feea55512a3004acb0d222c35d3e3d5cde943a15a9824cbac59"
+        );
+    }
+
+    #[test]
+    fn test_cardano_derive_from_seed_is_refused() {
+        let seed = test_seed();
+        assert!(
+            HdDeriver::derive(seed.expose(), "m/1852'/1815'/0'/0/0", Curve::Ed25519Bip32).is_err()
+        );
     }
 
     #[test]
