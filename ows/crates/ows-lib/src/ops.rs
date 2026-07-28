@@ -332,18 +332,16 @@ pub fn import_wallet_private_key(
     }
 
     let keys = match (secp256k1_key_hex, ed25519_key_hex) {
-        // Both curve keys explicitly provided — use them directly
-        (Some(secp_hex), Some(ed_hex)) => {
-            let mut random_bip32 = vec![0u8; 64];
-            getrandom::getrandom(&mut random_bip32).map_err(|e| {
-                OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
-            })?;
-            KeyPair {
-                secp256k1: decode_hex_key(secp_hex)?,
-                ed25519: decode_hex_key(ed_hex)?,
-                ed25519_bip32: random_bip32,
-            }
-        }
+        // Both curve keys explicitly provided — use them directly. No Cardano
+        // key is fabricated: a random ed25519_bip32 key would have no
+        // derivation relationship to any user-held secret, so ADA sent to its
+        // address would be unrecoverable if the vault were lost. Leaving it
+        // empty makes account derivation skip Cardano for this wallet.
+        (Some(secp_hex), Some(ed_hex)) => KeyPair {
+            secp256k1: decode_hex_key(secp_hex)?,
+            ed25519: decode_hex_key(ed_hex)?,
+            ed25519_bip32: Vec::new(),
+        },
         // Existing single-key behavior
         _ => {
             let key_bytes = decode_hex_key(private_key_hex)?;
@@ -357,13 +355,12 @@ pub fn import_wallet_private_key(
                 None => ows_signer::Curve::Secp256k1,
             };
 
-            // Build key pair: provided key for its curve, random bytes for the others.
+            // Build key pair: provided key for its curve, random bytes for the
+            // others. No Cardano key is fabricated unless one was supplied —
+            // a random ed25519_bip32 key would be unrecoverable from any
+            // user-held secret, so Cardano is skipped for these wallets.
             let mut other_key_32 = vec![0u8; 32];
             getrandom::getrandom(&mut other_key_32).map_err(|e| {
-                OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
-            })?;
-            let mut random_bip32 = vec![0u8; 64];
-            getrandom::getrandom(&mut random_bip32).map_err(|e| {
                 OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
             })?;
             let mut random_ed25519 = vec![0u8; 32];
@@ -378,7 +375,7 @@ pub fn import_wallet_private_key(
                         .map(decode_hex_key)
                         .transpose()?
                         .unwrap_or(other_key_32),
-                    ed25519_bip32: random_bip32,
+                    ed25519_bip32: Vec::new(),
                 },
                 ows_signer::Curve::Ed25519 => KeyPair {
                     secp256k1: secp256k1_key_hex
@@ -386,7 +383,7 @@ pub fn import_wallet_private_key(
                         .transpose()?
                         .unwrap_or(other_key_32),
                     ed25519: key_bytes,
-                    ed25519_bip32: random_bip32,
+                    ed25519_bip32: Vec::new(),
                 },
                 ows_signer::Curve::Ed25519Bip32 => KeyPair {
                     secp256k1: secp256k1_key_hex
@@ -1639,8 +1636,15 @@ mod tests {
 
         assert_eq!(
             info.accounts.len(),
-            ALL_CHAIN_TYPES.len(),
-            "should have one account per chain type"
+            ALL_CHAIN_TYPES.len() - 1,
+            "one account per chain type except Cardano, which is skipped \
+             because no recoverable ed25519_bip32 key exists for key imports"
+        );
+        assert!(
+            info.accounts
+                .iter()
+                .all(|a| !a.chain_id.starts_with("cardano:")),
+            "no Cardano account may be fabricated from an unrecoverable random key"
         );
 
         // Sign on EVM (secp256k1)

@@ -6,6 +6,13 @@ use blake2::Blake2bVar;
 use ed25519_bip32::XPrv;
 use ows_core::ChainType;
 
+/// Domain-separation prefix for `sign_message`. Ensures a signed message can
+/// never be byte-identical to a blake2b-256 transaction hash (the prefixed
+/// payload is always longer than 32 bytes and starts with ASCII that a raw
+/// hash context cannot require), so message signatures are structurally
+/// unusable as transaction witnesses.
+pub const CARDANO_MESSAGE_PREFIX: &[u8] = b"Cardano Signed Message:\n";
+
 /// Cardano network tag used in address header byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Network {
@@ -169,9 +176,18 @@ impl ChainSigner for CardanoSigner {
         self.sign(private_key, &tx_hash)
     }
 
-    /// Sign an arbitrary message (raw, no chain-specific prefix).
+    /// Sign an arbitrary message with a domain-separation prefix.
+    ///
+    /// The prefix guarantees the signed payload can never equal a raw
+    /// blake2b-256 transaction hash, so a "sign this message" request can
+    /// never yield a valid Cardano transaction witness. Verifiers must
+    /// prepend the same prefix. (Full CIP-8 / COSE_Sign1 enveloping is a
+    /// planned follow-up for wallet interoperability.)
     fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
-        self.sign(private_key, message)
+        let mut prefixed = Vec::with_capacity(CARDANO_MESSAGE_PREFIX.len() + message.len());
+        prefixed.extend_from_slice(CARDANO_MESSAGE_PREFIX);
+        prefixed.extend_from_slice(message);
+        self.sign(private_key, &prefixed)
     }
 
     /// Inject the witness set into the Cardano transaction.
@@ -582,5 +598,26 @@ mod tests {
     #[test]
     fn test_reward_address_rejects_bad_length() {
         assert!(reward_address(&[0u8; 32], true).is_err());
+    }
+
+    #[test]
+    fn test_sign_message_is_domain_separated_from_transaction_signing() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let key = derive_payment_key(&mnemonic);
+        let signer = CardanoSigner::mainnet();
+
+        // A phishing "message" that is exactly a 32-byte transaction hash
+        // must not produce the same signature the transaction path would,
+        // otherwise the message signature is a valid transaction witness.
+        let fake_tx_hash = [0xABu8; 32];
+        let message_sig = signer.sign_message(&key, &fake_tx_hash).unwrap();
+        let witness_sig = signer.sign(&key, &fake_tx_hash).unwrap();
+        assert_ne!(message_sig.signature, witness_sig.signature);
+
+        // The prefixed payload is what actually gets signed.
+        let mut prefixed = CARDANO_MESSAGE_PREFIX.to_vec();
+        prefixed.extend_from_slice(&fake_tx_hash);
+        let expected = signer.sign(&key, &prefixed).unwrap();
+        assert_eq!(message_sig.signature, expected.signature);
     }
 }
