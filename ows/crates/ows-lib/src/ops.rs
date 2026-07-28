@@ -1026,6 +1026,12 @@ fn broadcast_cardano(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLi
     let mut child = Command::new("curl")
         .args([
             "-fsSL",
+            // Restrict curl to HTTP(S) (including across redirects) so a
+            // hostile rpc_url cannot smuggle other schemes (file://, ftp://, ...).
+            "--proto",
+            "-all,http,https",
+            "--proto-redir",
+            "-all,http,https",
             "-X",
             "POST",
             "-H",
