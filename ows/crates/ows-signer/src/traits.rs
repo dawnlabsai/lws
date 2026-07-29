@@ -39,7 +39,30 @@ pub trait ChainSigner: Send + Sync {
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
 
     /// Sign an arbitrary message with chain-specific prefixing/hashing.
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
+    /// When `address` is `Some`, the implementation should call [`ChainSigner::verify_sign_message_address`] first.
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError>;
+
+    fn verify_sign_message_address(
+        &self,
+        private_key: &[u8],
+        address: Option<&str>,
+    ) -> Result<(), SignerError> {
+        let Some(expected) = address else {
+            return Ok(());
+        };
+        let derived = self.derive_address(private_key)?;
+        if derived.trim_start_matches("0x").to_lowercase()
+            != expected.trim_start_matches("0x").to_lowercase()
+        {
+            return Err(SignerError::AddressMismatch);
+        }
+        Ok(())
+    }
 
     /// Sign an unsigned transaction. Each chain hashes the raw transaction
     /// bytes according to its own rules before signing.
@@ -143,4 +166,7 @@ pub enum SignerError {
 
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
+
+    #[error("address does not match derived address")]
+    AddressMismatch,
 }

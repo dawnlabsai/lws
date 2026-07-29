@@ -69,7 +69,13 @@ impl ChainSigner for NearSigner {
         })
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // V1: raw ed25519 over message bytes (parity with Solana).
         // NEP-413 message signing (`tag 2147484061 || borsh(payload)`) is a
         // structurally distinct flow with required fields (recipient, nonce);
@@ -201,7 +207,7 @@ mod tests {
         let signer = NearSigner;
         let msg = b"hello near";
         let s1 = signer.sign(&rfc_seed(), msg).unwrap();
-        let s2 = signer.sign_message(&rfc_seed(), msg).unwrap();
+        let s2 = signer.sign_message(&rfc_seed(), msg, None).unwrap();
         assert_eq!(s1.signature, s2.signature);
     }
 

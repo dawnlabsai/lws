@@ -41,10 +41,10 @@ print(sig["signature"])
 | `delete_wallet(name_or_id, vault_path?)` | Delete a wallet |
 | `export_wallet(name_or_id, passphrase?, vault_path?)` | Export a wallet's mnemonic or keys |
 | `rename_wallet(name_or_id, new_name, vault_path?)` | Rename a wallet |
-| `sign_message(wallet, chain, message, passphrase?, encoding?, index?, vault_path?)` | Sign a message with chain-specific formatting |
+| `sign_message(wallet, chain, message, passphrase?, encoding?, index?, address?, vault_path?)` | Sign a message with chain-specific formatting |
 | `sign_hash(wallet, chain, hash_hex, passphrase?, index?, vault_path?)` | Sign a raw 32-byte hash on a secp256k1-backed chain |
 | `sign_authorization(wallet, chain, address, nonce, passphrase?, index?, vault_path?)` | Sign an EIP-7702 authorization tuple |
-| `sign_typed_data(wallet, chain, typed_data_json, passphrase?, index?, vault_path?)` | Sign EIP-712 typed data (EVM only) |
+| `sign_typed_data(wallet, chain, typed_data_json, passphrase?, index?, address?, vault_path?)` | Sign EIP-712 typed data (EVM only) |
 | `sign_transaction(wallet, chain, tx_hex, passphrase?, index?, vault_path?)` | Sign a raw transaction |
 | `sign_and_send(wallet, chain, tx_hex, passphrase?, index?, rpc_url?, vault_path?)` | Sign and broadcast a transaction |
 | `generate_mnemonic(words?)` | Generate a BIP-39 mnemonic phrase |

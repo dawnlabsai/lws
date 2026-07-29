@@ -135,6 +135,7 @@ pub fn import_wallet_private_key(
         vault_path(vault_path_opt).as_deref(),
         secp256k1_key.as_deref(),
         ed25519_key.as_deref(),
+        None,
     )
     .map(WalletInfo::from)
     .map_err(map_err)
@@ -226,6 +227,7 @@ pub fn sign_message(
     passphrase: Option<String>,
     encoding: Option<String>,
     index: Option<u32>,
+    address: Option<String>,
     vault_path_opt: Option<String>,
 ) -> Result<SignResult> {
     ows_lib::sign_message(
@@ -235,6 +237,7 @@ pub fn sign_message(
         passphrase.as_deref(),
         encoding.as_deref(),
         index,
+        address.as_deref(),
         vault_path(vault_path_opt).as_deref(),
     )
     .map(|r| SignResult {
@@ -252,6 +255,7 @@ pub fn sign_typed_data(
     typed_data_json: String,
     passphrase: Option<String>,
     index: Option<u32>,
+    address: Option<String>,
     vault_path_opt: Option<String>,
 ) -> Result<SignResult> {
     ows_lib::sign_typed_data(
@@ -260,6 +264,7 @@ pub fn sign_typed_data(
         &typed_data_json,
         passphrase.as_deref(),
         index,
+        address.as_deref(),
         vault_path(vault_path_opt).as_deref(),
     )
     .map(|r| SignResult {

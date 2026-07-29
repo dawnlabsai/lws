@@ -41,7 +41,7 @@ describe('@open-wallet-standard/adapters — viem', () => {
   it('signMessage matches OWS SDK direct call', async () => {
     const account = owsToViemAccount(walletName, { vaultPath: vaultDir });
     const adapterSig = await account.signMessage({ message: 'parity-check' });
-    const directResult = owsSignMessage(walletName, 'eip155:1', 'parity-check', undefined, undefined, undefined, vaultDir);
+    const directResult = owsSignMessage(walletName, 'eip155:1', 'parity-check', undefined, undefined, undefined, undefined, vaultDir);
     const directSig = directResult.signature.startsWith('0x') ? directResult.signature : `0x${directResult.signature}`;
     assert.equal(adapterSig, directSig);
   });

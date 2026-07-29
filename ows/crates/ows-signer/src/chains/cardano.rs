@@ -75,6 +75,7 @@ impl ChainSigner for CardanoSigner {
         &self,
         _private_key: &[u8],
         _message: &[u8],
+        _address: Option<&str>,
     ) -> Result<SignOutput, SignerError> {
         Err(SignerError::SigningFailed("not implemented".into()))
     }

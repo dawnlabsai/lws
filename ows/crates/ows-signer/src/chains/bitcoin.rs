@@ -263,7 +263,13 @@ impl ChainSigner for BitcoinSigner {
         self.sign(private_key, &hash)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // Bitcoin message signing: double-SHA256 of prefixed message
         let prefix = b"\x18Bitcoin Signed Message:\n";
         let mut data = Vec::new();
@@ -341,7 +347,7 @@ mod tests {
 
         // Message longer than 252 bytes requires multi-byte CompactSize varint
         let message = vec![0x42u8; 300];
-        let result = signer.sign_message(&privkey, &message).unwrap();
+        let result = signer.sign_message(&privkey, &message, None).unwrap();
 
         // Compute expected hash with CORRECT varint encoding:
         // CompactSize for 300: 0xFD followed by 300 as 2-byte LE (0x2C, 0x01)
@@ -375,7 +381,7 @@ mod tests {
 
         // 253 bytes: the exact boundary where single-byte varint becomes invalid
         let message = vec![0xAA; 253];
-        let result = signer.sign_message(&privkey, &message).unwrap();
+        let result = signer.sign_message(&privkey, &message, None).unwrap();
 
         let mut expected_data = Vec::new();
         expected_data.extend_from_slice(b"\x18Bitcoin Signed Message:\n");
@@ -433,7 +439,7 @@ mod tests {
 
         // Short message (< 253 bytes) uses single-byte varint
         let message = b"Hello Bitcoin!";
-        let result = signer.sign_message(&privkey, message).unwrap();
+        let result = signer.sign_message(&privkey, message, None).unwrap();
 
         let mut expected_data = Vec::new();
         expected_data.extend_from_slice(b"\x18Bitcoin Signed Message:\n");

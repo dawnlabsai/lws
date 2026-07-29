@@ -97,7 +97,7 @@ import { signMessage, signTransaction, signAndSend } from "@open-wallet-standard
 const sig = signMessage("my-wallet", "evm", "hello world");
 // sig.signature => hex string
 // sig.recoveryId => 0 or 1 (EVM/Tron only)
-// signMessage(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?)
+// signMessage(wallet, chain, message, passphrase?, encoding?, index?, address?, vaultPath?)
 
 // Sign transaction
 const txSig = signTransaction("my-wallet", "evm", "02f8...");
@@ -117,7 +117,7 @@ import { signTypedData } from "@open-wallet-standard/core";
 const sig = signTypedData("my-wallet", "evm", '{"types":...}');
 // sig.signature => hex string
 // sig.recoveryId => 0 or 1
-// signTypedData(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?)
+// signTypedData(wallet, chain, typedDataJson, passphrase?, index?, address?, vaultPath?)
 ```
 
 ## Policy Management

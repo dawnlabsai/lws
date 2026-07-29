@@ -103,7 +103,7 @@ ows wallet rename --wallet "my-wallet" --new-name "treasury"
 
 ### Signing
 
-The `--wallet` flag can also be set via `OWS_WALLET` env var. Use `--json` for structured output, `--index N` to select an HD account index.
+The `--wallet` flag can also be set via `OWS_WALLET` env var. Use `--json` for structured output, `--index N` to select an HD account index, and optional `--address` that will be used to sign the message (e.g. stake/base/enterprise address on Cardano).
 
 ```bash
 # Sign a message

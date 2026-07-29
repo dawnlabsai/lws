@@ -243,7 +243,7 @@ console.log(wallet3.accounts.length); // => 8
 
 ### Signing
 
-#### `signMessage(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?)`
+#### `signMessage(wallet, chain, message, passphrase?, encoding?, index?, address?, vaultPath?)`
 
 Sign a message with chain-specific formatting.
 
@@ -261,6 +261,7 @@ console.log(result.recoveryId); // 0 or 1
 | `passphrase` | `string` | `undefined` | Decryption passphrase |
 | `encoding` | `string` | `"utf8"` | `"utf8"` or `"hex"` |
 | `index` | `number` | `0` | Account index |
+| `address` | `string` | `undefined` | Optional address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano) |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
 
 **Returns:** `SignResult`
@@ -300,7 +301,7 @@ console.log(result.signature);
 console.log(result.recoveryId); // 0 or 1
 ```
 
-#### `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?)`
+#### `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, address?, vaultPath?)`
 
 Sign EIP-712 typed structured data (EVM only).
 
@@ -333,6 +334,7 @@ console.log(result.recoveryId); // 27 or 28
 | `typedDataJson` | `string` | &mdash; | JSON string of EIP-712 typed data |
 | `passphrase` | `string` | `undefined` | Decryption passphrase |
 | `index` | `number` | `0` | Account index |
+| `address` | `string` | `undefined` | Optional address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano) |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
 
 **Returns:** `SignResult`

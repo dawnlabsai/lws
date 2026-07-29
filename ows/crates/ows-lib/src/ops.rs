@@ -648,6 +648,7 @@ pub fn sign_authorization(
 ///
 /// The `passphrase` parameter accepts either the owner's passphrase or an
 /// API token (`ows_key_...`).
+#[allow(clippy::too_many_arguments)]
 pub fn sign_message(
     wallet: &str,
     chain: &str,
@@ -655,6 +656,7 @@ pub fn sign_message(
     passphrase: Option<&str>,
     encoding: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
@@ -675,7 +677,7 @@ pub fn sign_message(
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let chain = parse_chain(chain)?;
         return crate::key_ops::sign_message_with_api_key(
-            credential, wallet, &chain, &msg_bytes, index, vault_path,
+            credential, wallet, &chain, &msg_bytes, index, address, vault_path,
         );
     }
 
@@ -683,7 +685,7 @@ pub fn sign_message(
     let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
     let signer = signer_for_chain(&chain);
-    let output = signer.sign_message(key.expose(), &msg_bytes)?;
+    let output = signer.sign_message(key.expose(), &msg_bytes, address)?;
 
     Ok(SignResult {
         signature: hex::encode(&output.signature),
@@ -702,6 +704,7 @@ pub fn sign_typed_data(
     typed_data_json: &str,
     passphrase: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
@@ -720,11 +723,14 @@ pub fn sign_typed_data(
             &chain,
             typed_data_json,
             index,
+            address,
             vault_path,
         );
     }
 
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
+    let signer = signer_for_chain(&chain);
+    signer.verify_sign_message_address(key.expose(), address)?;
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
@@ -1423,6 +1429,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(vault),
             );
             assert!(
@@ -1495,8 +1502,28 @@ mod tests {
         let vault = dir.path();
         create_wallet("det-sign", None, None, Some(vault)).unwrap();
 
-        let s1 = sign_message("det-sign", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("det-sign", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message(
+            "det-sign",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "det-sign",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_eq!(
             s1.signature, s2.signature,
             "same message should produce same signature"
@@ -1509,8 +1536,28 @@ mod tests {
         let vault = dir.path();
         create_wallet("diff-msg", None, None, Some(vault)).unwrap();
 
-        let s1 = sign_message("diff-msg", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("diff-msg", "evm", "world", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message(
+            "diff-msg",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "diff-msg",
+            "evm",
+            "world",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_ne!(s1.signature, s2.signature);
     }
 
@@ -1527,6 +1574,7 @@ mod tests {
             "pk-sign",
             "evm",
             "hello",
+            None,
             None,
             None,
             None,
@@ -1567,8 +1615,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_privkey_wallet("pk-det", TEST_PRIVKEY, "", dir.path());
 
-        let s1 = sign_message("pk-det", "evm", "test", None, None, None, Some(dir.path())).unwrap();
-        let s2 = sign_message("pk-det", "evm", "test", None, None, None, Some(dir.path())).unwrap();
+        let s1 = sign_message(
+            "pk-det",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "pk-det",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+        )
+        .unwrap();
         assert_eq!(s1.signature, s2.signature);
     }
 
@@ -1580,8 +1648,10 @@ mod tests {
         create_wallet("mn-w", None, None, Some(vault)).unwrap();
         save_privkey_wallet("pk-w", TEST_PRIVKEY, "", vault);
 
-        let mn_sig = sign_message("mn-w", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let pk_sig = sign_message("pk-w", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let mn_sig =
+            sign_message("mn-w", "evm", "hello", None, None, None, None, Some(vault)).unwrap();
+        let pk_sig =
+            sign_message("pk-w", "evm", "hello", None, None, None, None, Some(vault)).unwrap();
         assert_ne!(
             mn_sig.signature, pk_sig.signature,
             "different keys should produce different signatures"
@@ -1610,7 +1680,17 @@ mod tests {
         );
 
         // Should be able to sign
-        let sig = sign_message("pk-api", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-api",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Export should return JSON key pair with original key
@@ -1653,6 +1733,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -1663,6 +1744,7 @@ mod tests {
             "pk-secp-and-ed",
             "solana",
             "hello",
+            None,
             None,
             None,
             None,
@@ -1802,6 +1884,7 @@ mod tests {
             Some("s3cret"),
             None,
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -1819,13 +1902,24 @@ mod tests {
             Some("wrong"),
             None,
             None,
+            None,
             Some(vault)
         )
         .is_err());
         assert!(export_wallet("pass-mn", Some("wrong"), Some(vault)).is_err());
 
         // No passphrase should fail (defaults to empty string, which is wrong)
-        assert!(sign_message("pass-mn", "evm", "hello", None, None, None, Some(vault)).is_err());
+        assert!(sign_message(
+            "pass-mn",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1839,6 +1933,7 @@ mod tests {
             "evm",
             "hello",
             Some("mypass"),
+            None,
             None,
             None,
             Some(dir.path()),
@@ -1856,6 +1951,7 @@ mod tests {
             "evm",
             "hello",
             Some("wrong"),
+            None,
             None,
             None,
             Some(dir.path())
@@ -1887,6 +1983,7 @@ mod tests {
             "verify-evm",
             "evm",
             "hello world",
+            None,
             None,
             None,
             None,
@@ -1941,7 +2038,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(get_wallet("nope", Some(dir.path())).is_err());
         assert!(export_wallet("nope", None, Some(dir.path())).is_err());
-        assert!(sign_message("nope", "evm", "x", None, None, None, Some(dir.path())).is_err());
+        assert!(
+            sign_message("nope", "evm", "x", None, None, None, None, Some(dir.path())).is_err()
+        );
         assert!(delete_wallet("nope", Some(dir.path())).is_err());
     }
 
@@ -1974,9 +2073,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
         create_wallet("chain-err", None, None, Some(vault)).unwrap();
-        assert!(
-            sign_message("chain-err", "fakecoin", "hi", None, None, None, Some(vault)).is_err()
-        );
+        assert!(sign_message(
+            "chain-err",
+            "fakecoin",
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
     }
 
     #[test]
@@ -2064,6 +2171,7 @@ mod tests {
             None,
             Some("hex"),
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2076,6 +2184,7 @@ mod tests {
             "hello",
             None,
             Some("utf8"),
+            None,
             None,
             Some(vault),
         )
@@ -2097,6 +2206,7 @@ mod tests {
             "hello",
             None,
             Some("base64"),
+            None,
             None,
             Some(vault)
         )
@@ -2120,9 +2230,9 @@ mod tests {
         assert_eq!(wallets.len(), 3);
 
         // All can sign independently
-        let s1 = sign_message("w1", "evm", "test", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("w2", "evm", "test", None, None, None, Some(vault)).unwrap();
-        let s3 = sign_message("w3", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message("w1", "evm", "test", None, None, None, None, Some(vault)).unwrap();
+        let s2 = sign_message("w2", "evm", "test", None, None, None, None, Some(vault)).unwrap();
+        let s3 = sign_message("w3", "evm", "test", None, None, None, None, Some(vault)).unwrap();
 
         // All signatures should be different (different keys)
         assert_ne!(s1.signature, s2.signature);
@@ -2132,8 +2242,8 @@ mod tests {
         // Delete one, others survive
         delete_wallet("w2", Some(vault)).unwrap();
         assert_eq!(list_wallets(Some(vault)).unwrap().len(), 2);
-        assert!(sign_message("w1", "evm", "test", None, None, None, Some(vault)).is_ok());
-        assert!(sign_message("w3", "evm", "test", None, None, None, Some(vault)).is_ok());
+        assert!(sign_message("w1", "evm", "test", None, None, None, None, Some(vault)).is_ok());
+        assert!(sign_message("w3", "evm", "test", None, None, None, None, Some(vault)).is_ok());
     }
 
     // ================================================================
@@ -2268,6 +2378,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2307,13 +2418,23 @@ mod tests {
         );
 
         // Same for sign_message
-        let msg_none =
-            sign_message("char-equiv", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let msg_none = sign_message(
+            "char-equiv",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         let msg_empty = sign_message(
             "char-equiv",
             "evm",
             "test",
             Some(""),
+            None,
             None,
             None,
             Some(vault),
@@ -2360,6 +2481,7 @@ mod tests {
             "evm",
             "test",
             Some("some-random-passphrase"),
+            None,
             None,
             None,
             Some(vault),
@@ -2453,17 +2575,47 @@ mod tests {
         create_wallet("orig-name", None, None, Some(vault)).unwrap();
 
         // Sign with original name
-        let sig1 = sign_message("orig-name", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig1 = sign_message(
+            "orig-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig1.signature.is_empty());
 
         // Rename
         rename_wallet("orig-name", "new-name", Some(vault)).unwrap();
 
         // Old name no longer works
-        assert!(sign_message("orig-name", "evm", "test", None, None, None, Some(vault)).is_err());
+        assert!(sign_message(
+            "orig-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
 
         // Sign with new name — should produce same signature (same key)
-        let sig2 = sign_message("new-name", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig2 = sign_message(
+            "new-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_eq!(
             sig1.signature, sig2.signature,
             "renamed wallet should produce identical signatures"
@@ -2477,15 +2629,33 @@ mod tests {
         create_wallet("del-me-char", None, None, Some(vault)).unwrap();
 
         // Sign succeeds
-        let sig =
-            sign_message("del-me-char", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "del-me-char",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Delete
         delete_wallet("del-me-char", Some(vault)).unwrap();
 
         // Sign after delete fails with WalletNotFound
-        let result = sign_message("del-me-char", "evm", "test", None, None, None, Some(vault));
+        let result = sign_message(
+            "del-me-char",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             OwsLibError::WalletNotFound(name) => assert_eq!(name, "del-me-char"),
@@ -2510,6 +2680,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(v1.path()),
         )
         .unwrap();
@@ -2526,6 +2697,7 @@ mod tests {
             "char-det-2",
             "evm",
             "determinism test",
+            None,
             None,
             None,
             None,
@@ -2575,6 +2747,7 @@ mod tests {
             ("cosmos", true),
             ("tron", true),
             ("ton", false),
+            ("spark", false),
             ("sui", false),
             ("cardano", false),
         ];
@@ -2583,6 +2756,7 @@ mod tests {
                 "char-all-chains",
                 chain,
                 "hello",
+                None,
                 None,
                 None,
                 None,
@@ -2624,7 +2798,15 @@ mod tests {
             "message": {"value": "42"}
         }"#;
 
-        let result = sign_typed_data("char-typed", "evm", typed_data, None, None, Some(vault));
+        let result = sign_typed_data(
+            "char-typed",
+            "evm",
+            typed_data,
+            None,
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_ok(), "sign_typed_data failed: {:?}", result.err());
 
         let sig = result.unwrap();
@@ -2679,6 +2861,7 @@ mod tests {
             None,
             None,
             Some(0),
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2689,6 +2872,7 @@ mod tests {
             None,
             None,
             Some(1),
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2745,7 +2929,16 @@ mod tests {
 
         // Sign message on multiple chains
         for chain in &["evm", "solana", "bitcoin", "cosmos"] {
-            let result = sign_message("char-24w", chain, "test", None, None, None, Some(vault));
+            let result = sign_message(
+                "char-24w",
+                chain,
+                "test",
+                None,
+                None,
+                None,
+                None,
+                Some(vault),
+            );
             assert!(
                 result.is_ok(),
                 "24-word wallet sign_message failed for {chain}: {:?}",
@@ -2783,6 +2976,7 @@ mod tests {
                         "char-conc",
                         "evm",
                         &msg,
+                        None,
                         None,
                         None,
                         None,
@@ -3019,7 +3213,15 @@ mod tests {
             "message": {"value": "1"}
         }"#;
 
-        let result = sign_typed_data(&w.id, "solana", typed_data, Some("pass"), None, Some(vault));
+        let result = sign_typed_data(
+            &w.id,
+            "solana",
+            typed_data,
+            Some("pass"),
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3049,7 +3251,15 @@ mod tests {
             "message": {"value": "42"}
         }"#;
 
-        let result = sign_typed_data(&w.id, "evm", typed_data, Some("pass"), None, Some(vault));
+        let result = sign_typed_data(
+            &w.id,
+            "evm",
+            typed_data,
+            Some("pass"),
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_ok(), "sign_typed_data failed: {:?}", result.err());
 
         let sign_result = result.unwrap();
@@ -3441,13 +3651,22 @@ mod tests {
         create_wallet("reg-msg", None, None, Some(vault)).unwrap();
 
         // Through the public API
-        let api_result =
-            sign_message("reg-msg", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let api_result = sign_message(
+            "reg-msg",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
 
         // Direct signer
         let key = decrypt_signing_key("reg-msg", ChainType::Evm, "", None, Some(vault)).unwrap();
         let signer = signer_for_chain_type(ChainType::Evm);
-        let direct = signer.sign_message(key.expose(), b"hello").unwrap();
+        let direct = signer.sign_message(key.expose(), b"hello", None).unwrap();
 
         assert_eq!(
             api_result.signature,

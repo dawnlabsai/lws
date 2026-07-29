@@ -85,6 +85,7 @@ fn import_wallet_private_key(
         vault_path(vault_path_opt).as_deref(),
         secp256k1_key,
         ed25519_key,
+        None,
     )
     .map_err(map_err)?;
     Python::with_gil(|py| wallet_info_to_dict(py, &info))
@@ -176,7 +177,7 @@ fn sign_transaction(
 
 /// Sign a message.
 #[pyfunction]
-#[pyo3(signature = (wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path_opt=None))]
+#[pyo3(signature = (wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path_opt=None))]
 fn sign_message(
     wallet: &str,
     chain: &str,
@@ -184,6 +185,7 @@ fn sign_message(
     passphrase: Option<&str>,
     encoding: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path_opt: Option<String>,
 ) -> PyResult<PyObject> {
     let result = ows_lib::sign_message(
@@ -193,6 +195,7 @@ fn sign_message(
         passphrase,
         encoding,
         index,
+        address,
         vault_path(vault_path_opt).as_deref(),
     )
     .map_err(map_err)?;
@@ -207,13 +210,14 @@ fn sign_message(
 
 /// Sign EIP-712 typed structured data (EVM only).
 #[pyfunction]
-#[pyo3(signature = (wallet, chain, typed_data_json, passphrase=None, index=None, vault_path_opt=None))]
+#[pyo3(signature = (wallet, chain, typed_data_json, passphrase=None, index=None, address=None, vault_path_opt=None))]
 fn sign_typed_data(
     wallet: &str,
     chain: &str,
     typed_data_json: &str,
     passphrase: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path_opt: Option<String>,
 ) -> PyResult<PyObject> {
     let result = ows_lib::sign_typed_data(
@@ -222,6 +226,7 @@ fn sign_typed_data(
         typed_data_json,
         passphrase,
         index,
+        address,
         vault_path(vault_path_opt).as_deref(),
     )
     .map_err(map_err)?;

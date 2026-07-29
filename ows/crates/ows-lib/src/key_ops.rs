@@ -3,7 +3,7 @@ use std::path::Path;
 
 use ows_core::{ApiKeyFile, EncryptedWallet, OwsError};
 use ows_signer::{
-    decrypt, eip712, encrypt_with_hkdf, signer_for_chain, CryptoEnvelope, SecretBytes,
+    decrypt, eip712, encrypt_with_hkdf, signer_for_chain, ChainSigner, CryptoEnvelope, SecretBytes,
 };
 
 use crate::error::OwsLibError;
@@ -120,6 +120,7 @@ pub fn sign_message_with_api_key(
     chain: &ows_core::Chain,
     msg_bytes: &[u8],
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
@@ -139,7 +140,7 @@ pub fn sign_message_with_api_key(
         vault_path,
     )?;
     let signer = signer_for_chain(chain);
-    let output = signer.sign_message(key.expose(), msg_bytes)?;
+    let output = signer.sign_message(key.expose(), msg_bytes, address)?;
 
     Ok(crate::types::SignResult {
         signature: hex::encode(&output.signature),
@@ -194,6 +195,7 @@ pub fn sign_typed_data_with_api_key(
     chain: &ows_core::Chain,
     typed_data_json: &str,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<crate::types::SignResult, OwsLibError> {
     // 1. EVM-only gate — cheapest check first
@@ -259,6 +261,7 @@ pub fn sign_typed_data_with_api_key(
 
     // 6. Sign
     let evm_signer = ows_signer::chains::EvmSigner;
+    evm_signer.verify_sign_message_address(key.expose(), address)?;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
     Ok(crate::types::SignResult {
@@ -683,6 +686,7 @@ mod tests {
             &chain,
             b"hello",
             None,
+            None,
             Some(&vault),
         );
         assert!(
@@ -922,6 +926,7 @@ mod tests {
             &chain,
             &test_typed_data_json(),
             None,
+            None,
             Some(&vault),
         );
         assert!(
@@ -957,6 +962,7 @@ mod tests {
             "test-wallet",
             &chain,
             &test_typed_data_json(),
+            None,
             None,
             Some(&vault),
         );
@@ -1004,6 +1010,7 @@ mod tests {
             &chain,
             &wrong_contract_td,
             None,
+            None,
             Some(&vault),
         );
         assert!(result.is_err());
@@ -1038,6 +1045,7 @@ mod tests {
             &chain,
             "not valid json",
             None,
+            None,
             Some(&vault),
         );
         assert!(result.is_err());
@@ -1065,6 +1073,7 @@ mod tests {
             "test-wallet",
             &chain,
             &test_typed_data_json(),
+            None,
             None,
             Some(&vault),
         );
@@ -1108,6 +1117,7 @@ mod tests {
             "other-wallet",
             &chain,
             &test_typed_data_json(),
+            None,
             None,
             Some(&vault),
         );
@@ -1165,6 +1175,7 @@ mod tests {
             "test-wallet",
             &chain,
             &mismatched_td,
+            None,
             None,
             Some(&vault),
         );
@@ -1237,6 +1248,7 @@ else:
             "test-wallet",
             &chain,
             &typed_data_json,
+            None,
             None,
             Some(&vault),
         );

@@ -45,7 +45,7 @@ describe('@open-wallet-standard/adapters — solana', () => {
   it('keypair matches OWS signMessage output', async () => {
     const keypair = owsToSolanaKeypair(walletName, { vaultPath: vaultDir });
     const messageHex = Buffer.from('verify-match').toString('hex');
-    const owsResult = signMessage(walletName, 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', messageHex, undefined, 'hex', undefined, vaultDir);
+    const owsResult = signMessage(walletName, 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', messageHex, undefined, 'hex', undefined, undefined, vaultDir);
     const { ed25519 } = await import('@noble/curves/ed25519');
     const keypairSig = Buffer.from(ed25519.sign(Buffer.from(messageHex, 'hex'), keypair.secretKey.slice(0, 32))).toString('hex');
     assert.equal(keypairSig, owsResult.signature);

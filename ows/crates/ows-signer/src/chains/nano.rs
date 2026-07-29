@@ -292,6 +292,7 @@ impl ChainSigner for NanoSigner {
         &self,
         _private_key: &[u8],
         _message: &[u8],
+        _address: Option<&str>,
     ) -> Result<SignOutput, SignerError> {
         Err(SignerError::SigningFailed(
             "Nano off-chain message signing is not supported: no canonical standard exists. \
@@ -489,7 +490,7 @@ mod tests {
         let key = derive_key(MNEMONIC_12, "", "m/44'/165'/0'");
         let signer = NanoSigner;
         let message = b"hello nano";
-        let result = signer.sign_message(&key, message);
+        let result = signer.sign_message(&key, message, None);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

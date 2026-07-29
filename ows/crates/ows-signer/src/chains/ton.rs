@@ -193,7 +193,13 @@ impl ChainSigner for TonSigner {
         self.sign(private_key, tx_bytes)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         self.sign(private_key, message)
     }
 

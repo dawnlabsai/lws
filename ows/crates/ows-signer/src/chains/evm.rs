@@ -289,7 +289,13 @@ impl ChainSigner for EvmSigner {
             .map_err(|e| SignerError::InvalidTransaction(e.to_string()))
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // EIP-191 personal sign prefix
         let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
         let mut prefixed = Vec::new();
@@ -369,8 +375,29 @@ mod tests {
             hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
                 .unwrap();
         let signer = EvmSigner;
-        let result = signer.sign_message(&privkey, b"Hello World").unwrap();
+        let result = signer.sign_message(&privkey, b"Hello World", None).unwrap();
         assert_eq!(result.signature.len(), 65);
+    }
+
+    #[test]
+    fn test_sign_message_address_mismatch() {
+        use crate::traits::SignerError;
+        let privkey =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+                .unwrap();
+        let signer = EvmSigner;
+        let err = signer
+            .sign_message(
+                &privkey,
+                b"Hello World",
+                Some("0x0000000000000000000000000000000000000001"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SignerError::AddressMismatch));
+        let derived = signer.derive_address(&privkey).unwrap();
+        signer
+            .sign_message(&privkey, b"Hello World", Some(derived.as_str()))
+            .unwrap();
     }
 
     #[test]
@@ -457,7 +484,7 @@ mod tests {
             hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
                 .unwrap();
         let signer = EvmSigner;
-        let result = signer.sign_message(&privkey, b"Hello World").unwrap();
+        let result = signer.sign_message(&privkey, b"Hello World", None).unwrap();
         let v = result.signature[64];
         assert!(
             v == 27 || v == 28,
@@ -471,7 +498,9 @@ mod tests {
             hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
                 .unwrap();
         let signer = EvmSigner;
-        let result = signer.sign_message(&privkey, b"test recovery id").unwrap();
+        let result = signer
+            .sign_message(&privkey, b"test recovery id", None)
+            .unwrap();
         let v = result.signature[64];
         let recovery_id = result.recovery_id.unwrap();
         assert_eq!(
@@ -491,7 +520,7 @@ mod tests {
             hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
                 .unwrap();
         let signer = EvmSigner;
-        let result = signer.sign_message(&privkey, b"verify me").unwrap();
+        let result = signer.sign_message(&privkey, b"verify me", None).unwrap();
 
         // Signature should verify
         let signing_key = SigningKey::from_slice(&privkey).unwrap();

@@ -198,6 +198,7 @@ impl ChainSigner for XrplSigner {
         &self,
         _private_key: &[u8],
         _message: &[u8],
+        _address: Option<&str>,
     ) -> Result<SignOutput, SignerError> {
         Err(SignerError::SigningFailed(
             "XRPL off-chain message signing is not supported: no canonical standard exists. \
@@ -413,7 +414,7 @@ mod tests {
     fn test_sign_message_unsupported() {
         let privkey = test_privkey();
         let signer = XrplSigner;
-        let result = signer.sign_message(&privkey, b"hello");
+        let result = signer.sign_message(&privkey, b"hello", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
