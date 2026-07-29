@@ -65,9 +65,9 @@ fn import_wallet_mnemonic(
 }
 
 /// Import a wallet from a hex-encoded private key (derives addresses for all chains).
-/// Optionally specify explicit keys per curve via `secp256k1_key` and `ed25519_key`.
+/// Optionally specify explicit keys per curve via `secp256k1_key`, `ed25519_key`, and `ed25519_bip32_key`.
 #[pyfunction]
-#[pyo3(signature = (name, private_key_hex, chain=None, passphrase=None, vault_path_opt=None, secp256k1_key=None, ed25519_key=None))]
+#[pyo3(signature = (name, private_key_hex, chain=None, passphrase=None, vault_path_opt=None, secp256k1_key=None, ed25519_key=None, ed25519_bip32_key=None))]
 fn import_wallet_private_key(
     name: &str,
     private_key_hex: &str,
@@ -76,6 +76,7 @@ fn import_wallet_private_key(
     vault_path_opt: Option<String>,
     secp256k1_key: Option<&str>,
     ed25519_key: Option<&str>,
+    ed25519_bip32_key: Option<&str>,
 ) -> PyResult<PyObject> {
     let info = ows_lib::import_wallet_private_key(
         name,
@@ -85,7 +86,7 @@ fn import_wallet_private_key(
         vault_path(vault_path_opt).as_deref(),
         secp256k1_key,
         ed25519_key,
-        None,
+        ed25519_bip32_key,
     )
     .map_err(map_err)?;
     Python::with_gil(|py| wallet_info_to_dict(py, &info))

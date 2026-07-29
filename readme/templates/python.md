@@ -35,7 +35,7 @@ print(sig["signature"])
 |----------|-------------|
 | `create_wallet(name, passphrase?, words?, vault_path?)` | Create a new wallet with addresses for the current auto-derived chain set |
 | `import_wallet_mnemonic(name, mnemonic, passphrase?, index?, vault_path?)` | Import a wallet from a BIP-39 mnemonic |
-| `import_wallet_private_key(name, private_key_hex, chain?, passphrase?, vault_path?, secp256k1_key?, ed25519_key?)` | Import a wallet from a private key |
+| `import_wallet_private_key(name, private_key_hex, chain?, passphrase?, vault_path?, secp256k1_key?, ed25519_key?, ed25519_bip32_key?)` | Import a wallet from a private key |
 | `list_wallets(vault_path?)` | List all wallets in the vault |
 | `get_wallet(name_or_id, vault_path?)` | Get details of a specific wallet |
 | `delete_wallet(name_or_id, vault_path?)` | Delete a wallet |

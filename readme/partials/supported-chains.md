@@ -13,3 +13,4 @@
 | Spark (Bitcoin L2) | secp256k1 | spark: prefixed | `m/84'/0'/0'/0/0` |
 | Filecoin | secp256k1 | f1 base32 | `m/44'/461'/0'/0/0` |
 | NEAR | Ed25519 | implicit hex (64 chars) | `m/44'/397'/0'` |
+| Cardano | Ed25519-BIP32 (CIP-1852) | Shelley Bech32 base (`addr1…`) | Payment `m/1852'/1815'/0'/0/0` + stake `m/1852'/1815'/0'/2/0` |

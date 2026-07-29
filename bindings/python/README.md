@@ -40,7 +40,7 @@ print(sig["signature"])
 |----------|-------------|
 | `create_wallet(name, passphrase?, words?, vault_path?)` | Create a new wallet with addresses for the current auto-derived chain set |
 | `import_wallet_mnemonic(name, mnemonic, passphrase?, index?, vault_path?)` | Import a wallet from a BIP-39 mnemonic |
-| `import_wallet_private_key(name, private_key_hex, chain?, passphrase?, vault_path?, secp256k1_key?, ed25519_key?)` | Import a wallet from a private key |
+| `import_wallet_private_key(name, private_key_hex, chain?, passphrase?, vault_path?, secp256k1_key?, ed25519_key?, ed25519_bip32_key?)` | Import a wallet from a private key |
 | `list_wallets(vault_path?)` | List all wallets in the vault |
 | `get_wallet(name_or_id, vault_path?)` | Get details of a specific wallet |
 | `delete_wallet(name_or_id, vault_path?)` | Delete a wallet |
@@ -77,6 +77,7 @@ print(sig["signature"])
 | Spark (Bitcoin L2) | secp256k1 | spark: prefixed | `m/84'/0'/0'/0/0` |
 | Filecoin | secp256k1 | f1 base32 | `m/44'/461'/0'/0/0` |
 | NEAR | Ed25519 | implicit hex (64 chars) | `m/44'/397'/0'` |
+| Cardano | Ed25519-BIP32 (CIP-1852) | Shelley Bech32 base (`addr1…`) | Payment `m/1852'/1815'/0'/0/0` + stake `m/1852'/1815'/0'/2/0` |
 
 ## Architecture
 
