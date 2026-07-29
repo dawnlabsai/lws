@@ -12,10 +12,42 @@ use emurgo_cardano_message_signing::utils::ToBytes as EmurgoToBytes;
 use emurgo_cardano_message_signing::{
     HeaderMap, Headers, Label, ProtectedHeaderMap, SignedMessage,
 };
+use ows_core::policy::{TransactionContext, TransactionEffect};
 use ows_core::ChainType;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 pub struct CardanoSigner {
     network_id: u8,
+}
+
+const LOVELACE_ASSET_ID: &str = "lovelace";
+const KOIOS_TXS_CBOR_CHUNK_SIZE: usize = 10;
+const KOIOS_REQUESTS_TIMEOUT: Duration = Duration::from_secs(45);
+
+type AssetBalanceMap = BTreeMap<String, u64>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KoiosAssetListItem {
+    policy_id: String,
+    asset_name: String,
+    quantity: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KoiosUtxoInfoRow {
+    tx_hash: String,
+    tx_index: u32,
+    address: String,
+    value: String,
+    asset_list: Option<Vec<KoiosAssetListItem>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KoiosTxCborRow {
+    tx_hash: String,
+    cbor: String,
 }
 
 impl CardanoSigner {
@@ -195,6 +227,200 @@ impl CardanoSigner {
         rew.to_address()
             .to_bech32(None)
             .map_err(|e| SignerError::AddressDerivationFailed(e.to_string()))
+    }
+
+    /// Explicit deposit/refund carried on a certificate, attributed to the
+    /// credential's reward address. Legacy Shelley certs without an on-wire
+    /// `coin` are skipped (amount comes from protocol parameters).
+    ///
+    /// Returns `(credential, lovelace, is_deposit)`.
+    fn cert_deposit_or_refund(cert: &Certificate) -> Option<(Credential, u64, bool)> {
+        match cert.kind() {
+            CertificateKind::StakeRegistration => cert.as_reg_cert().and_then(|c| {
+                c.coin()
+                    .map(|coin| (c.stake_credential(), u64::from(coin), true))
+            }),
+            CertificateKind::StakeDeregistration => cert.as_unreg_cert().and_then(|c| {
+                c.coin()
+                    .map(|coin| (c.stake_credential(), u64::from(coin), false))
+            }),
+            CertificateKind::StakeRegistrationAndDelegation => cert
+                .as_stake_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::StakeVoteRegistrationAndDelegation => cert
+                .as_stake_vote_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::VoteRegistrationAndDelegation => cert
+                .as_vote_registration_and_delegation()
+                .map(|c| (c.stake_credential(), u64::from(c.coin()), true)),
+            CertificateKind::DRepRegistration => cert
+                .as_drep_registration()
+                .map(|c| (c.voting_credential(), u64::from(c.coin()), true)),
+            CertificateKind::DRepDeregistration => cert
+                .as_drep_deregistration()
+                .map(|c| (c.voting_credential(), u64::from(c.coin()), false)),
+            _ => None,
+        }
+    }
+
+    fn add_lovelace_balance(
+        balances: &mut BTreeMap<String, AssetBalanceMap>,
+        address: String,
+        amount: u64,
+    ) {
+        *balances
+            .entry(address)
+            .or_default()
+            .entry(LOVELACE_ASSET_ID.to_string())
+            .or_insert(0) += amount;
+    }
+
+    fn fetch_txs_cbor(
+        koios_base_url: &str,
+        tx_hashes: &[String],
+    ) -> Result<BTreeMap<String, String>, SignerError> {
+        if tx_hashes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(KOIOS_REQUESTS_TIMEOUT)
+            .build()
+            .map_err(|e| SignerError::RpcError(e.to_string()))?;
+
+        let base_url = koios_base_url.trim_end_matches('/');
+        let url = format!("{base_url}/tx_cbor");
+        let mut txs_cbor: BTreeMap<String, String> = BTreeMap::new();
+
+        for chunk in tx_hashes.chunks(KOIOS_TXS_CBOR_CHUNK_SIZE) {
+            let body = serde_json::json!({
+                "_tx_hashes": chunk,
+            });
+
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .map_err(|e| SignerError::RpcError(e.to_string()))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().unwrap_or_default();
+                return Err(SignerError::RpcError(format!(
+                    "Koios tx_cbor returned {status}: {text}"
+                )));
+            }
+
+            let fetched: Vec<KoiosTxCborRow> = resp
+                .json()
+                .map_err(|e| SignerError::RpcError(format!("Koios tx_cbor JSON: {e}")))?;
+
+            for row in fetched {
+                txs_cbor.insert(row.tx_hash, row.cbor);
+            }
+        }
+
+        Ok(txs_cbor)
+    }
+
+    /// Fetches UTXOs by retrieving each referenced transaction's CBOR and verifying
+    /// that `transaction_hash()` matches the expected hash. This prevents a malicious
+    /// RPC provider from returning fabricated UTXO data under a trusted tx hash.
+    fn fetch_utxos(
+        koios_base_url: &str,
+        input_refs: &[(String, u32)],
+    ) -> Result<Vec<KoiosUtxoInfoRow>, SignerError> {
+        if input_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let unique_hashes: Vec<String> = input_refs
+            .iter()
+            .map(|(hash, _)| hash.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let txs_cbor = Self::fetch_txs_cbor(koios_base_url, &unique_hashes)?;
+
+        for hash in &unique_hashes {
+            if !txs_cbor.contains_key(hash) {
+                return Err(SignerError::RpcError(format!(
+                    "Koios tx_cbor missing transaction {hash}"
+                )));
+            }
+        }
+
+        let mut verified_txs: BTreeMap<String, FixedTransaction> = BTreeMap::new();
+        for (expected_hash, cbor_hex) in &txs_cbor {
+            let cbor_bytes = hex::decode(cbor_hex).map_err(|e| {
+                SignerError::RpcError(format!("invalid CBOR hex for tx {expected_hash}: {e}"))
+            })?;
+            let tx = FixedTransaction::from_bytes(cbor_bytes).map_err(|e| {
+                SignerError::RpcError(format!("invalid CBOR for tx {expected_hash}: {e}"))
+            })?;
+            let actual_hash = tx.transaction_hash().to_hex();
+            if &actual_hash != expected_hash {
+                return Err(SignerError::RpcError(format!(
+                    "CBOR hash mismatch for tx {expected_hash}: got {actual_hash}"
+                )));
+            }
+            verified_txs.insert(expected_hash.clone(), tx);
+        }
+
+        let mut utxos = Vec::with_capacity(input_refs.len());
+        for (tx_hash, index) in input_refs {
+            let tx = verified_txs
+                .get(tx_hash)
+                .expect("missing tx already checked above");
+            let outputs = tx.body().outputs();
+            let index_usize = *index as usize;
+            if index_usize >= outputs.len() {
+                return Err(SignerError::InvalidTransaction(format!(
+                    "input {tx_hash}#{index} out of range (tx has {} outputs)",
+                    outputs.len()
+                )));
+            }
+
+            let output = outputs.get(index_usize);
+            let address = output.address().to_bech32(None).map_err(|e| {
+                SignerError::InvalidTransaction(format!(
+                    "invalid address on input {tx_hash}#{index}: {e}"
+                ))
+            })?;
+            let lovelace: u64 = output.amount().coin().into();
+
+            let asset_list = match output.amount().multiasset() {
+                Some(ma) if ma.keys().len() > 0 => {
+                    let mut assets = Vec::new();
+                    for policy_id_index in 0..ma.keys().len() {
+                        let policy_id = ma.keys().get(policy_id_index);
+                        let policy_assets = ma.get(&policy_id).unwrap();
+                        for asset_index in 0..policy_assets.len() {
+                            let asset_name = policy_assets.keys().get(asset_index);
+                            let quantity: u64 = policy_assets.get(&asset_name).unwrap().into();
+                            assets.push(KoiosAssetListItem {
+                                policy_id: policy_id.to_hex(),
+                                asset_name: hex::encode(asset_name.name()),
+                                quantity: quantity.to_string(),
+                            });
+                        }
+                    }
+                    Some(assets)
+                }
+                _ => None,
+            };
+
+            utxos.push(KoiosUtxoInfoRow {
+                tx_hash: tx_hash.clone(),
+                tx_index: *index,
+                address,
+                value: lovelace.to_string(),
+                asset_list,
+            });
+        }
+
+        Ok(utxos)
     }
 }
 
@@ -413,6 +639,205 @@ impl ChainSigner for CardanoSigner {
         Ok(tx.to_bytes())
     }
 
+    fn make_transaction_context(
+        &self,
+        tx_bytes: &[u8],
+        rpc_url: Option<&str>,
+    ) -> Result<TransactionContext, SignerError> {
+        let tx_hex = hex::encode(tx_bytes);
+
+        let tx = FixedTransaction::from_bytes(tx_bytes.to_vec())
+            .map_err(|e| SignerError::InvalidTransaction(e.to_string()))?;
+
+        let tx_input_refs: Vec<(String, u32)> = tx
+            .body()
+            .inputs()
+            .into_iter()
+            .map(|input| (input.transaction_id().to_hex(), input.index()))
+            .collect();
+
+        let mut inputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        if !tx_input_refs.is_empty() {
+            let koios_base_url = rpc_url.ok_or_else(|| {
+                SignerError::InvalidMessage(
+                    "Koios RPC URL is required to fetch Cardano transaction inputs".into(),
+                )
+            })?;
+            let utxos = Self::fetch_utxos(koios_base_url, &tx_input_refs)?;
+
+            for utxo in utxos {
+                let inputs_balances_for_address =
+                    inputs_balances_by_address.entry(utxo.address).or_default();
+
+                *inputs_balances_for_address
+                    .entry(LOVELACE_ASSET_ID.to_string())
+                    .or_insert(0) += utxo.value.parse::<u64>().map_err(|e| {
+                    SignerError::InvalidTransaction(format!(
+                        "invalid lovelace value for utxo {}#{}: {e}",
+                        utxo.tx_hash, utxo.tx_index
+                    ))
+                })?;
+
+                for asset in utxo.asset_list.unwrap_or_default() {
+                    *inputs_balances_for_address
+                        .entry(format!("{}{}", asset.policy_id, asset.asset_name))
+                        .or_insert(0) += asset.quantity.parse::<u64>().map_err(|e| {
+                        SignerError::InvalidTransaction(format!(
+                            "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
+                            utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
+                        ))
+                    })?;
+                }
+            }
+        }
+
+        let mut outputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
+        for output in tx.body().outputs().into_iter() {
+            let dest_address = output.address().to_bech32(None).map_err(|e| {
+                SignerError::InvalidTransaction(format!("invalid output address: {e}"))
+            })?;
+
+            let output_balances_for_address =
+                outputs_balances_by_address.entry(dest_address).or_default();
+
+            let lovelace: u64 = output.amount().coin().into();
+
+            *output_balances_for_address
+                .entry(LOVELACE_ASSET_ID.to_string())
+                .or_insert(0) += lovelace;
+
+            let ma = output.amount().multiasset();
+            if ma.is_none() {
+                continue;
+            }
+
+            let ma = ma.unwrap();
+
+            for policy_id_index in 0..ma.keys().len() {
+                let policy_id = ma.keys().get(policy_id_index);
+                let assets = ma.get(&policy_id).unwrap();
+
+                for asset_index in 0..assets.len() {
+                    let asset_name = assets.keys().get(asset_index);
+                    let asset_quantity = assets.get(&asset_name).unwrap();
+                    let asset_quantity: u64 = asset_quantity.into();
+
+                    *output_balances_for_address
+                        .entry(format!(
+                            "{}{}",
+                            policy_id.to_hex(),
+                            hex::encode(asset_name.name())
+                        ))
+                        .or_insert(0) += asset_quantity;
+                }
+            }
+        }
+
+        // Withdrawals leave the reward account and enter the transaction, so
+        // treat them as inputs from the reward address.
+        if let Some(withdrawals) = tx.body().withdrawals() {
+            let reward_addresses = withdrawals.keys();
+            for i in 0..reward_addresses.len() {
+                let reward_address = reward_addresses.get(i);
+                let amount: u64 = withdrawals
+                    .get(&reward_address)
+                    .ok_or_else(|| {
+                        SignerError::InvalidTransaction(
+                            "withdrawal amount missing for reward address".into(),
+                        )
+                    })?
+                    .into();
+                let addr = reward_address.to_address().to_bech32(None).map_err(|e| {
+                    SignerError::InvalidTransaction(format!("invalid withdrawal address: {e}"))
+                })?;
+                Self::add_lovelace_balance(&mut inputs_balances_by_address, addr, amount);
+            }
+        }
+
+        // Certificate deposits lock lovelace under the credential (like an
+        // output to its reward address); refunds unlock it (like an input).
+        if let Some(certs) = tx.body().certs() {
+            for i in 0..certs.len() {
+                let Some((credential, amount, is_deposit)) =
+                    Self::cert_deposit_or_refund(&certs.get(i))
+                else {
+                    continue;
+                };
+                let addr = RewardAddress::new(self.network_id, &credential)
+                    .to_address()
+                    .to_bech32(None)
+                    .map_err(|e| {
+                        SignerError::InvalidTransaction(format!(
+                            "invalid certificate reward address: {e}"
+                        ))
+                    })?;
+                if is_deposit {
+                    Self::add_lovelace_balance(&mut outputs_balances_by_address, addr, amount);
+                } else {
+                    Self::add_lovelace_balance(&mut inputs_balances_by_address, addr, amount);
+                }
+            }
+        }
+
+        let mut all_addresses: BTreeSet<&String> = BTreeSet::new();
+        for c in inputs_balances_by_address.keys() {
+            all_addresses.insert(c);
+        }
+        for c in outputs_balances_by_address.keys() {
+            all_addresses.insert(c);
+        }
+
+        let empty_balances = AssetBalanceMap::new();
+        let mut effects: Vec<TransactionEffect> = Vec::new();
+        for effect_address in all_addresses {
+            let input_balances = inputs_balances_by_address
+                .get(effect_address)
+                .unwrap_or(&empty_balances);
+            let output_balances = outputs_balances_by_address
+                .get(effect_address)
+                .unwrap_or(&empty_balances);
+
+            let mut asset_ids: BTreeSet<&String> = BTreeSet::new();
+            for k in input_balances.keys() {
+                asset_ids.insert(k);
+            }
+            for k in output_balances.keys() {
+                asset_ids.insert(k);
+            }
+
+            let mut diff: Vec<(String, i64)> = Vec::new();
+            for asset_id in asset_ids {
+                let input_balance = *input_balances.get(asset_id).unwrap_or(&0);
+                let output_balance = *output_balances.get(asset_id).unwrap_or(&0);
+
+                let asset_diff = (output_balance as i64) - (input_balance as i64);
+                if asset_diff == 0 {
+                    continue;
+                }
+
+                diff.push((asset_id.clone(), asset_diff));
+            }
+
+            if diff.is_empty() {
+                continue;
+            }
+
+            diff.sort_by(|a, b| a.0.cmp(&b.0));
+            effects.push(TransactionEffect {
+                address: effect_address.clone(),
+                diff,
+            });
+        }
+
+        effects.sort_by(|a, b| a.address.cmp(&b.address));
+
+        Ok(TransactionContext {
+            effects,
+            raw_hex: tx_hex,
+            data: None,
+        })
+    }
+
     fn default_derivation_path(&self, index: u32) -> String {
         Self::payment_derivation_path(index)
     }
@@ -453,10 +878,13 @@ mod tests {
     use crate::hd::HdDeriver;
     use crate::mnemonic::Mnemonic;
     use cardano_serialization_lib::{
-        BigNum, Certificates, Ed25519KeyHash, StakeDelegation, TransactionHash, TransactionInput,
-        TransactionInputs, TransactionOutput, TransactionOutputs, Value, Withdrawals,
+        AssetName, BigNum, Certificates, Ed25519KeyHash, Ed25519KeyHashes, MultiAsset, ScriptHash,
+        StakeDelegation, StakeDeregistration, StakeRegistration, TransactionBody, TransactionHash,
+        TransactionInput, TransactionInputs, TransactionOutput, TransactionOutputs, Value,
+        Withdrawals,
     };
     use hex::FromHex;
+    use mockito::Server;
 
     fn derive_key_material(signer: &CardanoSigner, m: &Mnemonic, index: u32) -> SecretBytes {
         let keys = HdDeriver::derive_keys_from_mnemonic_cached(
@@ -643,9 +1071,13 @@ mod tests {
         );
     }
 
+    const TX_FEE: u64 = 1_000_000u64;
+
+    type TestAsset<'a> = (&'a str, &'a str, u64); // (policy id hex, asset name hex, quantity)
+
     fn build_test_tx_cbor(
-        inputs: &[(&str, u32)],  // (tx hash, index)
-        outputs: &[(&str, u64)], // (bech32 address, lovelace)
+        inputs: &[(&str, u32)],                        // (tx hash, index)
+        outputs: &[(&str, u64, Option<&[TestAsset]>)], // (bech32 address, lovelace, optional assets)
         customize: impl FnOnce(&mut TransactionBody),
     ) -> Vec<u8> {
         let mut tx_inputs = TransactionInputs::new();
@@ -656,16 +1088,29 @@ mod tests {
         }
 
         let mut tx_outputs = TransactionOutputs::new();
-        for (addr, lovelace) in outputs {
-            let output = TransactionOutput::new(
-                &Address::from_bech32(addr).unwrap(),
-                &Value::new(&BigNum::from(*lovelace)),
-            );
+        for (addr, lovelace, assets) in outputs {
+            let mut output_value = Value::new(&BigNum::from(*lovelace));
+
+            if let Some(assets) = assets {
+                let mut multi_asset = MultiAsset::new();
+                for (policy_id_hex, asset_name_hex, quantity) in assets.iter().copied() {
+                    let policy_id = ScriptHash::from_hex(policy_id_hex).unwrap();
+                    let asset_name = AssetName::new(hex::decode(asset_name_hex).unwrap()).unwrap();
+
+                    let mut policy_assets = multi_asset.get(&policy_id).unwrap_or_default();
+                    policy_assets.insert(&asset_name, &BigNum::from(quantity));
+                    multi_asset.insert(&policy_id, &policy_assets);
+                }
+
+                output_value.set_multiasset(&multi_asset);
+            }
+
+            let output =
+                TransactionOutput::new(&Address::from_bech32(addr).unwrap(), &output_value);
             tx_outputs.add(&output);
         }
 
-        let mut body =
-            TransactionBody::new_tx_body(&tx_inputs, &tx_outputs, &BigNum::from(1_000_000u64));
+        let mut body = TransactionBody::new_tx_body(&tx_inputs, &tx_outputs, &BigNum::from(TX_FEE));
 
         customize(&mut body);
 
@@ -691,7 +1136,7 @@ mod tests {
                 "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
                 0,
             )],
-            &[(&output_address, 2_000_000)],
+            &[(&output_address, 2_000_000, None)],
             |_body| {},
         );
 
@@ -728,7 +1173,7 @@ mod tests {
                 "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
                 1,
             )],
-            &[(&output_address, 3_000_000)],
+            &[(&output_address, 3_000_000, None)],
             |body| {
                 let mut signers = Ed25519KeyHashes::new();
                 signers.add(&stake_key.to_public().to_raw_key().hash());
@@ -766,7 +1211,7 @@ mod tests {
                 "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
                 0,
             )],
-            &[(&address, 2_000_000)],
+            &[(&address, 2_000_000, None)],
             |body| {
                 let mut certs = Certificates::new();
                 let cert = Certificate::new_stake_delegation(&StakeDelegation::new(
@@ -815,7 +1260,7 @@ mod tests {
                 "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
                 0,
             )],
-            &[(&address, 2_000_000)],
+            &[(&address, 2_000_000, None)],
             |body| {
                 let mut withdrawals = Withdrawals::new();
                 withdrawals.insert(&reward_address, &BigNum::from(1_000_000u64));
@@ -834,6 +1279,495 @@ mod tests {
             [
                 "65a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128", // payment key
                 "097cdc1da25a445eda8db6c3f0a3c3ba86c6a9555df0b4010f4d042ed94c2206"  // stake key
+            ]
+        );
+    }
+
+    /// Build a source transaction whose outputs can be spent as UTXOs, returning
+    /// `(tx_hash, cbor_bytes)` with a real blake2b body hash.
+    fn build_utxo_source_tx(outputs: &[(&str, u64, Option<&[TestAsset]>)]) -> (String, Vec<u8>) {
+        let cbor = build_test_tx_cbor(
+            &[(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0,
+            )],
+            outputs,
+            |_body| {},
+        );
+        let tx = FixedTransaction::from_bytes(cbor.clone()).unwrap();
+        (tx.transaction_hash().to_hex(), cbor)
+    }
+
+    fn mock_tx_cbor_response(server: &mut Server, txs: &[(String, Vec<u8>)]) -> mockito::Mock {
+        let body: Vec<serde_json::Value> = txs
+            .iter()
+            .map(|(hash, cbor)| {
+                serde_json::json!({
+                    "tx_hash": hash,
+                    "cbor": hex::encode(cbor),
+                })
+            })
+            .collect();
+        server
+            .mock("POST", "/tx_cbor")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&body).unwrap())
+            .create()
+    }
+
+    #[test]
+    fn transaction_context_self_transfer() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let address = signer.derive_address(&key.expose()).unwrap();
+
+        let input_index = 0;
+        let input_value = 10_000_000;
+        let (input_tx_hash, source_cbor) = build_utxo_source_tx(&[(&address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, input_index)],
+            &[(&address, input_value - TX_FEE, None)],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = server.url();
+
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(
+            ctx.effects,
+            vec![TransactionEffect {
+                address,
+                diff: vec![("lovelace".into(), -(TX_FEE as i64))],
+            }]
+        );
+    }
+
+    #[test]
+    fn transaction_context_single_input_external_plus_change() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let my_address = signer.derive_address(&key.expose()).unwrap();
+        let external_address =
+            "addr1vyrqjj5nmz8emqexj7yc5wragnk0yfj4wznvjfccmrksxqcx2tst3".to_string();
+
+        let input_index = 0;
+        let input_value = 10_000_000u64;
+        let external_value = 3_000_000u64;
+        let change_value = input_value - external_value - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&my_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, input_index)],
+            &[
+                (&external_address, external_value, None),
+                (&my_address, change_value, None),
+            ],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = server.url();
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: my_address,
+                    diff: vec![("lovelace".into(), -4_000_000)],
+                },
+                TransactionEffect {
+                    address: external_address,
+                    diff: vec![("lovelace".into(), 3_000_000)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_single_input_external_plus_change_with_assets() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let my_address = signer.derive_address(&key.expose()).unwrap();
+        let external_address =
+            "addr1vyrqjj5nmz8emqexj7yc5wragnk0yfj4wznvjfccmrksxqcx2tst3".to_string();
+
+        let input_index = 0;
+        let input_value = 10_000_000u64;
+        let external_value = 3_000_000u64;
+        let change_value = input_value - external_value - TX_FEE;
+
+        let policy_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let asset_name = "746f6b656e";
+
+        let input_asset_qty = 100u64;
+        let external_asset_qty = 30u64;
+        let change_asset_qty = input_asset_qty - external_asset_qty;
+        let asset_id = format!("{policy_id}{asset_name}");
+
+        let input_assets: Vec<TestAsset> = vec![(policy_id, asset_name, input_asset_qty)];
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&my_address, input_value, Some(&input_assets))]);
+
+        let external_assets: Vec<TestAsset> = vec![(policy_id, asset_name, external_asset_qty)];
+        let change_assets: Vec<TestAsset> = vec![(policy_id, asset_name, change_asset_qty)];
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, input_index)],
+            &[
+                (&external_address, external_value, Some(&external_assets)),
+                (&my_address, change_value, Some(&change_assets)),
+            ],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+
+        let rpc_url = server.url();
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: my_address,
+                    diff: vec![(asset_id.clone(), -30), ("lovelace".into(), -4_000_000)],
+                },
+                TransactionEffect {
+                    address: external_address,
+                    diff: vec![(asset_id, 30), ("lovelace".into(), 3_000_000)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_two_inputs_a_b_two_outputs_a_b_rebalanced() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key_a = derive_key_material(&signer, &mnemonic, 0);
+        let key_b = derive_key_material(&signer, &mnemonic, 1);
+        let address_a = signer.derive_address(&key_a.expose()).unwrap();
+        let address_b = signer.derive_address(&key_b.expose()).unwrap();
+
+        let input_a_index = 0;
+        let input_b_index = 0;
+        let input_a_value = 8_000_000u64;
+        let input_b_value = 7_000_000u64;
+        let output_a_value = 5_000_000u64;
+        let output_b_value = input_a_value + input_b_value - output_a_value - TX_FEE;
+
+        let (input_a_hash, source_a_cbor) =
+            build_utxo_source_tx(&[(&address_a, input_a_value, None)]);
+        let (input_b_hash, source_b_cbor) =
+            build_utxo_source_tx(&[(&address_b, input_b_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[
+                (&input_a_hash, input_a_index),
+                (&input_b_hash, input_b_index),
+            ],
+            &[
+                (&address_a, output_a_value, None),
+                (&address_b, output_b_value, None),
+            ],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(
+            &mut server,
+            &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
+        );
+
+        let rpc_url = server.url();
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: address_a,
+                    diff: vec![("lovelace".into(), -3_000_000)],
+                },
+                TransactionEffect {
+                    address: address_b,
+                    diff: vec![("lovelace".into(), 2_000_000)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_inputs_a_b_outputs_a_c() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key_a = derive_key_material(&signer, &mnemonic, 0);
+        let key_b = derive_key_material(&signer, &mnemonic, 1);
+        let key_c = derive_key_material(&signer, &mnemonic, 2);
+        let address_a = signer.derive_address(&key_a.expose()).unwrap();
+        let address_b = signer.derive_address(&key_b.expose()).unwrap();
+        let address_c = signer.derive_address(&key_c.expose()).unwrap();
+
+        let input_a_index = 0;
+        let input_b_index = 0;
+        let input_a_value = 8_000_000u64;
+        let input_b_value = 7_000_000u64;
+        let output_a_value = 4_000_000u64;
+        let output_c_value = input_a_value + input_b_value - output_a_value - TX_FEE;
+
+        let (input_a_hash, source_a_cbor) =
+            build_utxo_source_tx(&[(&address_a, input_a_value, None)]);
+        let (input_b_hash, source_b_cbor) =
+            build_utxo_source_tx(&[(&address_b, input_b_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[
+                (&input_a_hash, input_a_index),
+                (&input_b_hash, input_b_index),
+            ],
+            &[
+                (&address_a, output_a_value, None),
+                (&address_c, output_c_value, None),
+            ],
+            |_body| {},
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(
+            &mut server,
+            &[(input_a_hash, source_a_cbor), (input_b_hash, source_b_cbor)],
+        );
+
+        let rpc_url = server.url();
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&rpc_url))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: address_a,
+                    diff: vec![("lovelace".into(), -4_000_000)],
+                },
+                TransactionEffect {
+                    address: address_b,
+                    diff: vec![("lovelace".into(), -7_000_000)],
+                },
+                TransactionEffect {
+                    address: address_c,
+                    diff: vec![("lovelace".into(), 10_000_000)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_withdrawal() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let reward_address = RewardAddress::new(
+            signer.network_id,
+            &Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash()),
+        );
+
+        let input_value = 10_000_000u64;
+        let withdrawal = 5_000_000u64;
+        let output_value = input_value + withdrawal - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut withdrawals = Withdrawals::new();
+                withdrawals.insert(&reward_address, &BigNum::from(withdrawal));
+                body.set_withdrawals(&withdrawals);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), (withdrawal - TX_FEE) as i64)],
+                },
+                TransactionEffect {
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), -(withdrawal as i64))],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_stake_registration_deposit() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+
+        let deposit = 2_000_000u64;
+        let input_value = 10_000_000u64;
+        let output_value = input_value - deposit - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut certs = Certificates::new();
+                let reg = StakeRegistration::new_with_explicit_deposit(
+                    &stake_cred,
+                    &BigNum::from(deposit),
+                );
+                certs.add(&Certificate::new_reg_cert(&reg).unwrap());
+                body.set_certs(&certs);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), -((deposit + TX_FEE) as i64))],
+                },
+                TransactionEffect {
+                    // Deposit is locked under the stake credential.
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), deposit as i64)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_context_with_stake_deregistration_refund() {
+        let signer = CardanoSigner::mainnet();
+        let mnemonic = Mnemonic::from_phrase(
+            "author cart lend blossom pistol rocket film just distance valid room lock",
+        )
+        .unwrap();
+        let key = derive_key_material(&signer, &mnemonic, 0);
+        let (_payment_key, stake_key) = CardanoSigner::decode_keys(key.expose()).unwrap();
+        let stake_key = stake_key.unwrap();
+        let payment_address = signer.derive_address(key.expose()).unwrap();
+        let reward_address_bech32 = signer.reward_address_bech32(&stake_key).unwrap();
+        let stake_cred = Credential::from_keyhash(&stake_key.to_public().to_raw_key().hash());
+
+        let refund = 2_000_000u64;
+        let input_value = 10_000_000u64;
+        let output_value = input_value + refund - TX_FEE;
+        let (input_tx_hash, source_cbor) =
+            build_utxo_source_tx(&[(&payment_address, input_value, None)]);
+
+        let tx_cbor = build_test_tx_cbor(
+            &[(&input_tx_hash, 0)],
+            &[(&payment_address, output_value, None)],
+            |body| {
+                let mut certs = Certificates::new();
+                let unreg = StakeDeregistration::new_with_explicit_refund(
+                    &stake_cred,
+                    &BigNum::from(refund),
+                );
+                certs.add(&Certificate::new_unreg_cert(&unreg).unwrap());
+                body.set_certs(&certs);
+            },
+        );
+
+        let mut server = Server::new();
+        let mock = mock_tx_cbor_response(&mut server, &[(input_tx_hash, source_cbor)]);
+        let ctx = signer
+            .make_transaction_context(&tx_cbor, Some(&server.url()))
+            .unwrap();
+        mock.assert();
+
+        assert_eq!(
+            ctx.effects,
+            vec![
+                TransactionEffect {
+                    address: payment_address,
+                    diff: vec![("lovelace".into(), (refund - TX_FEE) as i64)],
+                },
+                TransactionEffect {
+                    // Locked deposit is released from the stake credential.
+                    address: reward_address_bech32,
+                    diff: vec![("lovelace".into(), -(refund as i64))],
+                },
             ]
         );
     }

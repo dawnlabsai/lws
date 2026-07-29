@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use ows_core::ChainType;
 use ows_core::{ApiKeyFile, EncryptedWallet, OwsError};
 use ows_signer::{
     decrypt, eip712, encrypt_with_hkdf, signer_for_chain, ChainSigner, CryptoEnvelope, SecretBytes,
@@ -90,7 +91,16 @@ pub fn sign_with_api_key(
     let (key_file, wallet) = load_authorized_wallet(token, wallet_name_or_id, vault_path)?;
 
     let signer = signer_for_chain(chain);
-    let transaction = signer.make_transaction_context(tx_bytes, None)?;
+    let rpc_url = if chain.chain_type == ChainType::Cardano {
+        Some(crate::ops::resolve_rpc_url(
+            chain.chain_id,
+            chain.chain_type,
+            None,
+        )?)
+    } else {
+        None
+    };
+    let transaction = signer.make_transaction_context(tx_bytes, rpc_url.as_deref())?;
 
     let (key, _) = enforce_policies_and_decrypt_key(
         token,

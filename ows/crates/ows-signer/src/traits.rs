@@ -169,4 +169,7 @@ pub enum SignerError {
 
     #[error("address does not match derived address")]
     AddressMismatch,
+
+    #[error("RPC error: {0}")]
+    RpcError(String),
 }

@@ -766,6 +766,19 @@ pub fn sign_and_send(
         let (key_file, wallet_obj) =
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
         let signer = signer_for_chain(&chain_info);
+
+        // if rpc_url is provided, use it, otherwise, resolve it if the chain is Cardano, because it's needed in make_transaction_context
+        let resolved_rpc_url = match rpc_url {
+            Some(url) => Some(url.to_string()),
+            None if chain_info.chain_type == ChainType::Cardano => Some(resolve_rpc_url(
+                chain_info.chain_id,
+                chain_info.chain_type,
+                None,
+            )?),
+            None => None,
+        };
+        let rpc_url = resolved_rpc_url.as_deref();
+
         let transaction = signer.make_transaction_context(&tx_bytes, rpc_url)?;
         let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
@@ -840,7 +853,7 @@ pub fn decrypt_signing_key(
 }
 
 /// Resolve the RPC URL: explicit > config override (exact chain_id) > config (namespace) > built-in default.
-fn resolve_rpc_url(
+pub fn resolve_rpc_url(
     chain_id: &str,
     chain_type: ChainType,
     explicit: Option<&str>,
