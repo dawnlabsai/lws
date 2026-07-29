@@ -1,4 +1,5 @@
 pub mod bitcoin;
+pub mod cardano;
 pub mod cosmos;
 pub mod evm;
 pub mod filecoin;
@@ -12,6 +13,7 @@ pub mod tron;
 pub mod xrpl;
 
 pub use self::bitcoin::BitcoinSigner;
+pub use self::cardano::CardanoSigner;
 pub use self::cosmos::CosmosSigner;
 pub use self::evm::EvmSigner;
 pub use self::filecoin::FilecoinSigner;
@@ -43,6 +45,7 @@ pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
+        ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)),
     }
 }
 

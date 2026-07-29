@@ -35,7 +35,7 @@ pub struct WalletAccount {
 pub enum KeyType {
     Mnemonic,
     /// Multi-curve key pair: encrypted JSON `{"secp256k1":"hex","ed25519":"hex","ed25519_bip32":"hex"}`.
-    /// Supports all 6 chains.
+    /// Derives one account per [`crate::chain::universal_wallet_chains`] row from these keys.
     PrivateKey,
 }
 

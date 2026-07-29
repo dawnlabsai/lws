@@ -1,5 +1,5 @@
-use ows_core::{default_chain_for_type, ALL_CHAIN_TYPES};
-use ows_signer::{signer_for_chain, signer_for_chain_type, HdDeriver, Mnemonic};
+use ows_core::universal_wallet_chains;
+use ows_signer::{signer_for_chain, HdDeriver, Mnemonic};
 use zeroize::Zeroize;
 
 use crate::{parse_chain, CliError};
@@ -22,10 +22,9 @@ pub fn run(chain_str: Option<&str>, index: u32) -> Result<(), CliError> {
 
         println!("{address}");
     } else {
-        // Derive for all chains
-        for ct in &ALL_CHAIN_TYPES {
-            let chain = default_chain_for_type(*ct);
-            let signer = signer_for_chain_type(*ct);
+        // Derive for all universal-wallet networks (see `ows_core::universal_wallet_chains`)
+        for chain in universal_wallet_chains() {
+            let signer = signer_for_chain(&chain);
             let paths = signer.default_derivation_paths(index);
             let curve = signer.curve();
 

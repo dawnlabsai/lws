@@ -43,9 +43,10 @@ mod integration_tests {
     fn derive_address_for_chain(mnemonic: &Mnemonic, chain: ChainType) -> String {
         let signer = signer_for_chain_type(chain);
         let curve = signer.curve();
-        let path = signer.default_derivation_path(0);
+        let paths = signer.default_derivation_paths(0);
 
-        let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve).unwrap();
+        let keys = HdDeriver::derive_keys_from_mnemonic(mnemonic, "", paths, curve).unwrap();
+        let key = signer.encode_keys(&keys).unwrap();
         signer.derive_address(key.expose()).unwrap()
     }
 
@@ -140,6 +141,17 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_full_pipeline_cardano() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let address = derive_address_for_chain(&mnemonic, ChainType::Cardano);
+        assert!(
+            address.starts_with("addr1"),
+            "Cardano mainnet address should start with addr1, got: {address}"
+        );
+        assert_eq!(address.len(), 103);
+    }
+
+    #[test]
     fn test_spark_uses_bitcoin_derivation_path() {
         let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
         let btc_signer = signer_for_chain_type(ChainType::Bitcoin);
@@ -182,6 +194,7 @@ mod integration_tests {
         let spark_addr = derive_address_for_chain(&mnemonic, ChainType::Spark);
         let fil_addr = derive_address_for_chain(&mnemonic, ChainType::Filecoin);
         let xrpl_addr = derive_address_for_chain(&mnemonic, ChainType::Xrpl);
+        let cardano_addr = derive_address_for_chain(&mnemonic, ChainType::Cardano);
 
         // All addresses should be different
         let addrs = [
@@ -194,6 +207,7 @@ mod integration_tests {
             &spark_addr,
             &fil_addr,
             &xrpl_addr,
+            &cardano_addr,
         ];
         for i in 0..addrs.len() {
             for j in (i + 1)..addrs.len() {
@@ -264,6 +278,7 @@ mod integration_tests {
             ChainType::Spark,
             ChainType::Filecoin,
             ChainType::Xrpl,
+            ChainType::Cardano,
         ] {
             let signer = signer_for_chain_type(chain);
             assert_eq!(signer.chain_type(), chain);
