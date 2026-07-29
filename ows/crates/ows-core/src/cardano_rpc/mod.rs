@@ -5,14 +5,17 @@
 //! address' token balances. This module defines a provider-agnostic
 //! [`CardanoRpcProvider`] trait over those operations and
 //! [`resolve_cardano_provider`], which selects the concrete provider from an RPC
-//! URL. Provider-specific code lives in the [`koios`] submodule.
+//! URL. Provider-specific code lives in the [`koios`] and [`blockfrost`]
+//! submodules.
 //!
 //! The trait is synchronous (all call sites are effectively sync — the balance
 //! path bridges via `spawn_blocking`) and object-safe, so the resolver can hand
 //! back a `Box<dyn CardanoRpcProvider>`.
 
+mod blockfrost;
 mod koios;
 
+pub use blockfrost::BlockfrostProvider;
 pub use koios::KoiosProvider;
 
 use crate::TokenBalance;
@@ -53,9 +56,50 @@ pub trait CardanoRpcProvider: Send + Sync {
     fn get_balances(&self, address: &str) -> Result<Vec<TokenBalance>, CardanoRpcError>;
 }
 
+/// Environment variable holding the Blockfrost `project_id` (API key).
+pub const BLOCKFROST_PROJECT_ID_ENV: &str = "BLOCKFROST_PROJECT_ID";
+
+const BLOCKFROST_URL_PREFIX: &str = "blockfrost|";
+const KOIOS_URL_PREFIX: &str = "koios|";
+
+fn is_blockfrost_url(url: &str) -> bool {
+    url.starts_with(BLOCKFROST_URL_PREFIX) || url.contains("blockfrost.io/api")
+}
+
+fn is_koios_url(url: &str) -> bool {
+    url.starts_with(KOIOS_URL_PREFIX) || url.contains("koios.rest/api")
+}
+
+fn strip_provider_prefix(url: &str) -> &str {
+    url.strip_prefix(BLOCKFROST_URL_PREFIX)
+        .or_else(|| url.strip_prefix(KOIOS_URL_PREFIX))
+        .unwrap_or(url)
+}
+
 /// Select a Cardano RPC provider from its URL.
+///
+/// Blockfrost is selected when the URL contains `blockfrost.io/api` or is
+/// prefixed with `blockfrost|` (reading the `project_id` from
+/// [`BLOCKFROST_PROJECT_ID_ENV`]). Koios is selected when the URL contains
+/// `koios.rest/api` or is prefixed with `koios|`. Any other URL is rejected.
 pub fn resolve_cardano_provider(url: &str) -> Result<Box<dyn CardanoRpcProvider>, CardanoRpcError> {
-    Ok(Box::new(KoiosProvider::new(url)))
+    if is_blockfrost_url(url) {
+        let project_id = std::env::var(BLOCKFROST_PROJECT_ID_ENV).map_err(|_| {
+            CardanoRpcError::Rpc(format!(
+                "{BLOCKFROST_PROJECT_ID_ENV} environment variable is required for Blockfrost RPC"
+            ))
+        })?;
+        Ok(Box::new(BlockfrostProvider::new(
+            strip_provider_prefix(url),
+            project_id,
+        )))
+    } else if is_koios_url(url) {
+        Ok(Box::new(KoiosProvider::new(strip_provider_prefix(url))))
+    } else {
+        Err(CardanoRpcError::Rpc(format!(
+            "unsupported Cardano RPC URL: {url}"
+        )))
+    }
 }
 
 /// Shared blocking HTTP client used by the providers.
