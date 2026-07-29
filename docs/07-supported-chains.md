@@ -40,7 +40,7 @@ OWS groups chains into families that share a cryptographic curve and address der
 | Spark | secp256k1 | 8797555 | `m/84'/0'/0'/0/{index}` | `spark:` + compressed pubkey hex | `spark` |
 | Filecoin | secp256k1 | 461 | `m/44'/461'/0'/0/{index}` | `f1` + base32(blake2b-160) | `fil` |
 | NEAR | ed25519 | 397 | `m/44'/397'/{index}'` | 64-char lowercase hex of pubkey (implicit account) | `near` |
-| Cardano | Ed25519-BIP32 (CIP-1852) | 1815 | Payment `m/1852'/1815'/{index}'/0/0` + stake `m/1852'/1815'/0'/2/0` | Shelley Bech32 base (`addr1…` mainnet; `addr_test1…` testnets) | `cip34` |
+| Cardano | Ed25519-BIP32 (CIP-1852) | 1815 | Payment `m/1852'/1815'/{index}'/0/0` + stake `m/1852'/1815'/{index}'/2/0` | Shelley Bech32 base (`addr1…` mainnet; `addr_test1…` testnets) | `cip34` |
 
 
 ## Known Networks
