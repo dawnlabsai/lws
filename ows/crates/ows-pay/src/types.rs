@@ -245,7 +245,7 @@ pub struct MoonPayBalanceResponse {
     pub items: Vec<TokenBalance>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TokenBalance {
     pub address: String,
     pub name: String,
@@ -255,11 +255,15 @@ pub struct TokenBalance {
     pub balance: BalanceInfo,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BalanceInfo {
     pub amount: f64,
-    pub value: f64,
-    pub price: f64,
+    /// Fiat value when known (e.g. MoonPay). Absent for chains without pricing (e.g. Cardano via Koios).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// Spot price when known. Absent for chains without pricing.
+    #[serde(default)]
+    pub price: Option<f64>,
 }
 
 /// Result of `ows fund`.
