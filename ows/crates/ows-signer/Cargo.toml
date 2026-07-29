@@ -17,6 +17,8 @@ bitcoin = { version = "0.32", features = ["base64"] }
 xrpl-rust = { version = "1.1.0", default-features = false, features = ["core"] }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 ed25519-dalek = { version = "2", features = ["hazmat"] }
+ed25519-bip32 = "0.4.1"
+pbkdf2 = { version = "0.12", default-features = false, features = ["std"] }
 coins-bip32 = "0.11"
 coins-bip39 = "0.11"
 sha2 = "0.10"

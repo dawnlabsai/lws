@@ -644,6 +644,7 @@ mod tests {
             Some(&vault),
             None,
             None,
+            None,
         )
         .unwrap();
         let policy_id = setup_test_policy(&vault);

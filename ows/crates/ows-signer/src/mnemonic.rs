@@ -1,4 +1,5 @@
 use crate::zeroizing::SecretBytes;
+use coins_bip39::wordlist::Wordlist;
 use coins_bip39::{English, Mnemonic as Bip39Mnemonic};
 
 /// Mnemonic strength / word count.
@@ -41,6 +42,35 @@ impl Mnemonic {
     pub fn phrase(&self) -> SecretBytes {
         let phrase_str = self.inner.to_phrase();
         SecretBytes::new(phrase_str.into_bytes())
+    }
+
+    /// Raw BIP-39 entropy bytes (English wordlist; checksum bits excluded).
+    /// NOTE: assumes that the phrase is valid and in the English wordlist.
+    pub fn entropy(&self) -> SecretBytes {
+        use zeroize::Zeroize;
+
+        let phrase = self.inner.to_phrase();
+
+        let total_bits = phrase.split(' ').count() * 11;
+        let ent_bytes = (total_bits - total_bits / 33) / 8;
+
+        let mut out = Vec::with_capacity(total_bits / 8);
+        let mut acc: u32 = 0;
+        let mut acc_bits: u32 = 0;
+        for word in phrase.split(' ') {
+            acc = (acc << 11) | English::get_index(word).unwrap() as u32;
+            acc_bits += 11;
+            while acc_bits >= 8 {
+                acc_bits -= 8;
+                out.push((acc >> acc_bits) as u8);
+            }
+        }
+        out.truncate(ent_bytes);
+
+        acc.zeroize();
+        let mut phrase = phrase;
+        Zeroize::zeroize(unsafe { phrase.as_mut_vec() });
+        SecretBytes::new(out)
     }
 
     /// Derive a BIP-39 seed from this mnemonic with an optional passphrase.
@@ -123,6 +153,47 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_entropy_abandon_all_zero() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+        let ent = mnemonic.entropy();
+        assert_eq!(ent.expose(), &[0u8; 16]);
+    }
+
+    // BIP-39 test vectors (Trezor). The 24-word cases matter because 24 words carry
+    // 264 bits, so the last emitted byte is pure checksum and must be dropped.
+    #[test]
+    fn test_entropy_bip39_vectors() {
+        let cases: [(&str, &[u8]); 3] = [
+            (
+                "legal winner thank year wave sausage worth useful legal winner thank yellow",
+                &[0x7f; 16],
+            ),
+            (
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon art",
+                &[0x00; 32],
+            ),
+            (
+                "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo \
+                 zoo zoo zoo vote",
+                &[0xff; 32],
+            ),
+        ];
+
+        for (phrase, expected) in cases {
+            let mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+            let ent = mnemonic.entropy();
+            assert_eq!(
+                hex::encode(ent.expose()),
+                hex::encode(expected),
+                "entropy mismatch for '{phrase}'"
+            );
+        }
     }
 
     #[test]
