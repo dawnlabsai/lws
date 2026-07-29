@@ -16,13 +16,17 @@
 >    [Transaction and Message Signing](#3-transaction-and-message-signing-chain-plugin-interface)).
 > 5. **Policy engine support** — parsing an unsigned Cardano transaction (CBOR) into
 >    the chain-agnostic `TransactionContext` that the OWS Policy Engine evaluates,
->    resolving input UTxO values via the configured Koios RPC provider so that ADA
+>    resolving input UTxO values via the configured Cardano RPC provider (Koios or
+>    Blockfrost) so that ADA
 >    and native-asset flows can be computed per address (see
 >    [Policy Engine Support](#4-policy-engine-support)).
 > 6. **Address balance fetching** — ADA and native-asset balances for a Cardano
->    address, fetched from Koios (see
+>    address through `CardanoRpcProvider::get_balances` (see
 >    [Address balance fetching](#5-address-balance-fetching)).
-> 7. **Documentation and bindings** — this document, plus the optional `address`
+> 7. **Pluggable RPC providers** — a provider-agnostic `CardanoRpcProvider` trait
+>    with keyless **Koios** as the default and **Blockfrost** as an authenticated
+>    opt-in (see [Provider selection](#provider-selection)).
+> 8. **Documentation and bindings** — this document, plus the optional `address`
 >    argument exposed through the CLI and the Node/Python bindings (see
 >    [§3.6](#36-address-aware-sign_message-across-all-chains)).
 >
@@ -36,7 +40,8 @@ This specification adds Cardano mainnet support to the Open Wallet Standard (OWS
 reference implementation while preserving OWS's chain-agnostic, local-first design.
 It introduces the `cip34` CAIP-2 namespace and registers Cardano mainnet, preprod,
 and preview networks with canonical chain identifiers, a coin type, and default
-(keyless) Koios RPC endpoints. On the cryptographic side, it adds a new
+(keyless) Koios RPC endpoints, with optional Blockfrost support for deployments
+that prefer an authenticated provider. On the cryptographic side, it adds a new
 `Ed25519Bip32` curve (Ed25519-V2 / BIP32-Ed25519) implemented generically via the
 `ed25519-bip32` crate, together with the Cardano Icarus master-key scheme and
 CIP-1852 hierarchical derivation. Cardano accounts are derived from two credentials
@@ -53,7 +58,7 @@ and witness construction use `cardano-serialization-lib` (CSL), while the COSE
 message structures use Emurgo's `cardano-message-signing` companion library.
 Finally, it wires Cardano into the OWS Policy Engine: `make_transaction_context`
 parses an unsigned transaction (CBOR) and, because UTxO inputs carry no value,
-resolves them through the configured Koios RPC provider to compute per-address ADA
+resolves them through the configured Cardano RPC provider to compute per-address ADA
 and native-asset flows (`TransactionEffect`s) that built-in and executable policies
 can evaluate before a key is used.
 
@@ -145,9 +150,11 @@ drove a specific design decision later in this document:
 5. **CAIP-2 via CIP-34.** The chain identifier encodes both a network id and a
    network magic (`cip34:<networkId>-<networkMagic>`), rather than a single
    numeric/string reference.
-6. **CBOR transactions + keyless RPC.** Transactions are CBOR (parsed and
-   witness-encoded by CSL's `FixedTransaction`); the default RPC provider is
-   keyless Koios, with submission via a binary `POST /submittx`.
+6. **CBOR transactions + pluggable RPC.** Transactions are CBOR (parsed and
+   witness-encoded by CSL's `FixedTransaction`). Network access goes through a
+   provider-agnostic `CardanoRpcProvider` trait; the default is keyless Koios,
+   with Blockfrost available when the RPC URL points at Blockfrost and a
+   `BLOCKFROST_PROJECT_ID` is set.
 7. **COSE message signing (CIP-8).** Unlike most OWS chains, which sign a hashed
    or prefixed byte string, Cardano message signing follows CIP-8: the message is
    wrapped in a COSE `COSE_Sign1` structure whose protected headers carry the
@@ -213,11 +220,25 @@ testnet extras, Cardano contributes three rows:
 - `universal_wallet_chains()` therefore yields mainnet (via the family default)
   plus the two testnets, in a stable order.
 
-#### 1.4 RPC configuration (Koios, keyless)
+#### 1.4 RPC configuration (Koios and Blockfrost)
 
-OWS does not currently support authenticated RPC providers, so the default
-provider is **Koios**, which offers a keyless free tier. Default endpoints are
-registered in `Config::default_rpc()`:
+Cardano network access is implemented behind a provider-agnostic
+`CardanoRpcProvider` trait in `ows/crates/ows-core/src/cardano_rpc/`. Two concrete providers
+are supported:
+
+| Provider    | Authentication | Default |
+| ----------- | -------------- | ------- |
+| **Koios**   | None (keyless) | Yes     |
+| **Blockfrost** | `project_id` API key via the `BLOCKFROST_PROJECT_ID` environment variable | No (opt-in via RPC URL override) |
+
+Both providers implement the same three operations: broadcast a signed
+transaction (CBOR), fetch the CBOR of a set of transactions (used to resolve
+transaction inputs, see [§4.2](#42-parsing-and-input-resolution-cardanorpcproviderfetch_txs_cbor)),
+and fetch address token balances. `resolve_cardano_provider` selects the implementation from the
+configured RPC URL (see [Provider selection](#provider-selection) below).
+
+**Default endpoints (Koios).** Built-in defaults are registered in
+`Config::default_rpc()`:
 
 | Chain id            | Default RPC                         |
 | ------------------- | ----------------------------------- |
@@ -225,7 +246,40 @@ registered in `Config::default_rpc()`:
 | `cip34:0-1`         | `https://preprod.koios.rest/api/v1` |
 | `cip34:0-2`         | `https://preview.koios.rest/api/v1` |
 
-RPC resolution reuses the generic precedence already in place: explicit override
+**Blockfrost endpoints.** To use Blockfrost instead, override the RPC URL in
+user config to the Blockfrost API base for the target network, for example:
+
+| Network | Blockfrost RPC URL                                      |
+| ------- | ------------------------------------------------------- |
+| Mainnet | `https://cardano-mainnet.blockfrost.io/api/v0`          |
+| Preprod | `https://cardano-preprod.blockfrost.io/api/v0`          |
+| Preview | `https://cardano-preview.blockfrost.io/api/v0`          |
+
+Set `BLOCKFROST_PROJECT_ID` to your Blockfrost project id (API key) before any
+Cardano RPC call; without it, `resolve_cardano_provider` fails when the URL
+selects Blockfrost.
+
+##### Provider selection
+
+`resolve_cardano_provider` (`ows/crates/ows-core/src/cardano_rpc/mod.rs`) inspects the RPC
+URL string and returns a `Box<dyn CardanoRpcProvider>`:
+
+- **Blockfrost** — when the URL contains `blockfrost.io/api` **or** is prefixed
+  with `blockfrost|`. The prefix form is for custom Blockfrost-compatible hosts
+  that would not match the substring heuristic (e.g. `blockfrost|https://my-proxy.example/api/v0`).
+  The `project_id` is read from **`BLOCKFROST_PROJECT_ID`**; if the variable is
+  unset, resolution returns an error.
+- **Koios** — when the URL contains `koios.rest/api` **or** is prefixed with
+  `koios|` (same rationale for custom hosts).
+- **Any other URL** — rejected as unsupported.
+
+After selection, the `koios|` / `blockfrost|` prefix is stripped before the
+provider issues HTTP requests. All Cardano call sites — `broadcast_cardano`
+(`ows-lib`), `make_transaction_context` (`ows-signer`), and balance fetching
+(`ows-pay`) — go through `resolve_cardano_provider`, so the same URL override
+and provider-selection rules apply everywhere.
+
+RPC URL lookup reuses the generic precedence already in place: explicit override
 → user config exact `chain_id` → user config namespace match → built-in default.
 
 #### 1.5 Signer resolution
@@ -357,11 +411,13 @@ extended (`ows/crates/ows-lib/src/ops.rs`):
 
 #### 2.7 Broadcast plumbing
 
-`broadcast` dispatches `ChainType::Cardano` to `broadcast_cardano`, which POSTs the
-raw CBOR transaction to Koios `{rpc}/submittx` (`Content-Type: application/cbor`),
-expects HTTP `202`, and returns the 64-hex-character transaction hash. The fully
-signed CBOR produced by `encode_signed_transaction` (see [§3.4](#34-transaction-signing)) is
-what feeds this path.
+`broadcast` dispatches `ChainType::Cardano` to `broadcast_cardano`, which calls
+`resolve_cardano_provider` on the configured RPC URL and submits the signed CBOR
+via `CardanoRpcProvider::broadcast_tx` (Koios: `POST {rpc}/submittx` with
+`Content-Type: application/cbor`, HTTP `202`; Blockfrost:
+`POST {rpc}/tx/submit`). The fully signed CBOR produced by
+`encode_signed_transaction` (see [§3.4](#34-transaction-signing)) is what feeds
+this path.
 
 ### 3. Transaction and message signing (Chain Plugin Interface)
 
@@ -559,38 +615,41 @@ locked at those UTxOs. To compute how much each address gains or loses, the sign
 must resolve every referenced input to its underlying UTxO. This is the
 architectural consequence flagged in the scope: unlike the account-based effects on
 other chains, building a Cardano `TransactionContext` **depends on network access**
-to the configured RPC provider (Koios).
+to the configured RPC provider (Koios or Blockfrost).
 
 Accordingly, `make_transaction_context` takes an `Option<&str>` RPC URL, and the
 `ows-lib` call sites that build the policy context — `sign_and_send`
-(`ops.rs`) and `sign_with_api_key` (`key_ops.rs`) — now resolve the Koios endpoint
-for Cardano and pass it through. Resolution reuses the generic precedence
+(`ops.rs`) and `sign_with_api_key` (`key_ops.rs`) — resolve the Cardano RPC
+endpoint and pass it through. Resolution reuses the generic precedence
 (explicit override → config exact `chain_id` → config namespace → built-in
-default; see [§1.4](#14-rpc-configuration-koios-keyless)); `resolve_rpc_url` was
-made `pub(crate)`-visible for this. For every non-Cardano chain the URL stays
-`None`, so no network call is introduced anywhere else.
+default; see [§1.4](#14-rpc-configuration-koios-and-blockfrost)); `resolve_rpc_url`
+was made `pub(crate)`-visible for this. For every non-Cardano chain the URL
+stays `None`, so no network call is introduced anywhere else.
 
-#### 4.2 Parsing and input resolution (Koios `tx_cbor`)
+#### 4.2 Parsing and input resolution (`CardanoRpcProvider::fetch_txs_cbor`)
 
 `CardanoSigner::make_transaction_context` (`ows/crates/ows-signer/src/chains/cardano.rs`):
 
 1. Parse the bytes into a CSL `FixedTransaction` (`InvalidTransaction` on failure),
    and record the raw hex for `TransactionContext.raw_hex`.
 2. Collect input references as `(tx_hash_hex, index)` pairs from `tx.body().inputs()`.
-3. If there are inputs, an RPC URL is **required** (else `InvalidMessage`). Inputs are
-   resolved *not* by asking Koios for UTxO values, but by fetching the **CBOR of each
-   referenced transaction** (`fetch_txs_cbor`, one request set per unique tx hash) and
-   reading the referenced output out of it: `POST {rpc}/tx_cbor` with
-   `{"_tx_hashes": [...]}`.
-   - Requests are **chunked** at 10 hashes per call and use a blocking `reqwest`
-     client with a `45s` timeout.
-   - Non-2xx responses become `SignerError::RpcError`.
+3. If there are inputs, an RPC URL is **required** (else `InvalidMessage`);
+   `resolve_cardano_provider` selects Koios or Blockfrost from the URL (see
+   [§1.4](#14-rpc-configuration-koios-and-blockfrost)). Inputs are resolved *not*
+   by asking the provider for UTxO values, but by fetching the **CBOR of each
+   referenced transaction** (`CardanoRpcProvider::fetch_txs_cbor`, one request set
+   per unique tx hash) and reading the referenced output out of it:
+   - **Koios** — `POST {rpc}/tx_cbor` with `{"_tx_hashes": [...]}`, **chunked** at
+     10 hashes per call.
+   - **Blockfrost** — per-transaction `GET {rpc}/txs/{hash}/cbor` (no batch
+     endpoint); a `404` is skipped, so the result may be partial.
+   - Both providers use a blocking `reqwest` client with a `45s` timeout.
+   - Failures map to `SignerError::RpcError`.
 4. Each returned CBOR is decoded into a `FixedTransaction` and its
    `transaction_hash()` is compared against the hash it was requested under; a
    mismatch is a hard `RpcError`. A hash missing from the response is likewise an
-   `RpcError`, and an input whose index is past the end of the source transaction's
-   outputs is an `InvalidTransaction` (a missing input would silently understate the
-   flow, so it is rejected rather than ignored).
+   `RpcError`, and an input whose index is past the end of the source
+   transaction's outputs is an `InvalidTransaction`.
 
 Each resolved `Utxo` carries the input's `address`, its lovelace amount, and a list
 of native assets keyed by `policy_id ‖ asset_name` (hex), all read from the source
@@ -600,7 +659,8 @@ transaction's output.
 
 The signer builds two `address → (asset_id → amount)` maps and diffs them:
 
-- **Inputs** map is populated from the resolved input UTxOs (value → `lovelace`,
+- **Inputs** map is populated from the resolved provider UTxOs (lovelace →
+  `lovelace`,
   each native asset → `policy_id ‖ asset_name`).
 - **Outputs** map is read directly from `tx.body().outputs()`: the `coin` becomes
   `lovelace`, and each `multiasset` entry becomes `policy_id_hex ‖ asset_name_hex`.
@@ -636,25 +696,36 @@ built-in rules and to executable policies over stdin.
 
 ### 5. Address balance fetching
 
-`get_cardano_balances` (`ows/crates/ows-pay/src/cardano.rs`) queries the
-configured Koios RPC URL (`ows-pay`'s `get_balances` requires an explicit RPC
-URL for Cardano — a missing one is `PayErrorCode::InvalidInput`) and returns the
-generic `TokenBalance` list that every other chain in `ows-pay` produces:
+Balance queries go through the same provider abstraction.
+`get_cardano_balances` (`ows/crates/ows-pay/src/cardano.rs`) resolves the
+configured RPC URL with `resolve_cardano_provider` and calls
+`CardanoRpcProvider::get_balances(address)`, returning the generic
+`TokenBalance` list that every other chain in `ows-pay` produces:
 
 - ADA is reported with `address: "lovelace"`, symbol `ADA`, and 6 decimals; the
   amount is the lovelace total scaled by `10^-6`.
 - Each native asset is reported with `address` set to its **asset fingerprint**
   (`asset1…`), `name` set to `policy_id.asset_name`, and `symbol`/`decimals`
   taken from the token-registry metadata — falling back to the first 10
-  characters of the asset name and `0` decimals when no metadata exists.
+  characters of the asset name and `0` decimals when no metadata exists. On
+  Blockfrost the fingerprint comes from the per-asset lookup, so when
+  `GET {rpc}/assets/{unit}` returns a non-success status the `address` falls back
+  to the raw `policy_id ‖ asset_name` hex instead of an `asset1…` fingerprint.
   Zero-quantity entries are dropped, and the list is sorted by descending
   amount.
 - **Koios** reads `POST {rpc}/address_info` (summing `asset_list` across the
   UTxO set) and resolves metadata via `POST {rpc}/asset_info`, chunked.
+  **Blockfrost** reads `GET {rpc}/addresses/{address}` and one
+  `GET {rpc}/assets/{unit}` per native asset; a `404` on the address means "no
+  balances" rather than an error.
 
-Errors are mapped onto `PayErrorCode`: transport → `HttpTransport`, non-success
-status → `HttpStatus`, and an undecodable response body or amount → the new
-`InvalidData`.
+The provider API is blocking, so the `async` wrapper runs it on
+`tokio::task::spawn_blocking`. Errors are mapped onto `PayErrorCode`: a failure to
+select a provider from the configured RPC URL — an unsupported host, or a
+Blockfrost URL with no `BLOCKFROST_PROJECT_ID` (see
+[§1.4](#14-rpc-configuration-koios-and-blockfrost)) — is `InvalidInput`, while the
+provider's own errors map transport → `HttpTransport`, non-success status →
+`HttpStatus`, and an undecodable response body or amount → the new `InvalidData`.
 
 ## Rationale
 
@@ -729,27 +800,28 @@ status → `HttpStatus`, and an undecodable response body or amount → the new
 - **RPC-resolved transaction effects for policy.** Cardano inputs carry no value,
   so a meaningful `TransactionContext` cannot be built from the transaction bytes
   alone. Rather than inventing a Cardano-only policy path, the existing
-  `make_transaction_context` hook is overridden to resolve inputs via Koios and emit
+  `make_transaction_context` hook is overridden to resolve inputs via the
+  configured `CardanoRpcProvider` (Koios or Blockfrost) and emit
   the same chain-agnostic `TransactionEffect` shape every other chain uses — so
   executable policies see uniform per-address asset deltas regardless of chain. The
   RPC dependency is threaded only for Cardano; all other chains keep passing `None`.
-- **Reject missing input UTxOs.** If Koios omits a referenced transaction, returns
-  CBOR whose hash does not match, or the referenced output index does not exist,
-  `make_transaction_context` errors instead of proceeding. An unresolved input would
-  silently understate the ADA/asset outflow and could let a spending policy pass a
-  transaction it should have denied, so a partial resolution is treated as a hard
-  failure.
+- **Reject missing input UTxOs.** If the provider omits a referenced transaction,
+  returns CBOR whose hash does not match, or the referenced output index does not
+  exist, `make_transaction_context` errors instead of proceeding. An unresolved
+  input would silently understate the ADA/asset outflow and could let a spending
+  policy pass a transaction it should have denied, so a partial resolution is
+  treated as a hard failure.
 
   > **⚠️ Warning — chained/unconfirmed transactions.** This same strictness breaks
   > transaction *chaining*. If a transaction spends an input that was created by an
-  > earlier transaction which has **not yet been confirmed in a block**, Koios does
-  > not know that transaction yet and omits it from the `tx_cbor` response. Because
-  > the returned data is then incomplete,
-  > `make_transaction_context` fails (surfaced as `RpcError` —
-  > "missing transaction CBOR") and the signing request is rejected, even though
+  > earlier transaction which has **not yet been confirmed in a block**, the RPC
+  > provider does not know that transaction yet and omits it from the response.
+  > Because the returned data is then incomplete,
+  > `make_transaction_context` fails (surfaced as `InvalidTransaction` or
+  > `RpcError`) and the signing request is rejected, even though
   > the transaction itself is well-formed. In other words, a transaction cannot be
   > signed through the policy engine until every input it references has been
-  > confirmed and indexed by Koios. Building and submitting a chain of dependent
+  > confirmed and indexed by the provider. Building and submitting a chain of dependent
   > transactions back-to-back (before the parents confirm) is therefore not currently
   > supported.
 - **Deterministic effect ordering.** Effects are sorted by address and each `diff`
@@ -766,7 +838,8 @@ These deliverables are considered complete when:
 2. `parse_chain` resolves `cardano`, `cardano-preprod`, `cardano-preview`, and the
    corresponding `cip34:*` ids; `default_chain_for_type(Cardano)` is mainnet.
 3. Default Koios RPC endpoints are registered for all three networks and resolved
-   by the generic RPC lookup.
+   by the generic RPC lookup; Blockfrost is selectable by RPC URL override plus
+   `BLOCKFROST_PROJECT_ID`.
 4. `Curve::Ed25519Bip32` reports correct key lengths (96 / 32).
 5. `HdDeriver` produces the correct Icarus master `XPrv` from entropy (matches
    published vectors) and performs V2 child derivation, including the CIP-1852
@@ -793,16 +866,16 @@ These deliverables are considered complete when:
     `encode_keys` returns the 192-byte payment ‖ stake buffer; all other chains
     remain on their single-path defaults.
 12. `make_transaction_context` parses an unsigned Cardano transaction, resolves its
-    inputs via Koios `tx_cbor`, and produces per-address `TransactionEffect`s with
-    correct signed ADA and native-asset diffs (verified against mocked Koios
-    responses for self-transfer, external+change, asset-carrying, and
-    multi-input/multi-output cases); withdrawals and certificate deposits/refunds
-    are booked against the corresponding reward address; it errors when the RPC URL
-    is missing for a transaction with inputs, or when Koios returns incomplete
-    transaction data.
+    inputs via the configured provider (Koios or Blockfrost), and produces
+    per-address `TransactionEffect`s with correct signed ADA and native-asset diffs
+    (verified against mocked provider responses for self-transfer, external+change,
+    asset-carrying, and multi-input/multi-output cases); withdrawals and
+    certificate deposits/refunds are booked against the corresponding reward
+    address; it errors when the RPC URL is missing for a transaction with inputs,
+    or when the provider returns incomplete UTxO data.
 13. Address balance fetching returns ADA under `lovelace` plus one entry per
     native asset (fingerprint, `policy_id.asset_name`, token-registry
-    symbol/decimals), and an amount that cannot be decoded
+    symbol/decimals) on both providers, and an amount that cannot be decoded
     fails with `PayErrorCode::InvalidData` instead of reporting `0`.
 
 ### Implementation Plan
@@ -811,12 +884,12 @@ Everything specified above is landed and covered by unit/integration tests (see
 [Testing](#testing)): the chain-registry/addressing layer, Ed25519-BIP32 key
 derivation, the chain plugin interface (Shelley base/enterprise/reward address
 encoding, raw signing, CIP-8 message signing, and transaction signing/witness
-encoding), policy-engine support (`make_transaction_context` with Koios input
-resolution), address balance fetching, and the CLI/binding surface for the
-optional `address` argument. Remaining Cardano work (separate deliverables)
-proceeds as: transaction *building* (input selection, fee/change), persisting
-both payment and stake paths per `WalletAccount`, and optional alternative RPC
-providers (e.g. Blockfrost).
+encoding), policy-engine support (`make_transaction_context` with provider-based
+input resolution), address balance fetching, a pluggable Cardano RPC layer (Koios
+default, Blockfrost opt-in), and the CLI/binding surface for the optional
+`address` argument. Remaining Cardano work (separate deliverables) proceeds as:
+transaction *building* (input selection, fee/change) and persisting both payment
+and stake paths per `WalletAccount`.
 
 ## Backwards Compatibility Assessment
 
@@ -841,7 +914,7 @@ providers (e.g. Blockfrost).
   The lib call sites resolve an RPC URL only for Cardano (all other chains keep
   passing `None`), so no new network call is introduced for existing chains.
 - **New network dependency for Cardano signing requests.** Building a Cardano
-  policy context now performs a Koios call when the transaction has inputs; a Cardano
+  policy context now performs an RPC call when the transaction has inputs; a Cardano
   signing request that previously would have proceeded with empty effects now
   requires provider reachability (and errors if none is configured/available). This
   is intended — the policy engine needs the flow to make a decision — but it is a
@@ -885,9 +958,11 @@ providers (e.g. Blockfrost).
 - **Key cache isolation.** The derivation cache key includes the curve tag, so
   Ed25519-BIP32 keys cannot be confused with secp256k1/ed25519 keys derived at the
   same BIP path string.
-- **Keyless RPC.** Koios needs no API key, avoiding credential storage. Broadcast
-  is performed over HTTPS; transaction submission and input resolution will rely on
-  this provider, so provider availability/trust is a deployment consideration.
+- **RPC providers.** Koios needs no API key, avoiding credential storage for the
+  default deployment. Blockfrost authenticates with a `project_id` read from
+  `BLOCKFROST_PROJECT_ID` (not stored in the wallet config). Broadcast and input
+  resolution rely on whichever provider the RPC URL selects, so provider
+  availability and trust are deployment considerations.
 - **Address-bound message signing.** `sign_message` always re-derives the address
   from the supplied key material and refuses to sign for an `address` the key does
   not control (`AddressMismatch`). The signing address is embedded in the CIP-8
@@ -904,19 +979,21 @@ providers (e.g. Blockfrost).
   Transaction *content* is not otherwise inspected or policy-checked here —
   the signer trusts the caller-provided unsigned CBOR — so transaction building and
   vetting remain the responsibility of upstream layers.
-- **Trust in the RPC-derived context.** Cardano input values come from Koios, so the
-  `TransactionContext` a policy evaluates is only as trustworthy as the RPC
-  provider. Fetching whole source transactions rather than endpoint-computed UTxO
-  values narrows that trust: each returned CBOR is re-hashed and must match the hash
-  it was requested under, so the endpoint cannot fabricate input values under a tx
-  hash the transaction actually references (it can still withhold a transaction,
-  which fails closed). The keyless Koios default trades authentication for
-  operational simplicity; deployments with stronger requirements should point RPC
-  config at a trusted provider. To limit silent under-reporting, a transaction with
-  inputs and no RPC URL is rejected, and any input Koios fails to return aborts
-  context construction rather than degrading to a partial view. On the balance path
-  the same strictness applies: an unparseable lovelace balance or asset quantity is
-  a hard `PayErrorCode::InvalidData` error rather than a silent `0`, so a
+- **Trust in the RPC-derived context.** Cardano input values come from the
+  configured RPC provider, so the `TransactionContext` a policy evaluates is only
+  as trustworthy as that endpoint. Fetching whole source transactions rather than
+  provider-computed UTxO values narrows that trust: each returned CBOR is re-hashed
+  and must match the hash it was requested under, so a provider cannot fabricate
+  input values under a tx hash the transaction actually references (it can still
+  withhold a transaction, which fails closed). The keyless Koios default
+  trades authentication for operational simplicity; deployments with stronger
+  requirements can point RPC config at Blockfrost (with `BLOCKFROST_PROJECT_ID`) or
+  another trusted host via the `koios|` / `blockfrost|` URL prefixes. To limit
+  silent under-reporting, a transaction with inputs and no RPC URL is rejected,
+  and incomplete UTxO resolution aborts context construction rather than degrading
+  to a partial view. On the balance path the same strictness applies to both
+  providers: an unparseable lovelace balance or asset quantity is a hard `Decode`
+  error (surfaced as `PayErrorCode::InvalidData`) rather than a silent `0`, so a
   malformed response cannot understate holdings. Nullable Koios fields
   (`asset_list`, `asset_name`, token-registry `decimals`) are modelled as optional
   and default to empty/`0`, because their absence is a normal response shape rather
@@ -930,6 +1007,8 @@ Components modified or added:
   coin type `1815`; mainnet/preprod/preview registry entries;
   `UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES`; `parse_chain` support.
 - `ows/crates/ows-core/src/config.rs` — default Koios RPC endpoints for the three networks.
+- `ows/crates/ows-core/src/cardano_rpc/` — `CardanoRpcProvider` trait,
+  `resolve_cardano_provider`, `KoiosProvider`, and `BlockfrostProvider`.
 - `ows/crates/ows-core/src/wallet_file.rs` — `KeyType::PrivateKey` doc updated to include
   `ed25519_bip32`.
 - `ows/crates/ows-signer/src/curve.rs` — `Curve::Ed25519Bip32` and key lengths.
@@ -941,20 +1020,21 @@ Components modified or added:
   network selection, and the full `ChainSigner` impl: base/enterprise/reward
   address encoding, `sign`, CIP-8 `sign_message`, `sign_transaction`,
   `encode_signed_transaction`, the `default_derivation_paths` / `encode_keys`
-  overrides, and the `make_transaction_context` override plus its Koios `tx_cbor`
-  client (`fetch_txs_cbor`), which also books withdrawals and certificate
-  deposits/refunds against the reward address.
+  overrides, and the `make_transaction_context` override (resolves inputs via
+  `resolve_cardano_provider` and `CardanoRpcProvider::fetch_txs_cbor`, and books
+  withdrawals and certificate deposits/refunds against the reward address).
 - `ows/crates/ows-signer/src/traits.rs` — `sign_message` gains `address: Option<&str>`; new
   default methods `verify_sign_message_address`, `default_derivation_paths`, and
   `encode_keys`; new `SignerError::AddressMismatch` and `SignerError::RpcError`.
   (`make_transaction_context` already existed as a default-empty hook; Cardano now
   overrides it.)
 - `ows/crates/ows-lib/src/ops.rs` & `ows/crates/ows-lib/src/key_ops.rs` — `sign_and_send` and
-  `sign_with_api_key` resolve the Koios RPC URL for Cardano and pass it into
-  `make_transaction_context`; `resolve_rpc_url` is exposed for reuse.
+  `sign_with_api_key` resolve the Cardano RPC URL and pass it into
+  `make_transaction_context`; `broadcast_cardano` uses `resolve_cardano_provider`;
+  `resolve_rpc_url` is exposed for reuse.
 - `ows/crates/ows-pay/src/cardano.rs` & `ows/crates/ows-pay/src/error.rs` — address balance fetching via
-  Koios `address_info` / `asset_info`; new `PayErrorCode::InvalidData` for a
-  response whose amounts cannot be decoded.
+  `CardanoRpcProvider::get_balances`; new `PayErrorCode::InvalidData` for a
+  provider response whose amounts cannot be decoded.
 - `ows/crates/ows-signer/src/chains/*.rs` — every chain's `sign_message` updated to the new
   signature and calls `verify_sign_message_address`.
 - `ows/crates/ows-signer/src/chains/mod.rs` & `lib.rs` — register `CardanoSigner` in
@@ -983,12 +1063,13 @@ Dependencies added:
   (`ows/crates/ows-signer/Cargo.toml`).
 - `emurgo-cardano-message-signing = "1.1.0"` — CIP-8 COSE message-signing helpers
   (`ows/crates/ows-signer/Cargo.toml`).
-- `reqwest = "0.12"` (blocking, `json`, `rustls-tls`, no default features) — Koios
-  `tx_cbor` HTTP client used to resolve transaction inputs for the policy context
-  (`ows/crates/ows-signer/Cargo.toml`).
-- `mockito = "1"` (dev-dependency) — mocks the Koios endpoints in the
-  `make_transaction_context` and balance tests
-  (`ows/crates/ows-signer/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`).
+- `reqwest = "0.12"` (`json`, `rustls-tls`, no default features; `blocking` in
+  `ows-core`) — HTTP client for the Cardano RPC providers
+  (`ows/crates/ows-core/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`).
+- `mockito = "1"` (dev-dependency) — mocks provider endpoints in the
+  `make_transaction_context`, `cardano_rpc`, and balance tests
+  (`ows/crates/ows-core/Cargo.toml`, `ows/crates/ows-pay/Cargo.toml`,
+  `ows/crates/ows-signer/Cargo.toml`).
 
 ## Testing
 
@@ -1038,21 +1119,22 @@ Implemented and passing for these deliverables:
 - **Integration** (`lib.rs`): `signer_for_chain` derives a mainnet `addr1…` base
   address via `default_derivation_paths`, `encode_keys`, and `derive_address`, now
   passing end-to-end.
-- **Policy context** (`cardano.rs`): `make_transaction_context` is exercised with a
-  mocked Koios `tx_cbor` endpoint (`mockito`, serving real CBOR for the source
-  transactions) across the flow shapes that matter
-  for policy evaluation — a self-transfer (only the negative fee shows up), a single
-  input with an external payment plus change, the same with a native asset split
-  between external and change outputs, and multi-input/multi-output transactions
-  that rebalance across the wallet's own addresses and to a third party. Three
-  staking shapes are covered on top of those: a **withdrawal** (reward address
-  debited, payment address credited with the withdrawal minus the fee), a **stake
-  registration deposit** (payment address debited by deposit + fee, reward address
-  credited with the locked deposit), and a **stake deregistration refund** (the
-  mirror image). Each asserts
-  the exact sorted `effects` (per-address signed lovelace and asset diffs) and that
-  the mock endpoint was hit. Balance fetching (`ows-pay/src/cardano.rs`) is covered
-  by tests against mocked Koios `address_info` / `asset_info` endpoints.
+- **Policy context** (`cardano.rs`, `cardano_rpc/`): `make_transaction_context` is
+  exercised with a mocked Koios `tx_cbor` endpoint (`mockito`, via the `koios|`
+  URL prefix, serving real CBOR for the source transactions) across the flow shapes
+  that matter for policy evaluation — a
+  self-transfer (only the negative fee shows up), a single input with an external
+  payment plus change, the same with a native asset split between external and
+  change outputs, and multi-input/multi-output transactions that rebalance across
+  the wallet's own addresses and to a third party. Three staking shapes are covered
+  on top of those: a **withdrawal** (reward address debited, payment address
+  credited with the withdrawal minus the fee), a **stake registration deposit**
+  (payment address debited by deposit + fee, reward address credited with the
+  locked deposit), and a **stake deregistration refund** (the mirror image). Each
+  asserts the exact sorted
+  `effects` (per-address signed lovelace and asset diffs) and that the mock
+  endpoint was hit. `KoiosProvider` and `BlockfrostProvider` have dedicated unit
+  tests for broadcast, transaction-CBOR fetch, and balance queries.
 
 ## References
 
@@ -1068,5 +1150,6 @@ Implemented and passing for these deliverables:
 - [`cardano-message-signing`](https://github.com/Emurgo/message-signing)
 - [RFC 8152: CBOR Object Signing and Encryption (COSE)](https://www.rfc-editor.org/rfc/rfc8152)
 - [Koios API](https://api.koios.rest/)
+- [Blockfrost API](https://blockfrost.io/)
 - [CAIP-2](https://chainagnostic.org/CAIPs/caip-2) and [CAIP-10](https://chainagnostic.org/CAIPs/caip-10)
 - [SLIP-44: Registered coin types](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (ADA = 1815)
