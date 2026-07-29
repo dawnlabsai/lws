@@ -13,41 +13,31 @@ use emurgo_cardano_message_signing::{
     HeaderMap, Headers, Label, ProtectedHeaderMap, SignedMessage,
 };
 use ows_core::policy::{TransactionContext, TransactionEffect};
-use ows_core::ChainType;
-use serde::{Deserialize, Serialize};
+use ows_core::{CardanoRpcProvider, ChainType};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 pub struct CardanoSigner {
     network_id: u8,
 }
 
 const LOVELACE_ASSET_ID: &str = "lovelace";
-const KOIOS_TXS_CBOR_CHUNK_SIZE: usize = 10;
-const KOIOS_REQUESTS_TIMEOUT: Duration = Duration::from_secs(45);
 
 type AssetBalanceMap = BTreeMap<String, u64>;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosAssetListItem {
+struct Asset {
     policy_id: String,
     asset_name: String,
-    quantity: String,
+    quantity: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosUtxoInfoRow {
+struct Utxo {
+    #[allow(dead_code)]
     tx_hash: String,
+    #[allow(dead_code)]
     tx_index: u32,
     address: String,
-    value: String,
-    asset_list: Option<Vec<KoiosAssetListItem>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct KoiosTxCborRow {
-    tx_hash: String,
-    cbor: String,
+    lovelace: u64,
+    assets: Vec<Asset>,
 }
 
 impl CardanoSigner {
@@ -275,61 +265,13 @@ impl CardanoSigner {
             .or_insert(0) += amount;
     }
 
-    fn fetch_txs_cbor(
-        koios_base_url: &str,
-        tx_hashes: &[String],
-    ) -> Result<BTreeMap<String, String>, SignerError> {
-        if tx_hashes.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(KOIOS_REQUESTS_TIMEOUT)
-            .build()
-            .map_err(|e| SignerError::RpcError(e.to_string()))?;
-
-        let base_url = koios_base_url.trim_end_matches('/');
-        let url = format!("{base_url}/tx_cbor");
-        let mut txs_cbor: BTreeMap<String, String> = BTreeMap::new();
-
-        for chunk in tx_hashes.chunks(KOIOS_TXS_CBOR_CHUNK_SIZE) {
-            let body = serde_json::json!({
-                "_tx_hashes": chunk,
-            });
-
-            let resp = client
-                .post(&url)
-                .json(&body)
-                .send()
-                .map_err(|e| SignerError::RpcError(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().unwrap_or_default();
-                return Err(SignerError::RpcError(format!(
-                    "Koios tx_cbor returned {status}: {text}"
-                )));
-            }
-
-            let fetched: Vec<KoiosTxCborRow> = resp
-                .json()
-                .map_err(|e| SignerError::RpcError(format!("Koios tx_cbor JSON: {e}")))?;
-
-            for row in fetched {
-                txs_cbor.insert(row.tx_hash, row.cbor);
-            }
-        }
-
-        Ok(txs_cbor)
-    }
-
     /// Fetches UTXOs by retrieving each referenced transaction's CBOR and verifying
     /// that `transaction_hash()` matches the expected hash. This prevents a malicious
     /// RPC provider from returning fabricated UTXO data under a trusted tx hash.
     fn fetch_utxos(
-        koios_base_url: &str,
+        provider: &dyn CardanoRpcProvider,
         input_refs: &[(String, u32)],
-    ) -> Result<Vec<KoiosUtxoInfoRow>, SignerError> {
+    ) -> Result<Vec<Utxo>, SignerError> {
         if input_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -341,7 +283,9 @@ impl CardanoSigner {
             .into_iter()
             .collect();
 
-        let txs_cbor = Self::fetch_txs_cbor(koios_base_url, &unique_hashes)?;
+        let txs_cbor = provider
+            .fetch_txs_cbor(&unique_hashes)
+            .map_err(|e| SignerError::RpcError(e.to_string()))?;
 
         for hash in &unique_hashes {
             if !txs_cbor.contains_key(hash) {
@@ -390,7 +334,7 @@ impl CardanoSigner {
             })?;
             let lovelace: u64 = output.amount().coin().into();
 
-            let asset_list = match output.amount().multiasset() {
+            let assets = match output.amount().multiasset() {
                 Some(ma) if ma.keys().len() > 0 => {
                     let mut assets = Vec::new();
                     for policy_id_index in 0..ma.keys().len() {
@@ -399,24 +343,24 @@ impl CardanoSigner {
                         for asset_index in 0..policy_assets.len() {
                             let asset_name = policy_assets.keys().get(asset_index);
                             let quantity: u64 = policy_assets.get(&asset_name).unwrap().into();
-                            assets.push(KoiosAssetListItem {
+                            assets.push(Asset {
                                 policy_id: policy_id.to_hex(),
                                 asset_name: hex::encode(asset_name.name()),
-                                quantity: quantity.to_string(),
+                                quantity,
                             });
                         }
                     }
-                    Some(assets)
+                    assets
                 }
-                _ => None,
+                _ => Vec::new(),
             };
 
-            utxos.push(KoiosUtxoInfoRow {
+            utxos.push(Utxo {
                 tx_hash: tx_hash.clone(),
                 tx_index: *index,
                 address,
-                value: lovelace.to_string(),
-                asset_list,
+                lovelace,
+                assets,
             });
         }
 
@@ -658,12 +602,14 @@ impl ChainSigner for CardanoSigner {
 
         let mut inputs_balances_by_address: BTreeMap<String, AssetBalanceMap> = BTreeMap::new();
         if !tx_input_refs.is_empty() {
-            let koios_base_url = rpc_url.ok_or_else(|| {
+            let rpc_url = rpc_url.ok_or_else(|| {
                 SignerError::InvalidMessage(
-                    "Koios RPC URL is required to fetch Cardano transaction inputs".into(),
+                    "Cardano RPC URL is required to fetch transaction inputs".into(),
                 )
             })?;
-            let utxos = Self::fetch_utxos(koios_base_url, &tx_input_refs)?;
+            let provider = ows_core::resolve_cardano_provider(rpc_url)
+                .map_err(|e| SignerError::RpcError(e.to_string()))?;
+            let utxos = Self::fetch_utxos(provider.as_ref(), &tx_input_refs)?;
 
             for utxo in utxos {
                 let inputs_balances_for_address =
@@ -671,22 +617,12 @@ impl ChainSigner for CardanoSigner {
 
                 *inputs_balances_for_address
                     .entry(LOVELACE_ASSET_ID.to_string())
-                    .or_insert(0) += utxo.value.parse::<u64>().map_err(|e| {
-                    SignerError::InvalidTransaction(format!(
-                        "invalid lovelace value for utxo {}#{}: {e}",
-                        utxo.tx_hash, utxo.tx_index
-                    ))
-                })?;
+                    .or_insert(0) += utxo.lovelace;
 
-                for asset in utxo.asset_list.unwrap_or_default() {
+                for asset in utxo.assets {
                     *inputs_balances_for_address
                         .entry(format!("{}{}", asset.policy_id, asset.asset_name))
-                        .or_insert(0) += asset.quantity.parse::<u64>().map_err(|e| {
-                        SignerError::InvalidTransaction(format!(
-                            "invalid asset quantity for utxo {}#{} and asset {}.{}: {e}",
-                            utxo.tx_hash, utxo.tx_index, asset.policy_id, asset.asset_name
-                        ))
-                    })?;
+                        .or_insert(0) += asset.quantity;
                 }
             }
         }

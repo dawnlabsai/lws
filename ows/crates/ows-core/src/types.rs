@@ -1,5 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+/// A token balance for a wallet address, normalized across chains and providers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TokenBalance {
+    pub address: String,
+    pub name: String,
+    pub symbol: String,
+    pub chain: String,
+    pub decimals: u32,
+    pub balance: BalanceInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BalanceInfo {
+    pub amount: f64,
+    /// Fiat value when known (e.g. MoonPay). Absent for chains without pricing (e.g. Cardano via Koios).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// Spot price when known. Absent for chains without pricing.
+    #[serde(default)]
+    pub price: Option<f64>,
+}
+
 /// Unique wallet identifier (UUID v4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

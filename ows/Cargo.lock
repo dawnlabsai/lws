@@ -1948,6 +1948,8 @@ name = "ows-core"
 version = "1.3.2"
 dependencies = [
  "chrono",
+ "mockito",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2025,7 +2027,6 @@ dependencies = [
  "ows-core",
  "pbkdf2",
  "rand 0.8.5",
- "reqwest",
  "ripemd",
  "scrypt",
  "serde",

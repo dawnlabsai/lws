@@ -35,7 +35,6 @@ hmac = "0.12"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
 aes-gcm = "0.10"
 scrypt = "0.11"
 blake2 = "0.10"
