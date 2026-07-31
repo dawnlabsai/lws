@@ -72,7 +72,8 @@ const DEFAULT_INTENT_SEGMENT: u16 = 1;
 /// applies each segment atomically (a segment-0 failure reverts the whole tx; a fallible segment fails
 /// alone), so a swap split across the guaranteed and a fallible section could settle one leg and drop
 /// the other. The intent itself still keys at a fallible segment (`intentSegment`); only the coins move.
-const GUARANTEED_SEGMENT: u16 = 0;
+/// The merge path reuses this for the taker complement's own coins, which settle guaranteed the same way.
+pub(super) const GUARANTEED_SEGMENT: u16 = 0;
 
 /// One input the maker contributes: a `value` of `token_type` in `kind`'s domain (no recipient — the
 /// maker spends its own coins).
@@ -166,6 +167,22 @@ pub(super) fn request_effects(
         })
     });
     effects_from_movements(&addresses, inputs.chain(outputs))
+}
+
+/// The `makeIntent` maker offer's wallet-relative effects as [`request_effects`] computes them, all in
+/// the transaction's guaranteed section ([`GUARANTEED_SEGMENT`]): a swap keeps every leg guaranteed — the
+/// maker's coins settle in segment 0 even though its intent keys at a fallible `intentSegment` — so the
+/// movement a policy sees is a guaranteed one. An offer that nets nothing yields no segment entry.
+pub(super) fn request_segment_effects(
+    chain_id: &str,
+    crypto_provider: &MidnightCryptoProvider,
+    req: &MakeIntentRequest,
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
+    let effects = request_effects(chain_id, crypto_provider, req)?;
+    Ok(crate::balance_tx::single_segment(
+        GUARANTEED_SEGMENT,
+        effects,
+    ))
 }
 
 /// Build the maker's imbalanced offer, prove it, and return the signable bytes. Runs **after** the

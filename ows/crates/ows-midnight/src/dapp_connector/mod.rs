@@ -6,7 +6,6 @@
 //! [`ConnectorPlan`]) → policy seam → [`ConnectorPlan::authorize`] (build + prove + sign + seal). The
 //! plan carries no bearer instrument, so the seam can gate on it before any key-bearing work happens.
 
-use ows_core::policy::TransactionEffect;
 use ows_signer::chains::MidnightCryptoProvider;
 use serde::Deserialize;
 
@@ -126,33 +125,34 @@ impl ConnectorPlan {
         }
     }
     /// The wallet-relative net movement authorizing this plan will have — the view the policy seam gates
-    /// on, computed before any bearer instrument is built. Plan-derived for the `balance*` methods (from
-    /// the inert [`BalancedPlan`] the wallet already selected) and request-derived for the `make*`
-    /// methods (from the declared inputs/outputs, before any coin is chosen). One [`TransactionEffect`]
-    /// per value domain that nets non-zero.
-    pub fn effects(
+    /// on, computed before any bearer instrument is built — grouped by the transaction segment each piece
+    /// occurs in: `0` guaranteed (always executed), `>= 1` fallible (executed in order, may fail).
+    /// Plan-derived for the `balance*` methods (from the inert [`BalancedPlan`] the wallet already
+    /// selected) and request-derived, at the intent's own segment, for the `make*` methods. The policy
+    /// seam interprets the guaranteed-versus-fallible distinction; here we only attribute.
+    pub fn segment_effects(
         &self,
         chain_id: &str,
         crypto_provider: &MidnightCryptoProvider,
-    ) -> Result<Vec<TransactionEffect>, std::io::Error> {
+    ) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
         match self {
             ConnectorPlan::BalanceUnsealed(plan) | ConnectorPlan::BalanceSealed(plan) => {
-                plan.effects(chain_id, crypto_provider)
+                plan.segment_effects(chain_id, crypto_provider)
             }
             ConnectorPlan::MakeTransfer(req) => {
-                make_transfer::effects(chain_id, crypto_provider, req)
+                make_transfer::segment_effects(chain_id, crypto_provider, req)
             }
             ConnectorPlan::MakeIntent(req) => {
-                make_intent::request_effects(chain_id, crypto_provider, req)
+                make_intent::request_segment_effects(chain_id, crypto_provider, req)
             }
             // The wallet's movement in a merge is its own half — the `complement` it contributes and
-            // receives — plus the merged DUST fee it funds; sized against the maker's sealed bytes so a
-            // movement cap sees the burn (see [`balance_sealed::merge_effects`]).
+            // receives — plus the merged DUST fee it funds, all in the guaranteed section (see
+            // [`balance_sealed::merge_segment_effects`]).
             ConnectorPlan::BalanceSealedMerge {
                 maker_tx,
                 complement,
                 pay_fees,
-            } => balance_sealed::merge_effects(
+            } => balance_sealed::merge_segment_effects(
                 chain_id,
                 crypto_provider,
                 maker_tx,

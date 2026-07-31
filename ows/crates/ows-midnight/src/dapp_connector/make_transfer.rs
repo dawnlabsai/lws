@@ -27,7 +27,6 @@ use super::build::{
     mock_prove_unsealed, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
     DesiredOutput, PreimageTx, TransferKind,
 };
-use ows_core::policy::TransactionEffect;
 
 /// The intent that carries the wallet's unshielded outputs keys at a fallible segment (>= 1): the
 /// ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
@@ -97,18 +96,19 @@ pub(super) fn authorize(
     crate::authorize_proven_tx(chain_id, crypto_provider, plan)
 }
 
-/// The wallet-relative effects a `makeTransfer` will have, sized from the inert balance plan so the
-/// **DUST fee** the transfer burns is included — a `sum(|diff|)` cap at the policy seam must see it, and
-/// request-derived effects (outputs only) would under-state it. The outputs are **mock-proven** (proofs
-/// are fixed-size, so the sized fee matches the real one exactly) and the balancing is planned against
-/// the wallet's synced UTXOs; **no real proving happens here**, so a transfer denied at the seam never
-/// reaches [`authorize`]'s real proofs. `BalancedPlan::effects` then nets the wallet's inputs against its
-/// own change and outputs — the value to each recipient plus the dust fee.
-pub(super) fn effects(
+/// The wallet-relative effects a `makeTransfer` will have, per segment, sized from the inert balance
+/// plan so the **DUST fee** the transfer burns is included — a `sum(|diff|)` cap at the policy seam must
+/// see it, and request-derived effects (outputs only) would under-state it. The outputs are
+/// **mock-proven** (proofs are fixed-size, so the sized fee matches the real one exactly) and the
+/// balancing is planned against the wallet's synced UTXOs; **no real proving happens here**, so a
+/// transfer denied at the seam never reaches [`authorize`]'s real proofs. `BalancedPlan::segment_effects`
+/// then nets the wallet's inputs against its own change and outputs — the value to each recipient plus
+/// the dust fee — attributing each to the segment (guaranteed or fallible) its offer rides.
+pub(super) fn segment_effects(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     req: &MakeTransferRequest,
-) -> Result<Vec<TransactionEffect>, std::io::Error> {
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
     let preimage = build_make_transfer_preimage(chain_id, req)?;
     // Mock-prove into the *unsealed* proven form (`mock_prove` would seal it, and the balancer only
     // consumes unsealed proven bytes). Fixed-size proofs → the sized fee equals the real one.
@@ -117,7 +117,7 @@ pub(super) fn effects(
     tagged_serialize(&mock_proven, &mut bytes)
         .map_err(|e| err(format!("serialize mock-proven makeTransfer: {e}")))?;
     let plan = crate::plan_unsealed_proven_tx(chain_id, crypto_provider, &bytes, req.pay_fees)?;
-    plan.effects(chain_id, crypto_provider)
+    plan.segment_effects(chain_id, crypto_provider)
 }
 
 /// Construct the `proof-preimage` transaction for a `makeTransfer`: recipient outputs and no inputs.

@@ -10,7 +10,7 @@
 //! proving), or, when the wallet has no unregistered NIGHT capacity (its NIGHT is all registered for
 //! dust generation), a proof-bearing **DUST spend** of its generated dust.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::ops::Deref as _;
 
@@ -618,23 +618,26 @@ pub struct BalancedPlan {
 }
 
 impl BalancedPlan {
-    /// The wallet-relative net effects authorizing this plan will have, derived from the plan alone —
-    /// no re-sync, no bearer instrument — so the policy seam can gate on it *before*
-    /// [`authorize_proven_tx`] builds any spend witness. One [`TransactionEffect`] per value domain the
-    /// plan touches:
+    /// The wallet-relative net movement authorizing this plan will have, derived from the plan alone — no
+    /// re-sync, no bearer instrument — so the policy seam can gate on it *before* [`authorize_proven_tx`]
+    /// builds any spend witness, grouped by the transaction segment it occurs in:
     ///
-    /// - **unshielded NIGHT** — the wallet's balancing inputs (guaranteed and fallible) are outflow; its
-    ///   own outputs (the change) are inflow; the effect is `inflow − outflow`.
-    /// - **shielded**, per token — the coins the plan spends are outflow, the self-change it mints is
-    ///   inflow. A shielded output the *dapp* routes to the wallet is not netted: the wallet is the
-    ///   funder here, so omitting that inflow only ever over-states outflow — the safe direction for a
-    ///   movement cap.
-    /// - **dust** — the DUST the fee section burns (a generationless registration burns none).
-    pub(crate) fn effects(
+    /// - **unshielded NIGHT** — per its offer's segment: the guaranteed offer nets into segment `0`, each
+    ///   per-segment fallible offer into its own segment. Inputs (all the wallet's) are outflow, its own
+    ///   outputs (the change) inflow.
+    /// - **shielded**, per token — per its plan's segment: the coins the plan spends are outflow, the
+    ///   self-change it mints inflow. A shielded output the *dapp* routes to the wallet is not netted: the
+    ///   wallet is the funder here, so omitting that inflow only ever over-states outflow — the safe
+    ///   direction for a movement cap.
+    /// - **dust** — the DUST the fee section burns (a generationless registration burns none), attributed
+    ///   to the guaranteed segment `0`: the fee pays for the guaranteed computation and is always charged.
+    ///
+    /// The policy seam interprets guaranteed (`0`) versus fallible (`>= 1`); here we only attribute.
+    pub(crate) fn segment_effects(
         &self,
         chain_id: &str,
         crypto_provider: &MidnightCryptoProvider,
-    ) -> Result<Vec<TransactionEffect>, std::io::Error> {
+    ) -> Result<Vec<SegmentEffects>, std::io::Error> {
         let addresses = crypto_provider
             .addresses(&MidnightNetwork::from_chain_id(chain_id))
             .map_err(|e| err(e.to_string()))?;
@@ -643,16 +646,20 @@ impl BalancedPlan {
                 .unshielded_verifying_key()
                 .map_err(|e| err(e.to_string()))?,
         );
-        // The wallet funds NIGHT through the guaranteed offer and any per-segment fallible offer, so all
-        // of them contribute to the unshielded movement.
-        let mut offers = vec![&self.unshielded_offer];
-        offers.extend(self.fallible_offers.iter().map(|(_, offer)| offer));
+        // The wallet funds NIGHT through the guaranteed offer (segment 0) and any per-segment fallible
+        // offer; each keeps its own segment so the policy can tell guaranteed from fallible movement.
+        let mut offers = vec![(0u16, &self.unshielded_offer)];
+        offers.extend(
+            self.fallible_offers
+                .iter()
+                .map(|(seg, offer)| (*seg, offer)),
+        );
         let shielded_plans = self
             .shielded
             .as_ref()
             .map(|funding| funding.plans.as_slice())
             .unwrap_or(&[]);
-        Ok(plan_effects(
+        Ok(plan_segment_effects(
             &addresses,
             &wallet_ua,
             &offers,
@@ -664,7 +671,8 @@ impl BalancedPlan {
 
 /// The wallet-relative DUST effect for a fee that burns `dust_outflow` — a negative diff in the `dust`
 /// domain keyed by the wallet's dust address — or `None` when the fee burns nothing. The single source
-/// for the dust effect's shape, shared by the balancer's [`plan_effects`] and the sealed-merge effects.
+/// for the dust effect's shape, shared by the balancer's [`plan_segment_effects`] and the sealed-merge
+/// effects.
 pub(crate) fn dust_outflow_effect(
     dust_address: String,
     dust_outflow: u128,
@@ -678,72 +686,117 @@ pub(crate) fn dust_outflow_effect(
     })
 }
 
-/// Compute the wallet-relative net effects from a balanced plan's already-decided parts. Pure over its
-/// inputs (no key, no network), so it is the unit-tested core of [`BalancedPlan::effects`]:
+/// The wallet-relative effects authorizing a plan will have, grouped by the transaction segment they
+/// occur in. `segment == 0` is the guaranteed section (always executed); `>= 1` a fallible section
+/// (executed in order, allowed to fail). Attribution only — whether a fallible movement is acceptable is
+/// the policy's call. Serialized into the generic `chain_extra` policy-context slot for executable
+/// policies to read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SegmentEffects {
+    pub segment: u16,
+    pub effects: Vec<TransactionEffect>,
+}
+
+/// Wrap a flat effect list as the movement of a single segment; an empty list yields no entry. Used by
+/// the `make*`/merge connectors whose whole offer rides one intent segment.
+pub(crate) fn single_segment(segment: u16, effects: Vec<TransactionEffect>) -> Vec<SegmentEffects> {
+    if effects.is_empty() {
+        Vec::new()
+    } else {
+        vec![SegmentEffects { segment, effects }]
+    }
+}
+
+/// Compute the wallet-relative effects from a balanced plan's already-decided parts, grouped by segment.
+/// Pure over its inputs (no key, no network), so it is the unit-tested core of
+/// [`BalancedPlan::segment_effects`]:
 ///
-/// - **unshielded NIGHT** — offer inputs (all the wallet's) are outflow; offer outputs owned by the
-///   wallet (its change) are inflow.
-/// - **shielded**, per token — a plan's spent coins are outflow, its minted self-change is inflow.
-/// - **dust** — `dust_outflow` is the DUST the fee section burns.
+/// - **unshielded NIGHT** — per its offer's segment: the offer's inputs (all the wallet's) are outflow,
+///   its wallet-owned outputs (change) inflow.
+/// - **shielded**, per token — per its plan's segment: spent coins outflow, minted self-change inflow.
+/// - **dust** — the DUST the fee section burns, attributed to the guaranteed segment `0`: the fee pays
+///   for the guaranteed computation (only the segment-0 offer loads the fee budget) and is always
+///   charged, so a policy sees it as a guaranteed outflow even when the transfer it funds is fallible.
 ///
-/// One [`TransactionEffect`] per domain, keyed by the wallet's address for that domain; a domain that
-/// nets to zero is omitted.
-fn plan_effects(
+/// One [`TransactionEffect`] per (segment, domain) that nets non-zero, keyed by the wallet's address for
+/// that domain; a segment with no non-zero movement is omitted.
+fn plan_segment_effects(
     addresses: &MidnightAddresses,
     wallet_ua: &UserAddress,
-    unshielded_offers: &[&UnshieldedOffer<MnSig, InMemoryDB>],
+    unshielded_offers: &[(u16, &UnshieldedOffer<MnSig, InMemoryDB>)],
     shielded_plans: &[ShieldedSpendPlan],
     dust_outflow: u128,
-) -> Vec<TransactionEffect> {
-    let mut night: i128 = 0;
-    for offer in unshielded_offers {
+) -> Vec<SegmentEffects> {
+    const GUARANTEED_SEGMENT: u16 = 0;
+    let mut night_by_seg: BTreeMap<u16, i128> = BTreeMap::new();
+    for (segment, offer) in unshielded_offers {
+        let night = night_by_seg.entry(*segment).or_default();
         for i in offer.inputs.iter_deref() {
             if i.type_ == NIGHT {
-                night -= i.value as i128;
+                *night -= i.value as i128;
             }
         }
         for o in offer.outputs.iter_deref() {
             if o.type_ == NIGHT && o.owner == *wallet_ua {
-                night += o.value as i128;
+                *night += o.value as i128;
             }
         }
     }
 
-    let mut shielded: BTreeMap<ShieldedTokenType, i128> = BTreeMap::new();
+    let mut shielded_by_seg: BTreeMap<u16, BTreeMap<ShieldedTokenType, i128>> = BTreeMap::new();
     for plan in shielded_plans {
+        let by_token = shielded_by_seg.entry(plan.segment).or_default();
         for coin in &plan.coins {
-            *shielded.entry(coin.type_).or_default() -= coin.value as i128;
+            *by_token.entry(coin.type_).or_default() -= coin.value as i128;
         }
         for (token, change) in &plan.change {
-            *shielded.entry(*token).or_default() += *change as i128;
+            *by_token.entry(*token).or_default() += *change as i128;
         }
     }
 
-    let mut effects = Vec::new();
-    if night != 0 {
-        effects.push(TransactionEffect {
-            address: addresses.unshielded.clone(),
-            diff: vec![(
-                TokenType::Native.to_wire_token_type(),
-                clamp_i128_to_i64(night),
-            )],
-        });
+    // Every segment carrying any movement, plus the guaranteed segment when the fee burns dust.
+    let mut segments: BTreeSet<u16> = BTreeSet::new();
+    segments.extend(night_by_seg.keys().copied());
+    segments.extend(shielded_by_seg.keys().copied());
+    if dust_outflow != 0 {
+        segments.insert(GUARANTEED_SEGMENT);
     }
-    let shielded_diff: Vec<(String, i64)> = shielded
-        .into_iter()
-        .filter(|(_, v)| *v != 0)
-        .map(|(token, v)| (hex::encode(token.into_inner().0), clamp_i128_to_i64(v)))
-        .collect();
-    if !shielded_diff.is_empty() {
-        effects.push(TransactionEffect {
-            address: addresses.shielded.clone(),
-            diff: shielded_diff,
-        });
+
+    let mut out = Vec::new();
+    for segment in segments {
+        let mut effects = Vec::new();
+        if let Some(night) = night_by_seg.get(&segment).filter(|n| **n != 0) {
+            effects.push(TransactionEffect {
+                address: addresses.unshielded.clone(),
+                diff: vec![(
+                    TokenType::Native.to_wire_token_type(),
+                    clamp_i128_to_i64(*night),
+                )],
+            });
+        }
+        if let Some(by_token) = shielded_by_seg.get(&segment) {
+            let shielded_diff: Vec<(String, i64)> = by_token
+                .iter()
+                .filter(|(_, v)| **v != 0)
+                .map(|(token, v)| (hex::encode(token.into_inner().0), clamp_i128_to_i64(*v)))
+                .collect();
+            if !shielded_diff.is_empty() {
+                effects.push(TransactionEffect {
+                    address: addresses.shielded.clone(),
+                    diff: shielded_diff,
+                });
+            }
+        }
+        if segment == GUARANTEED_SEGMENT {
+            if let Some(effect) = dust_outflow_effect(addresses.dust.clone(), dust_outflow) {
+                effects.push(effect);
+            }
+        }
+        if !effects.is_empty() {
+            out.push(SegmentEffects { segment, effects });
+        }
     }
-    if let Some(effect) = dust_outflow_effect(addresses.dust.clone(), dust_outflow) {
-        effects.push(effect);
-    }
-    effects
+    out
 }
 
 /// Plan the wallet's shielded funding for a proven tx's shielded deficit (e.g. a contract deposit
@@ -2039,7 +2092,7 @@ mod tests {
         assert!(ensure_tx_network_id_matches_chain("midnight:feature-x", "preview").is_err());
     }
 
-    // --- plan_effects: the wallet-relative effects the policy seam gates on ---
+    // --- plan_segment_effects: the wallet-relative effects, per segment, the policy seam gates on ---
 
     fn addrs() -> MidnightAddresses {
         MidnightAddresses {
@@ -2084,10 +2137,10 @@ mod tests {
         }
     }
 
-    /// Unshielded balancing: the wallet's input is outflow, its own change is inflow, and the dapp's
-    /// output (not the wallet's) is excluded — so the net is exactly the NIGHT the wallet funded.
+    /// Unshielded balancing on the guaranteed segment: the wallet's input is outflow, its own change is
+    /// inflow, the dapp's output is excluded — so segment 0 nets exactly the NIGHT the wallet funded.
     #[test]
-    fn plan_effects_unshielded_nets_input_minus_wallet_outputs() {
+    fn plan_segment_effects_unshielded_nets_input_minus_wallet_outputs() {
         let wallet = vk_of(UNSHIELDED_SEED_HEX);
         let wallet_ua = UserAddress::from(wallet.clone());
         let dapp_ua = UserAddress::from(vk_of(OTHER_SEED_HEX));
@@ -2098,19 +2151,21 @@ mod tests {
                 night_output(700_000, dapp_ua),   // dapp recipient — excluded
             ],
         );
-        let effects = plan_effects(&addrs(), &wallet_ua, &[&offer], &[], 0);
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].address, "mn_addr_unshielded");
+        let segs = plan_segment_effects(&addrs(), &wallet_ua, &[(0, &offer)], &[], 0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].segment, 0);
+        assert_eq!(segs[0].effects.len(), 1);
+        assert_eq!(segs[0].effects[0].address, "mn_addr_unshielded");
         assert_eq!(
-            effects[0].diff,
+            segs[0].effects[0].diff,
             vec![(TokenType::Native.to_wire_token_type(), -700_000)]
         );
     }
 
-    /// A fallible per-segment offer funds NIGHT too, so its inputs and self-change net into the same
-    /// unshielded effect as the guaranteed offer.
+    /// The guaranteed offer (segment 0) and a fallible offer (segment 1) fund NIGHT independently, so
+    /// each lands in its own segment — the distinction the policy needs.
     #[test]
-    fn plan_effects_sums_guaranteed_and_fallible_offers() {
+    fn plan_segment_effects_splits_guaranteed_and_fallible_offers() {
         let wallet = vk_of(UNSHIELDED_SEED_HEX);
         let wallet_ua = UserAddress::from(wallet.clone());
         let guaranteed = offer(
@@ -2118,18 +2173,29 @@ mod tests {
             vec![night_output(400_000, wallet_ua)],
         );
         let fallible = offer(vec![night_input(200_000, wallet.clone())], vec![]);
-        let effects = plan_effects(&addrs(), &wallet_ua, &[&guaranteed, &fallible], &[], 0);
-        assert_eq!(effects.len(), 1);
-        // -(1_000_000 + 200_000) + 400_000 = -800_000
+        let segs = plan_segment_effects(
+            &addrs(),
+            &wallet_ua,
+            &[(0, &guaranteed), (1, &fallible)],
+            &[],
+            0,
+        );
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].segment, 0);
         assert_eq!(
-            effects[0].diff,
-            vec![(TokenType::Native.to_wire_token_type(), -800_000)]
+            segs[0].effects[0].diff,
+            vec![(TokenType::Native.to_wire_token_type(), -600_000)]
+        );
+        assert_eq!(segs[1].segment, 1);
+        assert_eq!(
+            segs[1].effects[0].diff,
+            vec![(TokenType::Native.to_wire_token_type(), -200_000)]
         );
     }
 
-    /// Shielded funding nets spent coins against minted self-change, per token.
+    /// Shielded funding nets spent coins against minted self-change, per token, in the plan's segment.
     #[test]
-    fn plan_effects_shielded_nets_spend_minus_change() {
+    fn plan_segment_effects_shielded_nets_spend_minus_change() {
         let token = ShieldedTokenType(HashOutput([7u8; 32]));
         let plans = vec![ShieldedSpendPlan {
             segment: 0,
@@ -2137,28 +2203,44 @@ mod tests {
             change: vec![(token, 20)],
         }];
         let wallet_ua = UserAddress::from(vk_of(UNSHIELDED_SEED_HEX));
-        let effects = plan_effects(&addrs(), &wallet_ua, &[&offer(vec![], vec![])], &plans, 0);
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].address, "mn_shield_addr");
+        let segs = plan_segment_effects(
+            &addrs(),
+            &wallet_ua,
+            &[(0, &offer(vec![], vec![]))],
+            &plans,
+            0,
+        );
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].segment, 0);
+        assert_eq!(segs[0].effects[0].address, "mn_shield_addr");
         assert_eq!(
-            effects[0].diff,
+            segs[0].effects[0].diff,
             vec![(hex::encode(token.into_inner().0), -120)]
         );
     }
 
-    /// A proof-bearing dust fee shows up as a negative `dust` movement.
+    /// The DUST fee is a guaranteed cost, so it shows up as a negative `dust` movement in segment 0 even
+    /// with no other movement anywhere.
     #[test]
-    fn plan_effects_dust_outflow_is_negative_fee() {
+    fn plan_segment_effects_dust_outflow_is_guaranteed_in_segment_0() {
         let wallet_ua = UserAddress::from(vk_of(UNSHIELDED_SEED_HEX));
-        let effects = plan_effects(&addrs(), &wallet_ua, &[&offer(vec![], vec![])], &[], 50_000);
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].address, "mn_dust_addr");
-        assert_eq!(effects[0].diff, vec![("dust".to_string(), -50_000)]);
+        let segs = plan_segment_effects(
+            &addrs(),
+            &wallet_ua,
+            &[(0, &offer(vec![], vec![]))],
+            &[],
+            50_000,
+        );
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].segment, 0);
+        assert_eq!(segs[0].effects[0].address, "mn_dust_addr");
+        assert_eq!(segs[0].effects[0].diff, vec![("dust".to_string(), -50_000)]);
     }
 
-    /// All three domains at once, with a token spent across two segments summed into one effect.
+    /// All three domains, with a token spent in two segments: each segment keeps its own movement, and
+    /// the guaranteed segment also carries the dust fee.
     #[test]
-    fn plan_effects_combines_domains_and_sums_segments() {
+    fn plan_segment_effects_groups_domains_across_segments() {
         let wallet = vk_of(UNSHIELDED_SEED_HEX);
         let wallet_ua = UserAddress::from(wallet.clone());
         let token = ShieldedTokenType(HashOutput([5u8; 32]));
@@ -2178,9 +2260,14 @@ mod tests {
                 change: vec![],
             },
         ];
-        let effects = plan_effects(&addrs(), &wallet_ua, &[&offer], &plans, 12_345);
-        assert_eq!(effects.len(), 3);
-        let night = effects
+        let segs = plan_segment_effects(&addrs(), &wallet_ua, &[(0, &offer)], &plans, 12_345);
+        assert_eq!(segs.len(), 2);
+
+        // segment 0: night (-1_500_000), shielded (-70), dust (-12_345)
+        let seg0 = &segs[0];
+        assert_eq!(seg0.segment, 0);
+        let night = seg0
+            .effects
             .iter()
             .find(|e| e.address == "mn_addr_unshielded")
             .unwrap();
@@ -2188,31 +2275,43 @@ mod tests {
             night.diff,
             vec![(TokenType::Native.to_wire_token_type(), -1_500_000)]
         );
-        let shielded = effects
+        let shielded = seg0
+            .effects
             .iter()
             .find(|e| e.address == "mn_shield_addr")
             .unwrap();
-        // -(100 + 50) + 30 = -120
+        // -100 + 30 = -70
         assert_eq!(
             shielded.diff,
-            vec![(hex::encode(token.into_inner().0), -120)]
+            vec![(hex::encode(token.into_inner().0), -70)]
         );
-        let dust = effects
+        let dust = seg0
+            .effects
             .iter()
             .find(|e| e.address == "mn_dust_addr")
             .unwrap();
         assert_eq!(dust.diff, vec![("dust".to_string(), -12_345)]);
+
+        // segment 1: shielded only (-50)
+        let seg1 = &segs[1];
+        assert_eq!(seg1.segment, 1);
+        assert_eq!(seg1.effects.len(), 1);
+        assert_eq!(seg1.effects[0].address, "mn_shield_addr");
+        assert_eq!(
+            seg1.effects[0].diff,
+            vec![(hex::encode(token.into_inner().0), -50)]
+        );
     }
 
-    /// A domain that nets to zero (input fully returned as change) yields no effect.
+    /// A segment whose only movement nets to zero (input fully returned as change) yields no entry.
     #[test]
-    fn plan_effects_omits_zero_net_domains() {
+    fn plan_segment_effects_omits_zero_net_segments() {
         let wallet = vk_of(UNSHIELDED_SEED_HEX);
         let wallet_ua = UserAddress::from(wallet.clone());
         let offer = offer(
             vec![night_input(1_000_000, wallet.clone())],
             vec![night_output(1_000_000, wallet_ua)],
         );
-        assert!(plan_effects(&addrs(), &wallet_ua, &[&offer], &[], 0).is_empty());
+        assert!(plan_segment_effects(&addrs(), &wallet_ua, &[(0, &offer)], &[], 0).is_empty());
     }
 }

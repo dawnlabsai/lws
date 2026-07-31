@@ -20,7 +20,6 @@ use midnight_ledger::structure::{ProofMarker, StandardTransaction, Transaction};
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
 use midnight_storage::arena::Sp;
 use midnight_storage::db::InMemoryDB;
-use ows_core::policy::TransactionEffect;
 use ows_core::sync_cache::SyncCacheScope;
 use ows_signer::chains::{MidnightCryptoProvider, MidnightNetwork};
 use serde::Deserialize;
@@ -332,27 +331,33 @@ pub(super) fn authorize_merge(
 }
 
 /// The wallet-relative effects a sealed-maker MERGE will have — the taker's own half **plus** the merged
-/// DUST fee it funds. The token movement is request-derived from the taker's [complement](sealed_maker_complement),
-/// exactly as a plain makeIntent. On a live-DUST chain, when the taker pays fees, the fee covers the whole
-/// merged tx (the maker contributes bytes but never pays), so it is sized against a **mock-proven** taker
-/// complement — fixed-size proofs give the exact fee with no real proving — and folded in as a DUST
-/// outflow, so a `sum(|diff|)` cap at the policy seam sees the burn. Sizing needs the same tip +
-/// spendable-dust sync the real merge uses; the real, submittable spend is proved only post-seam in
-/// [`authorize_merge`], so a merge denied at the seam never reaches a real proof.
-pub(super) fn merge_effects(
+/// DUST fee it funds — all in the transaction's guaranteed section (segment 0): the taker's coins settle
+/// guaranteed just like a plain makeIntent (see [`super::make_intent::GUARANTEED_SEGMENT`]), and the fee
+/// is a guaranteed cost. The token movement is request-derived from the taker's
+/// [complement](sealed_maker_complement), exactly as a plain makeIntent. On a live-DUST chain, when the
+/// taker pays fees, the fee covers the whole merged tx (the maker contributes bytes but never pays), so
+/// it is sized against a **mock-proven** taker complement — fixed-size proofs give the exact fee with no
+/// real proving — and folded in as a DUST outflow, so a `sum(|diff|)` cap at the policy seam sees the
+/// burn. Sizing needs the same tip + spendable-dust sync the real merge uses; the real, submittable spend
+/// is proved only post-seam in [`authorize_merge`], so a merge denied at the seam never reaches a real
+/// proof.
+pub(super) fn merge_segment_effects(
     chain_id: &str,
     crypto_provider: &MidnightCryptoProvider,
     maker_bytes: &[u8],
     complement: &MakeIntentRequest,
     pay_fees: bool,
-) -> Result<Vec<TransactionEffect>, std::io::Error> {
+) -> Result<Vec<crate::balance_tx::SegmentEffects>, std::io::Error> {
     let mut effects = super::make_intent::request_effects(chain_id, crypto_provider, complement)?;
 
     let indexer_url = crate::wallet::resolve_indexer_url(chain_id)?;
     let adding_dust =
         pay_fees && crate::block_on(crate::wallet_sync::dust::dust_ledger_is_live(&indexer_url));
     if !adding_dust {
-        return Ok(effects);
+        return Ok(crate::balance_tx::single_segment(
+            super::make_intent::GUARANTEED_SEGMENT,
+            effects,
+        ));
     }
 
     // Size the merged DUST fee against the taker's mock-proven complement — same coin selection as the
@@ -398,7 +403,10 @@ pub(super) fn merge_effects(
     if let Some(effect) = crate::balance_tx::dust_outflow_effect(addresses.dust, plan.fee_dust) {
         effects.push(effect);
     }
-    Ok(effects)
+    Ok(crate::balance_tx::single_segment(
+        super::make_intent::GUARANTEED_SEGMENT,
+        effects,
+    ))
 }
 
 /// Size + realize the taker's DUST fee for the merge and splice it into the taker's complement intent

@@ -550,13 +550,14 @@ pub fn decode_tx_input(chain: &ows_core::Chain, tx_input: &str) -> Result<Vec<u8
 /// Midnight, where the DApp Connector request carried through by `decode_tx_input` is parsed and
 /// balanced — using `key` to pull in the wallet's own inputs — into the transaction to sign. Every
 /// caller resolves the key first (the agent path only after the first policy pass). `gate` is the
-/// second, effect-aware policy pass, run at the plan→authorize seam over the plan's wallet-relative
-/// effects; owner callers pass a gate that always allows.
+/// second, effect-aware policy pass, run at the plan→authorize seam over the plan's per-segment
+/// wallet-relative effects, handed in as the `chain_extra` policy context; owner callers pass a gate
+/// that always allows.
 pub fn prepare_signable_tx(
     chain: &ows_core::Chain,
     tx_bytes: Vec<u8>,
     key: &SecretBytes,
-    gate: impl FnOnce(&[ows_core::policy::TransactionEffect]) -> Result<(), OwsLibError>,
+    gate: impl FnOnce(serde_json::Value) -> Result<(), OwsLibError>,
 ) -> Result<Vec<u8>, OwsLibError> {
     if chain.chain_type != ChainType::Midnight {
         return Ok(tx_bytes);
@@ -578,14 +579,18 @@ pub fn prepare_signable_tx(
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
 
     // ── POLICY SEAM ── the second, effect-aware policy pass. The plan is inert (no bearer instrument),
-    // so its wallet-relative effects can be derived and handed to `gate` to veto here — before
-    // `authorize` builds and proves any spend witness. A denial returns and nothing is proved; owner
-    // callers pass a gate that always allows. Only Midnight reaches this: every other chain returned
-    // above, its effects already known at the first pass.
-    let effects = plan
-        .effects(chain.chain_id, &crypto_provider)
+    // so its per-segment wallet-relative effects can be derived and handed to `gate` — as the chain's
+    // `chain_extra` context — to veto here, before `authorize` builds and proves any spend witness. A
+    // denial returns and nothing is proved; owner callers pass a gate that always allows. Only Midnight
+    // reaches this: every other chain returned above, its effects already known at the first pass.
+    let segment_effects = plan
+        .segment_effects(chain.chain_id, &crypto_provider)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
-    gate(&effects)?;
+    let chain_extra = serde_json::json!({
+        "segment_effects": serde_json::to_value(&segment_effects)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+    });
+    gate(chain_extra)?;
 
     plan.authorize(chain.chain_id, &crypto_provider)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))
@@ -796,13 +801,13 @@ pub fn sign_and_send(
         )?;
         // Second, effect-aware policy pass at the plan→authorize seam: a denial drops the key unused,
         // so a transaction the policy rejects is never proved.
-        let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key, |effects| {
+        let signable_tx = prepare_signable_tx(&chain_info, tx_bytes, &key, |chain_extra| {
             crate::key_ops::enforce_effect_policies(
                 &key_file,
                 &wallet_id,
                 &chain_info,
                 policy_tx,
-                effects,
+                chain_extra,
                 vault_path,
             )
         })?;
