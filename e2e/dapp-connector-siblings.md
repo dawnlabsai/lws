@@ -71,12 +71,12 @@ $OWS sign tx --chain $CHAIN --wallet $WALLET --json --tx '{
   "method": "makeIntent",
   "desiredInputs":  [ { "kind": "unshielded", "type": "<other-token-hex>", "value": "10" } ],
   "desiredOutputs": [ { "kind": "unshielded", "type": "night", "value": "500000", "recipient": "<mn_addr_preview1…self>" } ],
-  "intentSegment": 1,
-  "options": { "payFees": true }
+  "options": { "intentId": 1, "payFees": false }
 }'
 ```
 
-Expect: a proven, imbalanced maker offer. `sign tx` seals it as a **fully-sealed**
+Expect: a proven, imbalanced maker offer. (`payFees: true` is rejected here — the taker funds the
+DUST fee when it completes the swap.) `sign tx` seals it as a **fully-sealed**
 (`proof,pedersen-schnorr`) offer — which a taker completes by MERGING in its complement (step 3a).
 
 ## 3. balanceSealedTransaction — taker completes the maker offer
