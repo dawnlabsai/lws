@@ -101,6 +101,7 @@ pub trait ChainSigner: Send + Sync {
             effects: vec![],
             raw_hex: hex::encode(tx_bytes),
             data: None,
+            chain_extra: None,
         })
     }
 

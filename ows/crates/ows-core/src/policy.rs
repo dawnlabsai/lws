@@ -73,6 +73,11 @@ pub struct TransactionContext {
     /// Calldata / input data (EVM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
+    /// Chain-specific extra context as opaque JSON, for signing requests whose per-transaction detail is
+    /// richer than the flat `effects` list. A chain populates this when it has structured context to
+    /// expose to executable policies that `effects` cannot carry; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_extra: Option<serde_json::Value>,
 }
 
 /// Carried in [`PolicyContext`] for executable policies (opaque JSON). Not used by built-in rules.
@@ -221,6 +226,7 @@ mod tests {
                 }],
                 raw_hex: "0x02f8...".into(),
                 data: None,
+                chain_extra: None,
             }),
             spending: SpendingContext {
                 daily_total: "50000000000000000".into(),
@@ -346,6 +352,7 @@ mod tests {
                 effects: vec![],
                 raw_hex: "0x00".into(),
                 data: None,
+                chain_extra: None,
             }),
             spending: SpendingContext {
                 daily_total: "0".into(),

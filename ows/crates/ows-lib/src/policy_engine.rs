@@ -262,6 +262,7 @@ mod tests {
                 }],
                 raw_hex: "0x02f8...".to_string(),
                 data: None,
+                chain_extra: None,
             }),
             spending: SpendingContext {
                 daily_total: "50000000000000000".to_string(), // 0.05 ETH already spent

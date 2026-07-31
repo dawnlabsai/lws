@@ -135,6 +135,7 @@ pub fn sign_message_with_api_key(
         effects: vec![],
         raw_hex: hex::encode(msg_bytes),
         data: None,
+        chain_extra: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
         token,
@@ -167,6 +168,7 @@ pub fn sign_hash_with_api_key(
         effects: vec![],
         raw_hex: hex::encode(policy_bytes),
         data: None,
+        chain_extra: None,
     };
     let (key, _) = enforce_policies_and_decrypt_key(
         token,
@@ -1348,6 +1350,7 @@ else:
             effects: vec![],
             raw_hex: "00".into(),
             data: None,
+            chain_extra: None,
         };
         let native_move = |amount: i64| {
             vec![ows_core::policy::TransactionEffect {
