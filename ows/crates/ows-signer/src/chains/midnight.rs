@@ -649,6 +649,31 @@ impl MidnightCryptoProvider {
             .map_err(|e| SignerError::SigningFailed(format!("replay zswap event failed: {e:?}")))
     }
 
+    /// Recognize the wallet-owned shielded receipts a Zswap offer routes to this wallet: trial-decrypt
+    /// each output's ciphertext with the shielded keys and keep only those whose coin commitment
+    /// reconstructs from our coin public key, returning each receipt's token and value. Recognizing a
+    /// *receipt* is a viewing-tier operation — it needs no spend authority (only recognizing a *spend*
+    /// does, since that means matching precomputed nullifiers) — and the keys never leave the provider.
+    /// Transient outputs (created and spent within the same offer) are skipped: they net to nothing for
+    /// the wallet.
+    pub fn recognize_shielded_inflow<P: midnight_storage::Storable<InMemoryDB>>(
+        &self,
+        offer: &ZswapOffer<P, InMemoryDB>,
+    ) -> Vec<(ShieldedTokenType, u128)> {
+        offer
+            .outputs
+            .iter_deref()
+            .filter_map(|o| {
+                let ci = o
+                    .ciphertext
+                    .as_ref()
+                    .and_then(|ciph| self.shielded_keys.try_decrypt(ciph))?;
+                let recipient = transfer::Recipient::User(self.shielded_keys.coin_public_key());
+                (ci.commitment(&recipient) == o.coin_com).then_some((ci.type_, ci.value))
+            })
+            .collect()
+    }
+
     /// Build the proof-preimage shielded input offers for each segment (the key-bearing spend-witness
     /// construction) WITHOUT proving. Shared by `authorize_shielded` (which proves each) and the offline
     /// fee-sizing path (which mock-proves + discards each). The preimage is for a throwaway sizing tx or
@@ -1287,6 +1312,57 @@ mod tests {
         assert!(
             format!("{e}").contains("insufficient DUST balance"),
             "unexpected error: {e}"
+        );
+    }
+
+    /// `recognize_shielded_inflow` picks up exactly the zswap outputs routed to this wallet — the
+    /// viewing-tier trial-decrypt behind true-net shielded effects. An output encrypted to the wallet's
+    /// shielded key is recognized with its token and value; a foreign-keyed output in the same offer is
+    /// ignored.
+    #[test]
+    fn recognize_shielded_inflow_finds_wallet_outputs_and_rejects_foreign() {
+        use midnight_base_crypto::hash::HashOutput;
+        use rand::Rng as _;
+
+        let wallet = MidnightSigner::mainnet()
+            .crypto_provider(&SecretBytes::from_slice(&signing_key_blob()))
+            .unwrap();
+        let foreign = ZswapSecretKeys::from(ZswapSeed::from([9u8; 32]));
+
+        let mut rng = OsRng;
+        let wallet_token = ShieldedTokenType(HashOutput([4u8; 32]));
+        let wallet_coin = CoinInfo {
+            nonce: rng.r#gen(),
+            type_: wallet_token,
+            value: 4242,
+        };
+        let foreign_coin = CoinInfo {
+            nonce: rng.r#gen(),
+            type_: ShieldedTokenType(HashOutput([5u8; 32])),
+            value: 777,
+        };
+
+        let wallet_out = ZswapOutput::new(
+            &mut rng,
+            &wallet_coin,
+            Some(0),
+            &wallet.shielded_keys.coin_public_key(),
+            Some(wallet.shielded_keys.enc_public_key()),
+        )
+        .unwrap();
+        let foreign_out = ZswapOutput::new(
+            &mut rng,
+            &foreign_coin,
+            Some(0),
+            &foreign.coin_public_key(),
+            Some(foreign.enc_public_key()),
+        )
+        .unwrap();
+
+        let offer = ZswapOffer::new(vec![], vec![wallet_out, foreign_out], vec![]).unwrap();
+        assert_eq!(
+            wallet.recognize_shielded_inflow(&offer),
+            vec![(wallet_token, 4242)]
         );
     }
 
