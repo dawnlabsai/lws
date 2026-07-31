@@ -161,6 +161,28 @@ impl ConnectorPlan {
             ),
         }
     }
+
+    /// The contract actions this plan's transaction carries — the counterparty identity, and the value
+    /// each contract declares it takes in and pays out, that the wallet-relative
+    /// [effects](Self::segment_effects) deliberately leave out. Handed to the same policy seam,
+    /// alongside them.
+    ///
+    /// Only the `balance*` methods can carry any: they complete a transaction someone else authored.
+    /// The `make*` methods build the wallet's own transfer from the request alone, so they talk to no
+    /// contract.
+    pub fn contracts(&self) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+        match self {
+            ConnectorPlan::BalanceUnsealed(plan) | ConnectorPlan::BalanceSealed(plan) => {
+                Ok(plan.contracts())
+            }
+            ConnectorPlan::MakeTransfer(_) | ConnectorPlan::MakeIntent(_) => Ok(Vec::new()),
+            // The taker's complement is a plain `makeIntent` and carries none; the contracts of a merge
+            // are the sealed maker's, which survive the merge into the submitted transaction.
+            ConnectorPlan::BalanceSealedMerge { maker_tx, .. } => {
+                balance_sealed::maker_contracts(maker_tx)
+            }
+        }
+    }
 }
 
 /// Parse a stringified connector request and plan it (inert) into a [`ConnectorPlan`], ready for the

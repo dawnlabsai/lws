@@ -6,6 +6,7 @@ pub type ShieldedBalances = std::collections::BTreeMap<String, u128>;
 mod async_runtime;
 mod balance_tx;
 mod cache_io;
+mod contracts;
 mod dapp_connector;
 mod fund_balance;
 mod indexer_ws;

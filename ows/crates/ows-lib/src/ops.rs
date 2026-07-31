@@ -586,8 +586,15 @@ pub fn prepare_signable_tx(
     let segment_effects = plan
         .segment_effects(chain.chain_id, &crypto_provider)
         .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
+    // The two halves of the seam's view, kept disjoint: `segment_effects` is how much the *wallet*
+    // moves, `contracts` is *who* the transaction talks to and how much value each contract declares.
+    let contracts = plan
+        .contracts()
+        .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?;
     let chain_extra = serde_json::json!({
         "segment_effects": serde_json::to_value(&segment_effects)
+            .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
+        "contracts": serde_json::to_value(&contracts)
             .map_err(|e| OwsLibError::InvalidInput(e.to_string()))?,
     });
     gate(chain_extra)?;

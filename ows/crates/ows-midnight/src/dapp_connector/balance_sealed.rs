@@ -259,6 +259,23 @@ pub(super) fn sealed_maker_complement(
     ))
 }
 
+/// The contract actions a sealed maker offer carries. A merge preserves both halves' intents verbatim,
+/// so the maker's contract actions — the taker's complement adds none — are exactly what the submitted
+/// transaction performs, at the maker's own segments.
+pub(super) fn maker_contracts(
+    maker_bytes: &[u8],
+) -> Result<Vec<crate::contracts::ContractInteraction>, std::io::Error> {
+    let mut r: &[u8] = maker_bytes;
+    let tx: TxSealed = tagged_deserialize(&mut r)
+        .map_err(|e| std::io::Error::other(format!("failed to parse sealed maker tx: {e}")))?;
+    let Transaction::Standard(base) = &tx else {
+        return Err(std::io::Error::other(
+            "balanceSealedTransaction expects a Standard maker transaction",
+        ));
+    };
+    Ok(crate::contracts::contract_interactions(base.actions()))
+}
+
 /// Authorize the sealed-maker merge: build the taker's complementary half from its own coins, fold in a
 /// DUST fee that covers the whole *merged* tx, and return a [merge envelope](ows_signer::chains::wrap_merge_envelope)
 /// of the (proven, unsealed) taker half plus the sealed maker. The sign pipeline then signs the taker's
@@ -580,6 +597,18 @@ mod merge_tests {
                 "token {token}: taker must negate the maker's imbalance"
             );
         }
+    }
+
+    #[test]
+    fn contracts_of_a_real_sealed_maker_are_read_from_its_intents() {
+        let hex_str = include_str!("testdata/sealed_maker_preprod.hex");
+        let hex_str = hex_str.trim();
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).unwrap();
+
+        // The fixture is a plain token swap, so it names no contract — what matters here is that a
+        // sealed maker's actions are readable at all, i.e. the seam reports `contracts` for a merge
+        // instead of failing to parse the maker it already balances against.
+        assert_eq!(maker_contracts(&bytes).unwrap(), Vec::new());
     }
 }
 
