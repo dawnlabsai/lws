@@ -125,7 +125,8 @@ against the live stream tip** (`tip_verify`) by probing the indexer's current `m
 
 The GraphQL indexer URL comes from `~/.ows/config.json` under `rpc["midnight:<network>"]` (the
 WebSocket URL is derived from it); defaults ship for mainnet/preview/preprod. Sync timeouts
-(HTTP 30s, WS connect 30s, WS idle 90s, stall 120s) are fixed, not environment-configurable.
+default to HTTP 30s, WS connect 30s, WS idle 90s, and stall 120s, each overridable from the
+environment for a cold wallet on a slow link or a degraded-but-progressing indexer.
 
 ## Environment variables
 
@@ -134,6 +135,15 @@ WebSocket URL is derived from it); defaults ship for mainnet/preview/preprod. Sy
 | `OWS_PASSPHRASE` | Owner passphrase **or** api-key token; unlocks shielded/dust. Unset → unshielded only. |
 | `OWS_WALLET` | Default for `--wallet`. |
 | `OWS_MIDNIGHT_SYNC_CACHE` | `0`/`false` → disable the disk snapshot cache (always re-sync). |
+| `OWS_MIDNIGHT_WS_IDLE_TIMEOUT_SECS` | WebSocket idle budget per stream. Default `90`. |
+| `OWS_MIDNIGHT_STALL_TIMEOUT_SECS` | Seconds without events before a stream is declared stalled. Default `120`. |
+| `OWS_MIDNIGHT_INDEXER_HTTP_TIMEOUT_SECS` | Per-request timeout for indexer GraphQL HTTP calls. Default `30`. |
+| `OWS_MIDNIGHT_WS_CONNECT_TIMEOUT_SECS` | Timeout for establishing the indexer WebSocket. Default `30`. |
+
+Each timeout takes a positive whole number of seconds; a zero, negative, or unparseable value
+is ignored with a warning on stderr and the default is used. Overriding is safe in both
+directions — a longer budget only gives a sync more room to finish, and a shorter one surfaces
+as a stall error or a missing dust section, never as a partial balance reported as complete.
 
 ## The code path
 
