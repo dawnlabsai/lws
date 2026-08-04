@@ -3,6 +3,9 @@ use crate::mnemonic::Mnemonic;
 use crate::zeroizing::SecretBytes;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use zeroize::Zeroizing;
+
+const HARDENED_THRESHOLD: u32 = 0x80000000;
 
 /// Errors from HD key derivation.
 #[derive(Debug, thiserror::Error)]
@@ -20,15 +23,16 @@ pub enum HdError {
     InvalidSeedLength(usize),
 }
 
-/// HD key deriver supporting BIP-32 (secp256k1) and SLIP-10 (ed25519).
+/// HD key deriver supporting BIP-32 (secp256k1), SLIP-10 (ed25519), and Ed25519-BIP32.
 pub struct HdDeriver;
 
 impl HdDeriver {
     /// Derive a child private key from a seed and derivation path.
     ///
-    /// Seed must be 16-64 bytes (BIP-32 §2).
+    /// Seed must be 16-64 bytes (BIP-32 §2) for secp256k1 and ed25519, and 96 bytes for ed25519-bip32.
+    /// For Ed25519-BIP32, the seed must be the master extended private key.
     pub fn derive(seed: &[u8], path: &str, curve: Curve) -> Result<SecretBytes, HdError> {
-        if seed.len() < 16 || seed.len() > 64 {
+        if curve != Curve::Ed25519Bip32 && (seed.len() < 16 || seed.len() > 64) {
             return Err(HdError::InvalidSeedLength(seed.len()));
         }
         Self::validate_path(path)?;
@@ -36,6 +40,13 @@ impl HdDeriver {
         match curve {
             Curve::Secp256k1 => Self::derive_secp256k1(seed, path),
             Curve::Ed25519 => Self::derive_ed25519(seed, path),
+            Curve::Ed25519Bip32 => {
+                if seed.len() != ed25519_bip32::XPRV_SIZE {
+                    return Err(HdError::InvalidSeedLength(seed.len()));
+                }
+
+                Self::derive_ed25519_bip32(seed, path)
+            }
         }
     }
 
@@ -46,8 +57,17 @@ impl HdDeriver {
         path: &str,
         curve: Curve,
     ) -> Result<SecretBytes, HdError> {
-        let seed = mnemonic.to_seed(passphrase);
-        Self::derive(seed.expose(), path, curve)
+        match curve {
+            Curve::Ed25519Bip32 => {
+                let entropy = mnemonic.entropy();
+                let seed = Self::ed25519_bip32_master_xprv_from_entropy(entropy.expose());
+                Self::derive(seed.as_ref(), path, curve)
+            }
+            _ => {
+                let seed = mnemonic.to_seed(passphrase);
+                Self::derive(seed.expose(), path, curve)
+            }
+        }
     }
 
     /// Like `derive_from_mnemonic`, but checks the global key cache first.
@@ -72,6 +92,7 @@ impl HdDeriver {
         hasher.update(match curve {
             Curve::Secp256k1 => b"secp256k1" as &[u8],
             Curve::Ed25519 => b"ed25519",
+            Curve::Ed25519Bip32 => b"ed25519_bip32",
         });
         let cache_key = hex::encode(hasher.finalize());
 
@@ -85,31 +106,97 @@ impl HdDeriver {
         Ok(key)
     }
 
-    /// Validate a derivation path. Must start with "m/" and contain valid indices.
-    pub fn validate_path(path: &str) -> Result<(), HdError> {
-        if !path.starts_with("m/") && path != "m" {
+    /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
+    ///
+    /// The non-cached sibling of [`Self::derive_keys_from_mnemonic_cached`]:
+    /// every path goes through the non-cached singular, so no derived secret is
+    /// retained in the global key cache. Address derivation uses this — it only
+    /// needs the public address, not to warm the cache — while the signing path
+    /// uses the cached variant.
+    pub fn derive_keys_from_mnemonic(
+        mnemonic: &Mnemonic,
+        passphrase: &str,
+        paths: Vec<String>,
+        curve: Curve,
+    ) -> Result<Vec<DerivedKey>, HdError> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let secret = Self::derive_from_mnemonic(mnemonic, passphrase, &path, curve)?;
+                Ok(DerivedKey { path, secret })
+            })
+            .collect()
+    }
+
+    /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
+    ///
+    /// Same interface as [`Self::derive_from_mnemonic_cached`] but plural in the
+    /// path: every path goes through the cached singular under the hood, and the
+    /// returned bundle pairs each secret with the path it came from so chains
+    /// that bind several keys per account (e.g. Midnight) can tell roles apart
+    /// by path instead of position.
+    pub fn derive_keys_from_mnemonic_cached(
+        mnemonic: &Mnemonic,
+        passphrase: &str,
+        paths: Vec<String>,
+        curve: Curve,
+    ) -> Result<Vec<DerivedKey>, HdError> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let secret = Self::derive_from_mnemonic_cached(mnemonic, passphrase, &path, curve)?;
+                Ok(DerivedKey { path, secret })
+            })
+            .collect()
+    }
+
+    /// Parse a derivation path into `(index, hardened)` pairs.
+    ///
+    /// The single parser behind [`Self::validate_path`] and the per-curve derivation
+    /// functions, so every curve agrees on what a path means. `"m"` yields no components.
+    fn parse_path_components(path: &str) -> Result<Vec<(u32, bool)>, HdError> {
+        if path == "m" {
+            return Ok(vec![]);
+        }
+        if !path.starts_with("m/") {
             return Err(HdError::InvalidPath(format!(
                 "path must start with 'm/', got '{}'",
                 path
             )));
         }
-        if path == "m" {
-            return Ok(());
-        }
-        let components = path[2..].split('/');
-        for component in components {
-            let index_str = component.trim_end_matches('\'');
-            if index_str.is_empty() {
-                return Err(HdError::InvalidPath(format!(
-                    "empty component in path '{}'",
-                    path
-                )));
-            }
-            index_str.parse::<u32>().map_err(|_| {
-                HdError::InvalidPath(format!("invalid index '{}' in path '{}'", component, path))
-            })?;
-        }
-        Ok(())
+        path[2..]
+            .split('/')
+            .map(|component| {
+                let (index_str, hardened) = match component.strip_suffix('\'') {
+                    Some(stripped) => (stripped, true),
+                    None => (component, false),
+                };
+                if index_str.is_empty() {
+                    return Err(HdError::InvalidPath(format!(
+                        "empty component in path '{}'",
+                        path
+                    )));
+                }
+                let index: u32 = index_str.parse().map_err(|_| {
+                    HdError::InvalidPath(format!(
+                        "invalid index '{}' in path '{}'",
+                        component, path
+                    ))
+                })?;
+                if index >= HARDENED_THRESHOLD {
+                    return Err(HdError::InvalidPath(format!(
+                        "index '{}' in path '{}' must be below {}",
+                        component, path, HARDENED_THRESHOLD
+                    )));
+                }
+                Ok((index, hardened))
+            })
+            .collect()
+    }
+
+    /// Validate a derivation path. Must start with "m/" and contain valid indices.
+    pub fn validate_path(path: &str) -> Result<(), HdError> {
+        Self::parse_path_components(path).map(|_| ())
     }
 
     /// BIP-32 derivation for secp256k1 using coins-bip32.
@@ -137,24 +224,11 @@ impl HdDeriver {
     fn derive_ed25519(seed: &[u8], path: &str) -> Result<SecretBytes, HdError> {
         use zeroize::Zeroize;
 
-        // Parse path components
-        let components = if path == "m" {
-            vec![]
-        } else {
-            path[2..]
-                .split('/')
-                .map(|c| {
-                    if !c.ends_with('\'') {
-                        return Err(HdError::Ed25519NonHardened);
-                    }
-                    let index_str = c.trim_end_matches('\'');
-                    let index: u32 = index_str
-                        .parse()
-                        .map_err(|_| HdError::InvalidPath(format!("invalid index: {}", c)))?;
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        // Parse path components (hardened only)
+        let components = Self::parse_path_components(path)?;
+        if components.iter().any(|(_, hardened)| !hardened) {
+            return Err(HdError::Ed25519NonHardened);
+        }
 
         // SLIP-10: Master key generation
         type HmacSha512 = Hmac<Sha512>;
@@ -168,12 +242,17 @@ impl HdDeriver {
 
         // Derive each component (hardened only)
         let mut data = Vec::new();
-        for index in components {
+        for (index, _) in components {
+            // `parse_path_components` bounds `index` below HARDENED_THRESHOLD, so this cannot overflow
+            let child_index = index.checked_add(HARDENED_THRESHOLD).ok_or_else(|| {
+                HdError::InvalidPath(format!("invalid hardened index: {}", index))
+            })?;
+
             data.zeroize();
             data.clear();
             data.push(0u8); // 0x00 prefix for private key derivation
             data.extend_from_slice(&key);
-            data.extend_from_slice(&(index + 0x80000000u32).to_be_bytes());
+            data.extend_from_slice(&child_index.to_be_bytes());
 
             let mut mac =
                 HmacSha512::new_from_slice(&chain_code).expect("HMAC can take key of any size");
@@ -190,6 +269,47 @@ impl HdDeriver {
         chain_code.zeroize();
         Ok(SecretBytes::new(key))
     }
+
+    /// Build the Ed25519-BIP32 master extended private key (96-byte `XPrv`) from raw BIP-39 entropy
+    fn ed25519_bip32_master_xprv_from_entropy(
+        entropy: &[u8],
+    ) -> Zeroizing<[u8; ed25519_bip32::XPRV_SIZE]> {
+        let mut out = Zeroizing::new([0u8; ed25519_bip32::XPRV_SIZE]);
+        // password slot stays empty on purpose to keep compatibility with Cardano software wallets
+        pbkdf2::pbkdf2_hmac::<sha2::Sha512>("".as_bytes(), entropy, 4096, out.as_mut());
+        Zeroizing::new(ed25519_bip32::XPrv::normalize_bytes_force3rd(*out).into())
+    }
+
+    /// Ed25519-BIP32 path derivation (V2) from an existing seed (master extended private key).
+    fn derive_ed25519_bip32(seed: &[u8], path: &str) -> Result<SecretBytes, HdError> {
+        let mut xprv = ed25519_bip32::XPrv::from_slice_verified(seed)
+            .map_err(|e| HdError::DerivationFailed(e.to_string()))?;
+
+        for (index, hardened) in Self::parse_path_components(path)? {
+            // `parse_path_components` bounds `index` below HARDENED_THRESHOLD, so this cannot overflow
+            let child_index = if hardened {
+                index.checked_add(HARDENED_THRESHOLD).ok_or_else(|| {
+                    HdError::InvalidPath(format!("invalid hardened index: {}", index))
+                })?
+            } else {
+                index
+            };
+            xprv = xprv.derive(ed25519_bip32::DerivationScheme::V2, child_index);
+        }
+        Ok(SecretBytes::new(xprv.as_ref().to_vec()))
+    }
+}
+
+/// A derived secret paired with the path it was derived from.
+///
+/// Most chains bind one key per account; chains that bind several (e.g.
+/// Midnight's unshielded / shielded / dust roles) get one `DerivedKey` per
+/// path, and the carried `path` is what tells them apart — callers select a
+/// key by its path, not by position in the bundle. The first entry is the
+/// primary (address / signing) key.
+pub struct DerivedKey {
+    pub path: String,
+    pub secret: SecretBytes,
 }
 
 #[cfg(test)]
@@ -263,6 +383,64 @@ mod tests {
         assert!(HdDeriver::validate_path("44'/60'/0'/0/0").is_err());
         assert!(HdDeriver::validate_path("").is_err());
         assert!(HdDeriver::validate_path("x/44'/60'").is_err());
+    }
+
+    #[test]
+    fn test_path_validation_rejects_index_at_or_above_hardened_threshold() {
+        // A bare 2147483648 would alias the hardened 0' (both are child index 0x80000000),
+        // and 2147483648' would overflow the hardening offset.
+        for path in [
+            "m/2147483648",
+            "m/2147483648'",
+            "m/4294967295",
+            "m/44'/0/2147483648",
+        ] {
+            assert!(
+                HdDeriver::validate_path(path).is_err(),
+                "expected '{path}' to be rejected"
+            );
+        }
+        // The largest legal index is still accepted.
+        assert!(HdDeriver::validate_path("m/2147483647'").is_ok());
+        assert!(HdDeriver::validate_path("m/2147483647").is_ok());
+    }
+
+    #[test]
+    fn test_path_validation_rejects_repeated_hardened_marker() {
+        assert!(HdDeriver::validate_path("m/44''").is_err());
+        assert!(HdDeriver::validate_path("m/44'/0''''").is_err());
+    }
+
+    #[test]
+    fn test_derive_rejects_out_of_range_index_on_every_curve() {
+        let seed = test_seed();
+        let xprv = HdDeriver::ed25519_bip32_master_xprv_from_entropy(&[0u8; 32]);
+
+        for path in ["m/2147483648", "m/2147483648'"] {
+            for (curve, seed) in [
+                (Curve::Secp256k1, seed.expose()),
+                (Curve::Ed25519, seed.expose()),
+                (Curve::Ed25519Bip32, &xprv[..]),
+            ] {
+                let err = HdDeriver::derive(seed, path, curve)
+                    .expect_err("expected '{path}' on {curve:?} to be rejected");
+                match err {
+                    HdError::InvalidPath(_) => {}
+                    other => {
+                        panic!("expected InvalidPath for '{path}' on {curve:?}, got {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// `m/2147483648` and `m/0'` are the same child index (0x80000000); rejecting the
+    /// former is what keeps two spellings of one path from being two paths.
+    #[test]
+    fn test_ed25519_bip32_no_longer_aliases_hardened_zero() {
+        let xprv = HdDeriver::ed25519_bip32_master_xprv_from_entropy(&[0u8; 32]);
+        assert!(HdDeriver::derive(&xprv[..], "m/0'", Curve::Ed25519Bip32).is_ok());
+        assert!(HdDeriver::derive(&xprv[..], "m/2147483648", Curve::Ed25519Bip32).is_err());
     }
 
     #[test]
@@ -582,5 +760,60 @@ mod tests {
         let key0 = HdDeriver::derive(seed.expose(), "m/44'/60'/0'/0/0", Curve::Secp256k1).unwrap();
         let key1 = HdDeriver::derive(seed.expose(), "m/44'/60'/0'/0/1", Curve::Secp256k1).unwrap();
         assert_ne!(key0.expose(), key1.expose());
+    }
+
+    // === Ed25519-BIP32 master key vectors (entropy + PBKDF2 root) ===
+
+    #[test]
+    fn test_ed25519_bip32_master() {
+        let phrase = "eight country switch draw meat scout mystery blade tip drift useless good keep usage title";
+        let mnemonic = Mnemonic::from_phrase(phrase).unwrap();
+        let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", "m", Curve::Ed25519Bip32).unwrap();
+        let expected = "c065afd2832cd8b087c4d9ab7011f481ee1e0721e78ea5dd609f3ab3f156d245d176bd8fd4ec60b4731c3918a2a72a0226c0cd119ec35b47e4d55884667f552a23f7fdcd4a10c6cd2c7393ac61d877873e248f417634aa3d812af327ffe9d620";
+        assert_eq!(hex::encode(key.expose()), expected);
+        assert_eq!(key.len(), ed25519_bip32::XPRV_SIZE);
+    }
+
+    /// "abandon … about" (zero entropy) — root `XPrv` bytes.
+    #[test]
+    fn test_ed25519_bip32_abandon_mnemonic_root_vector() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", "m", Curve::Ed25519Bip32).unwrap();
+        let expected = "60ce7dbec3616e9fc17e0c32578b3f380337b1b61a1f3cb9651aee30670e6f53970419a23a2e4e4082d12bf78faa8645dfc882cee2ae7179e2b07fe88098abb2072310084784c7308182dbbdb1449b2706586f1ff5cbf13d15e9b6e78c15f067";
+        assert_eq!(hex::encode(key.expose()), expected);
+    }
+
+    // === Ed25519-BIP32 child derivation (V2) ===
+    // Parent XPrv from ed25519-bip32 crate tests: src/tests.rs
+
+    #[test]
+    fn test_ed25519_bip32_derive_hardened_zero_from_test_vector_xprv() {
+        // ed25519-bip32 0.4.1 `src/tests.rs` constants D1, D1_H0
+        let d1_hex = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+        let d1_h0_hex = "60d399da83ef80d8d4f8d223239efdc2b8fef387e1b5219137ffb4e8fbdea15adc9366b7d003af37c11396de9a83734e30e05e851efa32745c9cd7b42712c890608763770eddf77248ab652984b21b849760d1da74a6f5bd633ce41adceef07a";
+
+        let d1_bytes: [u8; ed25519_bip32::XPRV_SIZE] =
+            hex::decode(d1_hex).unwrap().try_into().unwrap();
+        let derived = HdDeriver::derive_ed25519_bip32(&d1_bytes, "m/0'").unwrap();
+        assert_eq!(hex::encode(derived.expose()), d1_h0_hex);
+    }
+
+    #[test]
+    fn test_derive_rejects_bip39_seed_for_ed25519_bip32() {
+        let seed = test_seed();
+        let r = HdDeriver::derive(seed.expose(), "m/0'", Curve::Ed25519Bip32);
+        assert!(matches!(r, Err(HdError::InvalidSeedLength(64))));
+    }
+
+    #[test]
+    fn test_derive_ed25519_bip32_from_master_xprv_matches_from_mnemonic() {
+        let mnemonic = Mnemonic::from_phrase(ABANDON_PHRASE).unwrap();
+        let path = "m/1852'/1815'/0'/0/0";
+        let from_mnemonic =
+            HdDeriver::derive_from_mnemonic(&mnemonic, "", path, Curve::Ed25519Bip32).unwrap();
+        let master =
+            HdDeriver::derive_from_mnemonic(&mnemonic, "", "m", Curve::Ed25519Bip32).unwrap();
+        let from_derive = HdDeriver::derive(master.expose(), path, Curve::Ed25519Bip32).unwrap();
+        assert_eq!(from_mnemonic.expose(), from_derive.expose());
     }
 }

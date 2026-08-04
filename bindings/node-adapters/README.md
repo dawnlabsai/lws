@@ -77,7 +77,7 @@ const signature = await account.sign("hello");
 const txHash = await account.sendTransaction("deadbeef...");
 ```
 
-`chain` accepts WDK short names (`"evm"`, `"solana"`, `"btc"`, `"ton"`, `"tron"`, `"cosmos"`, `"sui"`, `"xrpl"`, `"filecoin"`, `"spark"`) or CAIP-2 identifiers.
+`chain` accepts WDK short names (`"evm"`, `"solana"`, `"btc"`, `"ton"`, `"tron"`, `"cosmos"`, `"sui"`, `"xrpl"`, `"filecoin"`, `"spark"`, `"cardano"`) or CAIP-2 identifiers.
 
 Options: `passphrase`, `index`, `rpcUrl`, `vaultPath`.
 

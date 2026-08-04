@@ -21,6 +21,8 @@ pub enum PayErrorCode {
     DiscoveryFailed,
     /// Invalid input (e.g. unsupported HTTP method).
     InvalidInput,
+    /// Invalid data (e.g. invalid balance).
+    InvalidData,
 }
 
 #[derive(Debug, Error)]

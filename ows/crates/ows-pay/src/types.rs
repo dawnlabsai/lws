@@ -245,22 +245,9 @@ pub struct MoonPayBalanceResponse {
     pub items: Vec<TokenBalance>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokenBalance {
-    pub address: String,
-    pub name: String,
-    pub symbol: String,
-    pub chain: String,
-    pub decimals: u32,
-    pub balance: BalanceInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BalanceInfo {
-    pub amount: f64,
-    pub value: f64,
-    pub price: f64,
-}
+// `TokenBalance` / `BalanceInfo` live in `ows-core` (shared with the Cardano RPC providers).
+// Re-exported here so existing `crate::types::TokenBalance` imports keep working.
+pub use ows_core::{BalanceInfo, TokenBalance};
 
 /// Result of `ows fund`.
 #[derive(Debug, Clone)]

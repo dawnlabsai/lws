@@ -16,6 +16,7 @@ SPEC_FILES=(
   06-wallet-lifecycle.md
   07-supported-chains.md
   policy-engine-implementation.md
+  cardano.md
 )
 
 SDK_FILES=(
@@ -42,6 +43,7 @@ Sitemap:
 - [06 — Wallet Lifecycle](https://docs.openwallet.sh/doc.html?slug=06-wallet-lifecycle): Creation, backup, recovery, rotation, and deletion
 - [07 — Supported Chains](https://docs.openwallet.sh/doc.html?slug=07-supported-chains): Blockchain networks supported by OWS and how to add new ones
 - [Policy Engine Implementation](https://docs.openwallet.sh/doc.html?slug=policy-engine-implementation): Detailed implementation guide for the policy engine
+- [Cardano Support](https://docs.openwallet.sh/doc.html?slug=cardano): Cardano integration — CIP-34 addressing, Ed25519-BIP32 derivation, CIP-8 signing, and policy context
 - [CLI Reference](https://docs.openwallet.sh/doc.html?slug=sdk-cli): Command-line interface for managing wallets, signing, and key operations
 - [Node.js SDK](https://docs.openwallet.sh/doc.html?slug=sdk-node): Node.js / TypeScript SDK for programmatic wallet access
 - [Python SDK](https://docs.openwallet.sh/doc.html?slug=sdk-python): Python SDK for programmatic wallet access

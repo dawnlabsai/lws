@@ -1,4 +1,6 @@
 use crate::CliError;
+use ows_core::parse_chain;
+use ows_lib::ops::resolve_rpc_url;
 use ows_lib::types::AccountInfo;
 
 /// Returns the wallet account matching the target funding chain.
@@ -6,14 +8,12 @@ fn find_account_for_chain<'a>(
     accounts: &'a [AccountInfo],
     chain: &str,
 ) -> Result<&'a AccountInfo, CliError> {
-    let chain_prefix = match chain {
-        "solana" => "solana:",
-        _ => "eip155:",
-    };
+    let parsed_chain =
+        parse_chain(chain).map_err(|e| CliError::InvalidArgs(format!("unknown chain: {e}")))?;
 
     accounts
         .iter()
-        .find(|a| a.chain_id.starts_with(chain_prefix))
+        .find(|a| a.chain_id == parsed_chain.chain_id)
         .ok_or_else(|| {
             CliError::InvalidArgs(format!("wallet has no account for chain \"{chain}\""))
         })
@@ -92,7 +92,15 @@ pub fn balance(wallet_name: &str, chain: Option<&str>) -> Result<(), CliError> {
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| CliError::InvalidArgs(format!("tokio: {e}")))?;
 
-    let balances = rt.block_on(ows_pay::fund::get_balances(address, Some(chain_name)))?;
+    let chain = parse_chain(chain_name)
+        .map_err(|e| CliError::InvalidArgs(format!("unknown chain: {e}")))?;
+
+    let rpc_url = resolve_rpc_url(chain.chain_id, chain.chain_type, None).ok();
+    let balances = rt.block_on(ows_pay::fund::get_balances(
+        address,
+        Some(chain_name),
+        rpc_url.as_deref(),
+    ))?;
 
     if balances.is_empty() {
         eprintln!("No tokens found for {address} on {chain_name}");
@@ -101,11 +109,13 @@ pub fn balance(wallet_name: &str, chain: Option<&str>) -> Result<(), CliError> {
 
     for token in &balances {
         let amount = token.balance.amount;
-        let value = token.balance.value;
-        println!(
-            "{:>12.6} {:6} ${:<10.2}  {}",
-            amount, token.symbol, value, token.name
-        );
+        match token.balance.value {
+            Some(value) => println!(
+                "{:>12.6} {:6} ${:<10.2}  {}",
+                amount, token.symbol, value, token.name
+            ),
+            None => println!("{:>12} {:<10} {}", amount, token.symbol, token.name),
+        }
     }
 
     Ok(())

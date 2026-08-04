@@ -19,7 +19,12 @@ var SDK_DOCS = [
   { slug: 'sdk-python', title: 'Python SDK',       sidebar: 'Python' },
 ];
 
-var DOCS = QUICKSTART_DOCS.concat(SDK_DOCS).concat(SPEC_DOCS);
+// Non-normative reference implementation docs (see docs/00-specification.md)
+var REFERENCE_DOCS = [
+  { slug: 'cardano', title: 'Cardano Support', sidebar: 'Cardano' },
+];
+
+var DOCS = QUICKSTART_DOCS.concat(SDK_DOCS).concat(SPEC_DOCS).concat(REFERENCE_DOCS);
 
 // Vercel build copies docs into website-docs/md/; local dev serves from repo root
 var DOCS_PATHS = ['md', '../docs'];
@@ -92,6 +97,12 @@ function buildSidebar(currentSlug) {
 
   html += '<div class="docs-sidebar-title" style="margin-top: 1rem;">Specification</div>';
   SPEC_DOCS.forEach(function (doc) {
+    var active = doc.slug === currentSlug ? ' class="active"' : '';
+    html += '<a href="doc.html?slug=' + doc.slug + '"' + active + '>' + doc.sidebar + '</a>';
+  });
+
+  html += '<div class="docs-sidebar-title" style="margin-top: 1rem;">Chains</div>';
+  REFERENCE_DOCS.forEach(function (doc) {
     var active = doc.slug === currentSlug ? ' class="active"' : '';
     html += '<a href="doc.html?slug=' + doc.slug + '"' + active + '>' + doc.sidebar + '</a>';
   });

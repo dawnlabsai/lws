@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::process::Command;
+use zeroize::Zeroizing;
 
 use ows_core::{
-    default_chain_for_type, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
-    ALL_CHAIN_TYPES,
+    universal_wallet_chains, ChainType, Config, EncryptedWallet, KeyType, WalletAccount,
+    UNIVERSAL_WALLET_ACCOUNT_COUNT,
 };
 use ows_signer::{
-    decrypt, encrypt, signer_for_chain, CryptoEnvelope, Curve, HdDeriver, Mnemonic,
-    MnemonicStrength, SecretBytes,
+    decrypt, encrypt, signer_for_chain, signer_for_chain_type, CryptoEnvelope, Curve, HdDeriver,
+    Mnemonic, MnemonicStrength, SecretBytes,
 };
 
 use crate::error::OwsLibError;
@@ -38,38 +39,76 @@ fn parse_chain(s: &str) -> Result<ows_core::Chain, OwsLibError> {
 
 /// Derive accounts for all chain families from a mnemonic at the given index.
 fn derive_all_accounts(mnemonic: &Mnemonic, index: u32) -> Result<Vec<WalletAccount>, OwsLibError> {
-    let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
-    for ct in &ALL_CHAIN_TYPES {
-        let chain = default_chain_for_type(*ct);
-        let signer = signer_for_chain(*ct);
-        let path = signer.default_derivation_path(index);
+    let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
+    for chain in universal_wallet_chains() {
+        let signer = signer_for_chain(&chain);
+        let paths = signer.default_derivation_paths(index);
         let curve = signer.curve();
-        let key = HdDeriver::derive_from_mnemonic(mnemonic, "", &path, curve)?;
-        let address = signer.derive_address(key.expose())?;
+        let keys = HdDeriver::derive_keys_from_mnemonic(mnemonic, "", paths, curve)?;
+        let signing_key = signer.encode_keys(&keys)?;
+        let address = signer.derive_address(signing_key.expose())?;
         let account_id = format!("{}:{}", chain.chain_id, address);
         accounts.push(WalletAccount {
             account_id,
             address,
             chain_id: chain.chain_id.to_string(),
-            derivation_path: path,
+            // TODO: Cardano addresses are derived using multiple paths, consider storing all paths in WalletAccount
+            derivation_path: signer.default_derivation_path(index),
         });
     }
     Ok(accounts)
 }
 
+fn random_32() -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
+    let mut b = Zeroizing::new(vec![0u8; 32]);
+    getrandom::getrandom(&mut b)
+        .map_err(|e| OwsLibError::InvalidInput(format!("failed to generate random key: {e}")))?;
+    Ok(b)
+}
+
+fn random_ed25519_bip32_key() -> Result<Zeroizing<[u8; ed25519_bip32::XPRV_SIZE]>, OwsLibError> {
+    let mut key = Zeroizing::new([0u8; ed25519_bip32::XPRV_SIZE]);
+    getrandom::getrandom(key.as_mut()).map_err(|e| {
+        OwsLibError::InvalidInput(format!("failed to generate random Ed25519-BIP32 key: {e}"))
+    })?;
+
+    Ok(Zeroizing::new(
+        ed25519_bip32::XPrv::normalize_bytes_force3rd(*key).into(),
+    ))
+}
+
+fn random_ed25519_bip32() -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
+    let payment_key = random_ed25519_bip32_key()?;
+    let stake_key = random_ed25519_bip32_key()?;
+    Ok(Zeroizing::new([*payment_key, *stake_key].concat()))
+}
+
+fn validate_ed25519_bip32_key(bytes: &[u8]) -> Result<(), OwsLibError> {
+    use ed25519_bip32::XPRV_SIZE;
+
+    if bytes.len() != XPRV_SIZE && bytes.len() != XPRV_SIZE * 2 {
+        return Err(OwsLibError::InvalidInput(format!(
+            "Ed25519-BIP32 key must be 96 (payment) or 192 (payment||stake) bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    for (i, half) in bytes.chunks(XPRV_SIZE).enumerate() {
+        let role = if i == 0 { "payment" } else { "stake" };
+        ed25519_bip32::XPrv::from_slice_verified(half).map_err(|e| {
+            OwsLibError::InvalidInput(format!("invalid Ed25519-BIP32 {role} key: {e}"))
+        })?;
+    }
+
+    Ok(())
+}
+
 /// A key pair: one key per curve.
 /// Private key material is zeroized on drop.
 struct KeyPair {
-    secp256k1: Vec<u8>,
-    ed25519: Vec<u8>,
-}
-
-impl Drop for KeyPair {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.secp256k1.zeroize();
-        self.ed25519.zeroize();
-    }
+    secp256k1: Zeroizing<Vec<u8>>,
+    ed25519: Zeroizing<Vec<u8>>,
+    ed25519_bip32: Zeroizing<Vec<u8>>,
 }
 
 impl KeyPair {
@@ -78,16 +117,18 @@ impl KeyPair {
         match curve {
             ows_signer::Curve::Secp256k1 => &self.secp256k1,
             ows_signer::Curve::Ed25519 => &self.ed25519,
+            ows_signer::Curve::Ed25519Bip32 => &self.ed25519_bip32,
         }
     }
 
     /// Serialize to JSON bytes for encryption.
-    fn to_json_bytes(&self) -> Vec<u8> {
+    fn to_json_bytes(&self) -> Zeroizing<Vec<u8>> {
         let obj = serde_json::json!({
-            "secp256k1": hex::encode(&self.secp256k1),
-            "ed25519": hex::encode(&self.ed25519),
+            "secp256k1": hex::encode(&*self.secp256k1),
+            "ed25519": hex::encode(&*self.ed25519),
+            "ed25519_bip32": hex::encode(&*self.ed25519_bip32),
         });
-        obj.to_string().into_bytes()
+        Zeroizing::new(obj.to_string().into_bytes())
     }
 
     /// Deserialize from JSON bytes after decryption.
@@ -101,23 +142,33 @@ impl KeyPair {
         let ed = obj["ed25519"]
             .as_str()
             .ok_or_else(|| OwsLibError::InvalidInput("missing ed25519 key".into()))?;
+        // using an empty string as the default value for backwards compatibility with wallets that were imported with only secp256k1 and ed25519 private keys
+        let ed_bip32 = obj["ed25519_bip32"].as_str().unwrap_or("");
+
         Ok(KeyPair {
-            secp256k1: hex::decode(secp)
-                .map_err(|e| OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}")))?,
-            ed25519: hex::decode(ed)
-                .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
+            secp256k1: Zeroizing::new(
+                hex::decode(secp).map_err(|e| {
+                    OwsLibError::InvalidInput(format!("invalid secp256k1 hex: {e}"))
+                })?,
+            ),
+            ed25519: Zeroizing::new(
+                hex::decode(ed)
+                    .map_err(|e| OwsLibError::InvalidInput(format!("invalid ed25519 hex: {e}")))?,
+            ),
+            ed25519_bip32: Zeroizing::new(hex::decode(ed_bip32).map_err(|e| {
+                OwsLibError::InvalidInput(format!("invalid ed25519_bip32 hex: {e}"))
+            })?),
         })
     }
 }
 
 /// Derive accounts for all chain families using a key pair (one key per curve).
 fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, OwsLibError> {
-    let mut accounts = Vec::with_capacity(ALL_CHAIN_TYPES.len());
-    for ct in &ALL_CHAIN_TYPES {
-        let signer = signer_for_chain(*ct);
+    let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
+    for chain in universal_wallet_chains() {
+        let signer = signer_for_chain(&chain);
         let key = keys.key_for_curve(signer.curve());
         let address = signer.derive_address(key)?;
-        let chain = default_chain_for_type(*ct);
         accounts.push(WalletAccount {
             account_id: format!("{}:{}", chain.chain_id, address),
             address,
@@ -141,18 +192,30 @@ pub(crate) fn secret_to_signing_key(
                 OwsLibError::InvalidInput("wallet contains invalid UTF-8 mnemonic".into())
             })?;
             let mnemonic = Mnemonic::from_phrase(phrase)?;
-            let signer = signer_for_chain(chain_type);
-            let path = signer.default_derivation_path(index.unwrap_or(0));
-            let curve = signer.curve();
-            Ok(HdDeriver::derive_from_mnemonic_cached(
-                &mnemonic, "", &path, curve,
-            )?)
+            let signer = signer_for_chain_type(chain_type);
+            let keys = HdDeriver::derive_keys_from_mnemonic_cached(
+                &mnemonic,
+                "",
+                signer.default_derivation_paths(index.unwrap_or(0)),
+                signer.curve(),
+            )?;
+            Ok(signer.encode_keys(&keys)?)
         }
         KeyType::PrivateKey => {
             // JSON key pair — extract the right key for this chain's curve
             let keys = KeyPair::from_json_bytes(secret.expose())?;
-            let signer = signer_for_chain(chain_type);
-            Ok(SecretBytes::from_slice(keys.key_for_curve(signer.curve())))
+            let signer = signer_for_chain_type(chain_type);
+            let key = keys.key_for_curve(signer.curve());
+
+            // if the key for the requested curve is empty, it means that the wallet was imported using private keys before the support for the requested curve was added
+            if key.is_empty() {
+                return Err(OwsLibError::InvalidInput(format!(
+                    "Private key for chain {} is empty",
+                    chain_type
+                )));
+            }
+
+            Ok(SecretBytes::from_slice(key))
         }
     }
 }
@@ -179,12 +242,13 @@ pub fn derive_address(
 ) -> Result<String, OwsLibError> {
     let chain = parse_chain(chain)?;
     let mnemonic = Mnemonic::from_phrase(mnemonic_phrase)?;
-    let signer = signer_for_chain(chain.chain_type);
-    let path = signer.default_derivation_path(index.unwrap_or(0));
+    let signer = signer_for_chain(&chain);
+    let paths = signer.default_derivation_paths(index.unwrap_or(0));
     let curve = signer.curve();
 
-    let key = HdDeriver::derive_from_mnemonic(&mnemonic, "", &path, curve)?;
-    let address = signer.derive_address(key.expose())?;
+    let keys = HdDeriver::derive_keys_from_mnemonic(&mnemonic, "", paths, curve)?;
+    let signing_key = signer.encode_keys(&keys)?;
+    let address = signer.derive_address(signing_key.expose())?;
     Ok(address)
 }
 
@@ -266,20 +330,20 @@ pub fn import_wallet_mnemonic(
 }
 
 /// Decode a hex-encoded key, stripping an optional `0x` prefix.
-fn decode_hex_key(hex_str: &str) -> Result<Vec<u8>, OwsLibError> {
+fn decode_hex_key(hex_str: &str) -> Result<Zeroizing<Vec<u8>>, OwsLibError> {
     let trimmed = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     hex::decode(trimmed)
+        .map(Zeroizing::new)
         .map_err(|e| OwsLibError::InvalidInput(format!("invalid hex private key: {e}")))
 }
 
 /// Import a wallet from a hex-encoded private key.
 /// The `chain` parameter specifies which chain the key originates from (e.g. "evm", "solana").
-/// A random key is generated for the other curve so all 6 chains are supported.
+/// A random key is generated for each curve that is not supplied explicitly or via `private_key_hex`.
 ///
-/// Alternatively, provide both `secp256k1_key_hex` and `ed25519_key_hex` to supply
-/// explicit keys for each curve. When both are given, `private_key_hex` and `chain`
-/// are ignored. When only one curve key is given alongside `private_key_hex`, it
-/// overrides the random generation for that curve.
+/// For each curve, the key is chosen in order: `secp256k1_key_hex` / `ed25519_key_hex` /
+/// `ed25519_bip32_key_hex` if set; else `private_key_hex` when `chain` maps to that curve; else a random key.
+#[allow(clippy::too_many_arguments)]
 pub fn import_wallet_private_key(
     name: &str,
     private_key_hex: &str,
@@ -288,6 +352,7 @@ pub fn import_wallet_private_key(
     vault_path: Option<&Path>,
     secp256k1_key_hex: Option<&str>,
     ed25519_key_hex: Option<&str>,
+    ed25519_bip32_key_hex: Option<&str>,
 ) -> Result<WalletInfo, OwsLibError> {
     let passphrase = passphrase.unwrap_or("");
 
@@ -295,48 +360,47 @@ pub fn import_wallet_private_key(
         return Err(OwsLibError::WalletNameExists(name.to_string()));
     }
 
-    let keys = match (secp256k1_key_hex, ed25519_key_hex) {
-        // Both curve keys explicitly provided — use them directly
-        (Some(secp_hex), Some(ed_hex)) => KeyPair {
-            secp256k1: decode_hex_key(secp_hex)?,
-            ed25519: decode_hex_key(ed_hex)?,
-        },
-        // Existing single-key behavior
-        _ => {
-            let key_bytes = decode_hex_key(private_key_hex)?;
+    let private_key = (!private_key_hex.is_empty())
+        .then(|| decode_hex_key(private_key_hex))
+        .transpose()?;
 
-            // Determine curve from the source chain (default: secp256k1)
-            let source_curve = match chain {
-                Some(c) => {
-                    let parsed = parse_chain(c)?;
-                    signer_for_chain(parsed.chain_type).curve()
-                }
-                None => ows_signer::Curve::Secp256k1,
-            };
+    let source_curve = chain
+        .map(|c| parse_chain(c).map(|parsed| signer_for_chain(&parsed).curve()))
+        .transpose()?
+        .unwrap_or(ows_signer::Curve::Secp256k1);
 
-            // Build key pair: provided key for its curve, random 32 bytes for the other
-            let mut other_key = vec![0u8; 32];
-            getrandom::getrandom(&mut other_key).map_err(|e| {
-                OwsLibError::InvalidInput(format!("failed to generate random key: {e}"))
-            })?;
-
-            match source_curve {
-                ows_signer::Curve::Secp256k1 => KeyPair {
-                    secp256k1: key_bytes,
-                    ed25519: ed25519_key_hex
-                        .map(decode_hex_key)
-                        .transpose()?
-                        .unwrap_or(other_key),
+    let get_key =
+        |key_hex: Option<&str>,
+         curve: ows_signer::Curve,
+         generate_random: fn() -> Result<Zeroizing<Vec<u8>>, OwsLibError>| {
+            key_hex.map(decode_hex_key).transpose()?.map_or_else(
+                || {
+                    if curve == source_curve {
+                        private_key
+                            .as_ref()
+                            .cloned()
+                            .map_or_else(generate_random, Ok)
+                    } else {
+                        generate_random()
+                    }
                 },
-                ows_signer::Curve::Ed25519 => KeyPair {
-                    secp256k1: secp256k1_key_hex
-                        .map(decode_hex_key)
-                        .transpose()?
-                        .unwrap_or(other_key),
-                    ed25519: key_bytes,
-                },
-            }
-        }
+                Ok,
+            )
+        };
+
+    let secp256k1 = get_key(secp256k1_key_hex, ows_signer::Curve::Secp256k1, random_32)?;
+    let ed25519 = get_key(ed25519_key_hex, ows_signer::Curve::Ed25519, random_32)?;
+    let ed25519_bip32 = get_key(
+        ed25519_bip32_key_hex,
+        ows_signer::Curve::Ed25519Bip32,
+        random_ed25519_bip32,
+    )?;
+    validate_ed25519_bip32_key(&ed25519_bip32)?;
+
+    let keys = KeyPair {
+        secp256k1,
+        ed25519,
+        ed25519_bip32,
     };
 
     let accounts = derive_all_accounts_from_keys(&keys)?;
@@ -379,7 +443,7 @@ pub fn delete_wallet(name_or_id: &str, vault_path: Option<&Path>) -> Result<(), 
 }
 
 /// Export a wallet's secret.
-/// Mnemonic wallets return the phrase. Private key wallets return JSON with both keys.
+/// Mnemonic wallets return the phrase. Private key wallets return JSON with all keys.
 pub fn export_wallet(
     name_or_id: &str,
     passphrase: Option<&str>,
@@ -447,7 +511,7 @@ fn sign_hash_with_credential(
     index: Option<u32>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(chain);
     if signer.curve() != Curve::Secp256k1 {
         return Err(OwsLibError::InvalidInput(
             "raw hash signing is only supported for secp256k1-backed chains".into(),
@@ -512,7 +576,7 @@ pub fn sign_transaction(
     // Owner mode: existing passphrase-based signing (unchanged)
     let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(&chain);
     let signable = signer.extract_signable_bytes(&tx_bytes)?;
     let output = signer.sign_transaction(key.expose(), signable)?;
 
@@ -583,6 +647,7 @@ pub fn sign_authorization(
 ///
 /// The `passphrase` parameter accepts either the owner's passphrase or an
 /// API token (`ows_key_...`).
+#[allow(clippy::too_many_arguments)]
 pub fn sign_message(
     wallet: &str,
     chain: &str,
@@ -590,6 +655,7 @@ pub fn sign_message(
     passphrase: Option<&str>,
     encoding: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
@@ -610,15 +676,15 @@ pub fn sign_message(
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let chain = parse_chain(chain)?;
         return crate::key_ops::sign_message_with_api_key(
-            credential, wallet, &chain, &msg_bytes, index, vault_path,
+            credential, wallet, &chain, &msg_bytes, index, address, vault_path,
         );
     }
 
     // Owner mode
     let chain = parse_chain(chain)?;
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
-    let signer = signer_for_chain(chain.chain_type);
-    let output = signer.sign_message(key.expose(), &msg_bytes)?;
+    let signer = signer_for_chain(&chain);
+    let output = signer.sign_message(key.expose(), &msg_bytes, address)?;
 
     Ok(SignResult {
         signature: hex::encode(&output.signature),
@@ -637,6 +703,7 @@ pub fn sign_typed_data(
     typed_data_json: &str,
     passphrase: Option<&str>,
     index: Option<u32>,
+    address: Option<&str>,
     vault_path: Option<&Path>,
 ) -> Result<SignResult, OwsLibError> {
     let credential = passphrase.unwrap_or("");
@@ -655,11 +722,14 @@ pub fn sign_typed_data(
             &chain,
             typed_data_json,
             index,
+            address,
             vault_path,
         );
     }
 
     let key = decrypt_signing_key(wallet, chain.chain_type, credential, index, vault_path)?;
+    let signer = signer_for_chain(&chain);
+    signer.verify_sign_message_address(key.expose(), address)?;
     let evm_signer = ows_signer::chains::EvmSigner;
     let output = evm_signer.sign_typed_data(key.expose(), typed_data_json)?;
 
@@ -692,11 +762,30 @@ pub fn sign_and_send(
     // Agent mode: enforce policies, decrypt key, then sign + broadcast
     if credential.starts_with(crate::key_store::TOKEN_PREFIX) {
         let chain_info = parse_chain(chain)?;
-        let (key, _) = crate::key_ops::enforce_policy_and_decrypt_key(
+        let (key_file, wallet_obj) =
+            crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
+        let signer = signer_for_chain(&chain_info);
+
+        // if rpc_url is provided, use it, otherwise, resolve it if the chain is Cardano, because it's needed in make_transaction_context
+        let resolved_rpc_url = match rpc_url {
+            Some(url) => Some(url.to_string()),
+            None if chain_info.chain_type == ChainType::Cardano => Some(resolve_rpc_url(
+                chain_info.chain_id,
+                chain_info.chain_type,
+                None,
+            )?),
+            None => None,
+        };
+        let rpc_url = resolved_rpc_url.as_deref();
+
+        let transaction = signer.make_transaction_context(&tx_bytes, rpc_url)?;
+        let (key, _) = crate::key_ops::enforce_policies_and_decrypt_key(
             credential,
-            wallet,
+            key_file,
+            wallet_obj,
             &chain_info,
-            &tx_bytes,
+            Some(transaction),
+            None,
             index,
             vault_path,
         )?;
@@ -723,7 +812,7 @@ pub fn sign_encode_and_broadcast(
     rpc_url: Option<&str>,
 ) -> Result<SendResult, OwsLibError> {
     let chain = parse_chain(chain)?;
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(&chain);
 
     // 1. Extract signable portion (strips signature-slot headers for Solana; no-op for others)
     let signable = signer.extract_signable_bytes(tx_bytes)?;
@@ -763,7 +852,7 @@ pub fn decrypt_signing_key(
 }
 
 /// Resolve the RPC URL: explicit > config override (exact chain_id) > config (namespace) > built-in default.
-fn resolve_rpc_url(
+pub fn resolve_rpc_url(
     chain_id: &str,
     chain_type: ChainType,
     explicit: Option<&str>,
@@ -820,7 +909,16 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
         ChainType::Xrpl => broadcast_xrpl(rpc_url, signed_bytes),
         ChainType::Nano => broadcast_nano(rpc_url, signed_bytes),
         ChainType::Near => crate::near_rpc::broadcast_tx_commit(rpc_url, signed_bytes),
+        ChainType::Cardano => broadcast_cardano(rpc_url, signed_bytes),
     }
+}
+
+fn broadcast_cardano(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
+    let provider = ows_core::resolve_cardano_provider(rpc_url)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))?;
+    provider
+        .broadcast_tx(signed_bytes)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))
 }
 
 fn broadcast_xrpl(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
@@ -1104,13 +1202,15 @@ mod tests {
     ) -> WalletInfo {
         let key_bytes = hex::decode(privkey_hex).unwrap();
 
-        // Generate a random ed25519 key for the other curve
+        // Generate random keys for the other curves
         let mut ed_key = vec![0u8; 32];
         getrandom::getrandom(&mut ed_key).unwrap();
+        let ed_bip32 = random_ed25519_bip32().unwrap();
 
         let keys = KeyPair {
-            secp256k1: key_bytes,
-            ed25519: ed_key,
+            secp256k1: Zeroizing::new(key_bytes),
+            ed25519: Zeroizing::new(ed_key),
+            ed25519_bip32: ed_bip32,
         };
         let accounts = derive_all_accounts_from_keys(&keys).unwrap();
         let payload = keys.to_json_bytes();
@@ -1267,13 +1367,14 @@ mod tests {
         // support generic off-chain message signing without a defined convention.
         // NEAR's V1 sign_message is raw ed25519 (NEP-413 follow-up tracked).
         let chains = [
-            "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "spark", "sui", "near",
+            "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "spark", "sui", "near", "cardano",
         ];
         for chain in &chains {
             let result = sign_message(
                 "multi-sign",
                 chain,
                 "test msg",
+                None,
                 None,
                 None,
                 None,
@@ -1315,8 +1416,12 @@ mod tests {
         // binary-encoded *unsigned* transaction (no SigningPubKey/TxnSignature).
         let xrpl_tx_hex = "12000024000000016140000000000F424068400000000000000C8114AFF3C2E33458B30714CA16FFEE19952DD35C17C883145720939C1336A7356A70ED861D5934345C6B6360";
 
+        // Valid Cardano Conway-era `FixedTransaction` CBOR fixture (from cardano-serialization-lib tests).
+        const CARDANO_TX_HEX: &str = "84a700818258208b9c96823c19f2047f32210a330434b3d163e194ea17b2b702c0667f6fea7a7a000d80018182581d6138fe1dd1d91221a199ff0dacf41fdd5b87506b533d00e70fae8dae8f1abfbac06a021a0002b645031a03962de305a1581de1b3cabd3914ef99169ace1e8b545b635f809caa35f8b6c8bc69ae48061abf4009040e80a100828258207dc05ac55cdfb9cc24571d491d3a3bdbd7d48489a916d27fce3ffe5c9af1b7f55840d7eda8457f1814fe3333b7b1916e3b034e6d480f97f4f286b1443ef72383279718a3a3fddf127dae0505b01a48fd9ffe0f52d9d8c46d02bcb85d1d106c13aa048258201b3d6e1236891a921abf1a3f90a9fb1b2568b1096b6cd6d3eaaeb0ef0ee0802f58401ce4658303c3eb0f2b9705992ccd62de30423ade90219e2c4cfc9eb488c892ea28ba3110f0c062298447f4f6365499d97d31207075f9815c3fe530bd9a927402f5f6";
+
         let chains = [
             "evm", "solana", "bitcoin", "cosmos", "tron", "ton", "spark", "sui", "xrpl", "near",
+            "cardano",
         ];
         for chain in &chains {
             let tx = if *chain == "solana" {
@@ -1325,6 +1430,8 @@ mod tests {
                 &near_tx_hex
             } else if *chain == "xrpl" {
                 xrpl_tx_hex
+            } else if *chain == "cardano" {
+                CARDANO_TX_HEX
             } else {
                 generic_tx_hex
             };
@@ -1343,8 +1450,28 @@ mod tests {
         let vault = dir.path();
         create_wallet("det-sign", None, None, Some(vault)).unwrap();
 
-        let s1 = sign_message("det-sign", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("det-sign", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message(
+            "det-sign",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "det-sign",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_eq!(
             s1.signature, s2.signature,
             "same message should produce same signature"
@@ -1357,8 +1484,28 @@ mod tests {
         let vault = dir.path();
         create_wallet("diff-msg", None, None, Some(vault)).unwrap();
 
-        let s1 = sign_message("diff-msg", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("diff-msg", "evm", "world", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message(
+            "diff-msg",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "diff-msg",
+            "evm",
+            "world",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_ne!(s1.signature, s2.signature);
     }
 
@@ -1375,6 +1522,7 @@ mod tests {
             "pk-sign",
             "evm",
             "hello",
+            None,
             None,
             None,
             None,
@@ -1415,8 +1563,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_privkey_wallet("pk-det", TEST_PRIVKEY, "", dir.path());
 
-        let s1 = sign_message("pk-det", "evm", "test", None, None, None, Some(dir.path())).unwrap();
-        let s2 = sign_message("pk-det", "evm", "test", None, None, None, Some(dir.path())).unwrap();
+        let s1 = sign_message(
+            "pk-det",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+        )
+        .unwrap();
+        let s2 = sign_message(
+            "pk-det",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+        )
+        .unwrap();
         assert_eq!(s1.signature, s2.signature);
     }
 
@@ -1428,8 +1596,10 @@ mod tests {
         create_wallet("mn-w", None, None, Some(vault)).unwrap();
         save_privkey_wallet("pk-w", TEST_PRIVKEY, "", vault);
 
-        let mn_sig = sign_message("mn-w", "evm", "hello", None, None, None, Some(vault)).unwrap();
-        let pk_sig = sign_message("pk-w", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let mn_sig =
+            sign_message("mn-w", "evm", "hello", None, None, None, None, Some(vault)).unwrap();
+        let pk_sig =
+            sign_message("pk-w", "evm", "hello", None, None, None, None, Some(vault)).unwrap();
         assert_ne!(
             mn_sig.signature, pk_sig.signature,
             "different keys should produce different signatures"
@@ -1449,6 +1619,7 @@ mod tests {
             Some(vault),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1457,7 +1628,17 @@ mod tests {
         );
 
         // Should be able to sign
-        let sig = sign_message("pk-api", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-api",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Export should return JSON key pair with original key
@@ -1467,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn privkey_wallet_import_both_curve_keys() {
+    fn privkey_wallet_import_secp_and_ed_curve_keys() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
 
@@ -1475,36 +1656,161 @@ mod tests {
         let ed_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 
         let info = import_wallet_private_key(
-            "pk-both",
-            "",   // ignored when both curve keys provided
-            None, // chain ignored too
+            "pk-secp-and-ed",
+            "",
+            None,
             None,
             Some(vault),
             Some(secp_key),
             Some(ed_key),
+            None, // ed25519_bip32 will be randomly generated
         )
         .unwrap();
 
         assert_eq!(
             info.accounts.len(),
-            ALL_CHAIN_TYPES.len(),
-            "should have one account per chain type"
+            UNIVERSAL_WALLET_ACCOUNT_COUNT,
+            "should have one account per chain type plus Cardano testnets"
         );
 
         // Sign on EVM (secp256k1)
-        let sig = sign_message("pk-both", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-secp-and-ed",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Sign on Solana (ed25519)
-        let sig =
-            sign_message("pk-both", "solana", "hello", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "pk-secp-and-ed",
+            "solana",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
-        // Export should return both keys
-        let exported = export_wallet("pk-both", None, Some(vault)).unwrap();
+        let exported = export_wallet("pk-secp-and-ed", None, Some(vault)).unwrap();
         let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
         assert_eq!(obj["secp256k1"].as_str().unwrap(), secp_key);
         assert_eq!(obj["ed25519"].as_str().unwrap(), ed_key);
+        assert_eq!(
+            obj["ed25519_bip32"].as_str().unwrap().len(),
+            ed25519_bip32::XPRV_SIZE * 2 * 2
+        );
+    }
+
+    #[test]
+    fn privkey_wallet_import_three_explicit_curve_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let secp_key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let ed_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        let ed_bip32_key = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+
+        import_wallet_private_key(
+            "pk-all-explicit",
+            "",
+            None,
+            None,
+            Some(vault),
+            Some(secp_key),
+            Some(ed_key),
+            Some(ed_bip32_key),
+        )
+        .unwrap();
+
+        let exported = export_wallet("pk-all-explicit", None, Some(vault)).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(obj["secp256k1"].as_str().unwrap(), secp_key);
+        assert_eq!(obj["ed25519"].as_str().unwrap(), ed_key);
+        assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), ed_bip32_key);
+    }
+
+    #[test]
+    fn privkey_wallet_import_single_curve_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let ed_bip32_key = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+
+        import_wallet_private_key(
+            "pk-evm-plus-bip32",
+            TEST_PRIVKEY,
+            Some("evm"),
+            None,
+            Some(vault),
+            None,
+            None, // ed25519 will be randomly generated
+            Some(ed_bip32_key),
+        )
+        .unwrap();
+
+        let exported = export_wallet("pk-evm-plus-bip32", None, Some(vault)).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(obj["secp256k1"].as_str().unwrap(), TEST_PRIVKEY);
+        assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), ed_bip32_key);
+    }
+
+    /// A single 96-byte payment `XPrv` and a 192-byte payment‖stake blob are the two shapes
+    /// the Cardano signer decodes; both must import.
+    #[test]
+    fn privkey_wallet_import_accepts_both_ed25519_bip32_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        let payment = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a247384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d";
+        let payment_and_stake = format!("{payment}{payment}");
+
+        for (name, key) in [("bip32-96", payment), ("bip32-192", &payment_and_stake)] {
+            import_wallet_private_key(name, "", None, None, Some(vault), None, None, Some(key))
+                .unwrap();
+            let exported = export_wallet(name, None, Some(vault)).unwrap();
+            let obj: serde_json::Value = serde_json::from_str(&exported).unwrap();
+            assert_eq!(obj["ed25519_bip32"].as_str().unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn privkey_wallet_rejects_malformed_ed25519_bip32_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+
+        // A 64-byte key: valid hex, but not a shape any Cardano signer can decode.
+        let too_short = "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15adcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a24";
+        // 96 bytes, but the scalar's high bits violate the Ed25519-BIP32 clamping rules
+        // (first byte's low 3 bits set, byte 31 not 0b01xxxxxx).
+        let bad_scalar_bits = "f".repeat(ed25519_bip32::XPRV_SIZE * 2);
+
+        for key in [too_short, bad_scalar_bits.as_str()] {
+            let err = import_wallet_private_key(
+                "bip32-bad",
+                "",
+                None,
+                None,
+                Some(vault),
+                None,
+                None,
+                Some(key),
+            )
+            .expect_err("expected malformed Ed25519-BIP32 key to be rejected");
+            assert!(
+                err.to_string().contains("Ed25519-BIP32"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     // ================================================================
@@ -1526,6 +1832,7 @@ mod tests {
             Some("s3cret"),
             None,
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -1543,13 +1850,24 @@ mod tests {
             Some("wrong"),
             None,
             None,
+            None,
             Some(vault)
         )
         .is_err());
         assert!(export_wallet("pass-mn", Some("wrong"), Some(vault)).is_err());
 
         // No passphrase should fail (defaults to empty string, which is wrong)
-        assert!(sign_message("pass-mn", "evm", "hello", None, None, None, Some(vault)).is_err());
+        assert!(sign_message(
+            "pass-mn",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1563,6 +1881,7 @@ mod tests {
             "evm",
             "hello",
             Some("mypass"),
+            None,
             None,
             None,
             Some(dir.path()),
@@ -1580,6 +1899,7 @@ mod tests {
             "evm",
             "hello",
             Some("wrong"),
+            None,
             None,
             None,
             Some(dir.path())
@@ -1611,6 +1931,7 @@ mod tests {
             "verify-evm",
             "evm",
             "hello world",
+            None,
             None,
             None,
             None,
@@ -1665,7 +1986,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(get_wallet("nope", Some(dir.path())).is_err());
         assert!(export_wallet("nope", None, Some(dir.path())).is_err());
-        assert!(sign_message("nope", "evm", "x", None, None, None, Some(dir.path())).is_err());
+        assert!(
+            sign_message("nope", "evm", "x", None, None, None, None, Some(dir.path())).is_err()
+        );
         assert!(delete_wallet("nope", Some(dir.path())).is_err());
     }
 
@@ -1688,6 +2011,7 @@ mod tests {
             Some(dir.path()),
             None,
             None,
+            None,
         )
         .is_err());
     }
@@ -1697,9 +2021,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
         create_wallet("chain-err", None, None, Some(vault)).unwrap();
-        assert!(
-            sign_message("chain-err", "fakecoin", "hi", None, None, None, Some(vault)).is_err()
-        );
+        assert!(sign_message(
+            "chain-err",
+            "fakecoin",
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1787,6 +2119,7 @@ mod tests {
             None,
             Some("hex"),
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -1799,6 +2132,7 @@ mod tests {
             "hello",
             None,
             Some("utf8"),
+            None,
             None,
             Some(vault),
         )
@@ -1820,6 +2154,7 @@ mod tests {
             "hello",
             None,
             Some("base64"),
+            None,
             None,
             Some(vault)
         )
@@ -1843,9 +2178,9 @@ mod tests {
         assert_eq!(wallets.len(), 3);
 
         // All can sign independently
-        let s1 = sign_message("w1", "evm", "test", None, None, None, Some(vault)).unwrap();
-        let s2 = sign_message("w2", "evm", "test", None, None, None, Some(vault)).unwrap();
-        let s3 = sign_message("w3", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let s1 = sign_message("w1", "evm", "test", None, None, None, None, Some(vault)).unwrap();
+        let s2 = sign_message("w2", "evm", "test", None, None, None, None, Some(vault)).unwrap();
+        let s3 = sign_message("w3", "evm", "test", None, None, None, None, Some(vault)).unwrap();
 
         // All signatures should be different (different keys)
         assert_ne!(s1.signature, s2.signature);
@@ -1855,8 +2190,8 @@ mod tests {
         // Delete one, others survive
         delete_wallet("w2", Some(vault)).unwrap();
         assert_eq!(list_wallets(Some(vault)).unwrap().len(), 2);
-        assert!(sign_message("w1", "evm", "test", None, None, None, Some(vault)).is_ok());
-        assert!(sign_message("w3", "evm", "test", None, None, None, Some(vault)).is_ok());
+        assert!(sign_message("w1", "evm", "test", None, None, None, None, Some(vault)).is_ok());
+        assert!(sign_message("w3", "evm", "test", None, None, None, None, Some(vault)).is_ok());
     }
 
     // ================================================================
@@ -1903,7 +2238,7 @@ mod tests {
 
         // Now encode the full signed transaction (what the library does correctly)
         let key = decrypt_signing_key("send-bug", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm);
         let output = signer.sign_transaction(key.expose(), &unsigned_tx).unwrap();
         let full_signed_tx = signer
             .encode_signed_transaction(&unsigned_tx, &output)
@@ -1991,6 +2326,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2030,13 +2366,23 @@ mod tests {
         );
 
         // Same for sign_message
-        let msg_none =
-            sign_message("char-equiv", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let msg_none = sign_message(
+            "char-equiv",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         let msg_empty = sign_message(
             "char-equiv",
             "evm",
             "test",
             Some(""),
+            None,
             None,
             None,
             Some(vault),
@@ -2083,6 +2429,7 @@ mod tests {
             "evm",
             "test",
             Some("some-random-passphrase"),
+            None,
             None,
             None,
             Some(vault),
@@ -2176,17 +2523,47 @@ mod tests {
         create_wallet("orig-name", None, None, Some(vault)).unwrap();
 
         // Sign with original name
-        let sig1 = sign_message("orig-name", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig1 = sign_message(
+            "orig-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig1.signature.is_empty());
 
         // Rename
         rename_wallet("orig-name", "new-name", Some(vault)).unwrap();
 
         // Old name no longer works
-        assert!(sign_message("orig-name", "evm", "test", None, None, None, Some(vault)).is_err());
+        assert!(sign_message(
+            "orig-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault)
+        )
+        .is_err());
 
         // Sign with new name — should produce same signature (same key)
-        let sig2 = sign_message("new-name", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig2 = sign_message(
+            "new-name",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert_eq!(
             sig1.signature, sig2.signature,
             "renamed wallet should produce identical signatures"
@@ -2200,15 +2577,33 @@ mod tests {
         create_wallet("del-me-char", None, None, Some(vault)).unwrap();
 
         // Sign succeeds
-        let sig =
-            sign_message("del-me-char", "evm", "test", None, None, None, Some(vault)).unwrap();
+        let sig = sign_message(
+            "del-me-char",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
         assert!(!sig.signature.is_empty());
 
         // Delete
         delete_wallet("del-me-char", Some(vault)).unwrap();
 
         // Sign after delete fails with WalletNotFound
-        let result = sign_message("del-me-char", "evm", "test", None, None, None, Some(vault));
+        let result = sign_message(
+            "del-me-char",
+            "evm",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             OwsLibError::WalletNotFound(name) => assert_eq!(name, "del-me-char"),
@@ -2233,6 +2628,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(v1.path()),
         )
         .unwrap();
@@ -2249,6 +2645,7 @@ mod tests {
             "char-det-2",
             "evm",
             "determinism test",
+            None,
             None,
             None,
             None,
@@ -2275,6 +2672,7 @@ mod tests {
             Some(vault),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2285,7 +2683,7 @@ mod tests {
 
     #[test]
     fn char_sign_message_all_chain_families() {
-        // Verify sign_message works for every chain family (EVM, Solana, Bitcoin, Cosmos, Tron, TON, Sui)
+        // Verify sign_message works for every chain family (EVM, Solana, Bitcoin, Cosmos, Tron, TON, Sui, Cardano)
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
         create_wallet("char-all-chains", None, None, Some(vault)).unwrap();
@@ -2297,13 +2695,16 @@ mod tests {
             ("cosmos", true),
             ("tron", true),
             ("ton", false),
+            ("spark", false),
             ("sui", false),
+            ("cardano", false),
         ];
         for (chain, has_recovery_id) in &chains {
             let result = sign_message(
                 "char-all-chains",
                 chain,
                 "hello",
+                None,
                 None,
                 None,
                 None,
@@ -2345,7 +2746,15 @@ mod tests {
             "message": {"value": "42"}
         }"#;
 
-        let result = sign_typed_data("char-typed", "evm", typed_data, None, None, Some(vault));
+        let result = sign_typed_data(
+            "char-typed",
+            "evm",
+            typed_data,
+            None,
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_ok(), "sign_typed_data failed: {:?}", result.err());
 
         let sig = result.unwrap();
@@ -2400,6 +2809,7 @@ mod tests {
             None,
             None,
             Some(0),
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2410,6 +2820,7 @@ mod tests {
             None,
             None,
             Some(1),
+            None,
             Some(vault),
         )
         .unwrap();
@@ -2466,7 +2877,16 @@ mod tests {
 
         // Sign message on multiple chains
         for chain in &["evm", "solana", "bitcoin", "cosmos"] {
-            let result = sign_message("char-24w", chain, "test", None, None, None, Some(vault));
+            let result = sign_message(
+                "char-24w",
+                chain,
+                "test",
+                None,
+                None,
+                None,
+                None,
+                Some(vault),
+            );
             assert!(
                 result.is_ok(),
                 "24-word wallet sign_message failed for {chain}: {:?}",
@@ -2504,6 +2924,7 @@ mod tests {
                         "char-conc",
                         "evm",
                         &msg,
+                        None,
                         None,
                         None,
                         None,
@@ -2620,7 +3041,7 @@ mod tests {
         // by manually calling the signer's extract/sign/encode chain:
         let key =
             decrypt_signing_key("char-sol-sig", ChainType::Solana, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Solana);
+        let signer = signer_for_chain_type(ChainType::Solana);
 
         let signable = signer.extract_signable_bytes(&tx_bytes).unwrap();
         assert_eq!(
@@ -2686,7 +3107,7 @@ mod tests {
         // Path B: the internal pipeline (what sign_and_send uses)
         let key =
             decrypt_signing_key("char-encode", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm);
         let output = signer.sign_transaction(key.expose(), &unsigned_tx).unwrap();
         let full_signed_tx = signer
             .encode_signed_transaction(&unsigned_tx, &output)
@@ -2740,7 +3161,15 @@ mod tests {
             "message": {"value": "1"}
         }"#;
 
-        let result = sign_typed_data(&w.id, "solana", typed_data, Some("pass"), None, Some(vault));
+        let result = sign_typed_data(
+            &w.id,
+            "solana",
+            typed_data,
+            Some("pass"),
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2770,7 +3199,15 @@ mod tests {
             "message": {"value": "42"}
         }"#;
 
-        let result = sign_typed_data(&w.id, "evm", typed_data, Some("pass"), None, Some(vault));
+        let result = sign_typed_data(
+            &w.id,
+            "evm",
+            typed_data,
+            Some("pass"),
+            None,
+            None,
+            Some(vault),
+        );
         assert!(result.is_ok(), "sign_typed_data failed: {:?}", result.err());
 
         let sign_result = result.unwrap();
@@ -2807,7 +3244,7 @@ mod tests {
 
         let key =
             decrypt_signing_key(&wallet.id, ChainType::Evm, "pass", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm);
         let direct = signer
             .sign(key.expose(), &hex::decode(&hash_hex).unwrap())
             .unwrap();
@@ -3097,7 +3534,7 @@ mod tests {
 
         // Path B: direct signer call (no credential branch)
         let key = decrypt_signing_key("reg-owner", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Evm);
+        let signer = signer_for_chain_type(ChainType::Evm);
         let tx_bytes = hex::decode(tx_hex).unwrap();
         let direct_output = signer.sign_transaction(key.expose(), &tx_bytes).unwrap();
 
@@ -3162,13 +3599,22 @@ mod tests {
         create_wallet("reg-msg", None, None, Some(vault)).unwrap();
 
         // Through the public API
-        let api_result =
-            sign_message("reg-msg", "evm", "hello", None, None, None, Some(vault)).unwrap();
+        let api_result = sign_message(
+            "reg-msg",
+            "evm",
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some(vault),
+        )
+        .unwrap();
 
         // Direct signer
         let key = decrypt_signing_key("reg-msg", ChainType::Evm, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Evm);
-        let direct = signer.sign_message(key.expose(), b"hello").unwrap();
+        let signer = signer_for_chain_type(ChainType::Evm);
+        let direct = signer.sign_message(key.expose(), b"hello", None).unwrap();
 
         assert_eq!(
             api_result.signature,
@@ -3298,7 +3744,7 @@ mod tests {
         // Path B: manual extract + sign
         let key =
             decrypt_signing_key("sol-match", ChainType::Solana, "", None, Some(vault)).unwrap();
-        let signer = signer_for_chain(ChainType::Solana);
+        let signer = signer_for_chain_type(ChainType::Solana);
         let signable = signer.extract_signable_bytes(&full_tx).unwrap();
         let direct = signer.sign_transaction(key.expose(), signable).unwrap();
 

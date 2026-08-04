@@ -96,7 +96,7 @@ const solAddr = deriveAddress(mnemonic, "solana");
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `mnemonic` | `string` | &mdash; | BIP-39 mnemonic phrase |
-| `chain` | `string` | &mdash; | `"evm"`, `"solana"`, `"xrpl"`, `"sui"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` |
+| `chain` | `string` | &mdash; | `"evm"`, `"solana"`, `"xrpl"`, `"sui"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"`, `"cardano"` |
 | `index` | `number` | `0` | Account index in derivation path |
 
 **Returns:** `string`
@@ -120,6 +120,9 @@ console.log(wallet.accounts);
 //   { chainId: "sui:mainnet", address: "0x...", derivationPath: "m/44'/784'/0'/0'/0'" },
 //   { chainId: "xrpl:mainnet", address: "r...", derivationPath: "m/44'/144'/0'/0/0" },
 //   { chainId: "fil:mainnet", address: "f1...", derivationPath: "m/44'/461'/0'/0/0" },
+//   { chainId: "cip34:1-764824073", address: "addr1...", derivationPath: "m/1852'/1815'/0'/0/0" }, // payment; stake m/1852'/1815'/0'/2/0
+//   { chainId: "cip34:0-1", address: "addr_test1...", derivationPath: "m/1852'/1815'/0'/0/0" }, // Cardano Pre-production
+//   { chainId: "cip34:0-2", address: "addr_test1...", derivationPath: "m/1852'/1815'/0'/0/0" }, // Cardano Preview
 // ]
 ```
 
@@ -174,7 +177,7 @@ renameWallet("old-name", "new-name");
 Export a wallet's secret.
 
 - **Mnemonic wallets** return the phrase string.
-- **Private key wallets** return a JSON string with both curve keys:
+- **Private key wallets** return a JSON string with per-curve key material:
 
 ```javascript
 // Mnemonic wallet
@@ -184,7 +187,7 @@ const phrase = exportWallet("mn-wallet");
 // Private key wallet
 const keysJson = exportWallet("pk-wallet");
 const keys = JSON.parse(keysJson);
-// => { secp256k1: "4c0883a6...", ed25519: "9d61b19d..." }
+// => { secp256k1: "4c0883a6...", ed25519: "9d61b19d...", ed25519_bip32: "..." }
 ```
 
 **Returns:** `string`
@@ -193,7 +196,7 @@ const keys = JSON.parse(keysJson);
 
 #### `importWalletMnemonic(name, mnemonic, passphrase?, index?, vaultPath?)`
 
-Import a wallet from a BIP-39 mnemonic. Derives all 9 chain accounts via HD paths.
+Import a wallet from a BIP-39 mnemonic. Derives all 13 chain-family accounts via HD paths.
 
 ```javascript
 const wallet = importWalletMnemonic("imported", "goose puzzle decorate ...");
@@ -201,49 +204,51 @@ const wallet = importWalletMnemonic("imported", "goose puzzle decorate ...");
 
 **Returns:** `WalletInfo`
 
-#### `importWalletPrivateKey(name, privateKeyHex, passphrase?, vaultPath?, chain?, secp256k1Key?, ed25519Key?)`
+#### `importWalletPrivateKey(name, privateKeyHex, passphrase?, vaultPath?, chain?, secp256k1Key?, ed25519Key?, ed25519Bip32Key?)`
 
-Import a wallet from a hex-encoded private key. All 9 chains are supported: the provided key is used for its curve's chains, and a random key is generated for the other curve.
+Import a wallet from a hex-encoded private key. All registered chains are supported: the provided key is used for its curve's chains, and a random key is generated for the other curves.
 
 The optional `chain` parameter specifies which chain the key originates from to determine the curve. Defaults to `"evm"` (secp256k1).
 
-Alternatively, provide explicit keys for each curve via `secp256k1Key` and `ed25519Key`. When both are given, `privateKeyHex` and `chain` are ignored.
+Alternatively, provide explicit keys for each curve via `secp256k1Key`, `ed25519Key`, and `ed25519Bip32Key`. When all are given, `privateKeyHex` and `chain` are ignored.
 
 ```javascript
-// Import an EVM private key — generates a random Ed25519 key for Solana/Sui/TON
+// Import an EVM private key — generates a random Ed25519 key for Solana/Sui/TON and a random Ed25519Bip32 key for Cardano
 const wallet = importWalletPrivateKey("from-evm", "4c0883a691...");
-console.log(wallet.accounts.length); // => 9
+console.log(wallet.accounts.length); // => 15
 
-// Import a Solana private key — generates a random secp256k1 key for EVM/BTC/etc.
+// Import a Solana private key — generates a random secp256k1 key for EVM/BTC/etc and a random Ed25519Bip32 for Cardano.
 const wallet2 = importWalletPrivateKey(
   "from-solana", "9d61b19d...", undefined, undefined, "solana"
 );
-console.log(wallet2.accounts.length); // => 8
+console.log(wallet2.accounts.length); // => 15
 
-// Import explicit keys for both curves
+// Import explicit keys for all curves
 const wallet3 = importWalletPrivateKey(
-  "both-keys", "", undefined, undefined, undefined,
+  "all-keys", "", undefined, undefined, undefined,
   "4c0883a691...",  // secp256k1 key
-  "9d61b19d..."     // ed25519 key
+  "9d61b19d...",    // ed25519 key
+  "cafe..."         // ed25519Bip32 key
 );
-console.log(wallet3.accounts.length); // => 8
+console.log(wallet3.accounts.length); // => 15
 ```
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | `string` | &mdash; | Wallet name |
-| `privateKeyHex` | `string` | &mdash; | Hex-encoded private key (with or without `0x` prefix). Ignored when both curve keys are provided. |
+| `privateKeyHex` | `string` | &mdash; | Hex-encoded private key (with or without `0x` prefix). Ignored when all three curve keys (`secp256k1Key`, `ed25519Key`, and `ed25519Bip32Key`) are provided. |
 | `passphrase` | `string` | `undefined` | Encryption passphrase |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
-| `chain` | `string` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) |
-| `secp256k1Key` | `string` | `undefined` | Explicit secp256k1 private key (hex). Overrides random generation for secp256k1 chains. |
-| `ed25519Key` | `string` | `undefined` | Explicit Ed25519 private key (hex). Overrides random generation for Ed25519 chains. |
+| `chain` | `string` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) or `"cardano"` (Ed25519-BIP32) |
+| `secp256k1Key` | `string` | `undefined` | Explicit secp256k1 private key (hex). With `ed25519Key`, fills that curve; otherwise overrides random secp256k1 when using a primary `privateKeyHex`. |
+| `ed25519Key` | `string` | `undefined` | Explicit Ed25519 private key (hex). Same pairing rules as `secp256k1Key`. |
+| `ed25519Bip32Key` | `string` | `undefined` | Explicit Ed25519-BIP32 extended private key, 96/192 bytes as hex. Random if omitted. |
 
 **Returns:** `WalletInfo`
 
 ### Signing
 
-#### `signMessage(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?)`
+#### `signMessage(wallet, chain, message, passphrase?, encoding?, index?, address?, vaultPath?)`
 
 Sign a message with chain-specific formatting.
 
@@ -261,6 +266,7 @@ console.log(result.recoveryId); // 0 or 1
 | `passphrase` | `string` | `undefined` | Decryption passphrase |
 | `encoding` | `string` | `"utf8"` | `"utf8"` or `"hex"` |
 | `index` | `number` | `0` | Account index |
+| `address` | `string` | `undefined` | Optional address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano) |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
 
 **Returns:** `SignResult`
@@ -300,7 +306,7 @@ console.log(result.signature);
 console.log(result.recoveryId); // 0 or 1
 ```
 
-#### `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?)`
+#### `signTypedData(wallet, chain, typedDataJson, passphrase?, index?, address?, vaultPath?)`
 
 Sign EIP-712 typed structured data (EVM only).
 
@@ -333,6 +339,7 @@ console.log(result.recoveryId); // 27 or 28
 | `typedDataJson` | `string` | &mdash; | JSON string of EIP-712 typed data |
 | `passphrase` | `string` | `undefined` | Decryption passphrase |
 | `index` | `number` | `0` | Account index |
+| `address` | `string` | `undefined` | Optional address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano) |
 | `vaultPath` | `string` | `~/.ows` | Custom vault directory root |
 
 **Returns:** `SignResult`

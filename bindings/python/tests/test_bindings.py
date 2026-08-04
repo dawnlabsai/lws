@@ -40,7 +40,7 @@ def test_derive_address_ethereum():
 
 def test_derive_address_all_supported_chains():
     phrase = ows.generate_mnemonic(12)
-    for chain in ["evm", "solana", "sui", "bitcoin", "cosmos", "tron", "ton", "filecoin", "xrpl", "nano", "near"]:
+    for chain in ["evm", "solana", "sui", "bitcoin", "cosmos", "tron", "ton", "filecoin", "xrpl", "nano", "near", "cardano"]:
         address = ows.derive_address(phrase, chain)
         assert len(address) > 0
 
@@ -49,7 +49,7 @@ def test_create_and_list_wallets(vault_dir):
     wallet = ows.create_wallet("test-wallet", vault_path_opt=vault_dir)
     assert wallet["name"] == "test-wallet"
     assert isinstance(wallet["accounts"], list)
-    assert len(wallet["accounts"]) == 12
+    assert len(wallet["accounts"]) == 15
 
     # Verify each chain family is present
     chain_ids = [a["chain_id"] for a in wallet["accounts"]]
@@ -65,6 +65,7 @@ def test_create_and_list_wallets(vault_dir):
     assert any(c.startswith("xrpl:") for c in chain_ids)
     assert any(c.startswith("nano:") for c in chain_ids)
     assert any(c.startswith("near:") for c in chain_ids)
+    assert any(c.startswith("cip34:") for c in chain_ids)
 
     wallets = ows.list_wallets(vault_path_opt=vault_dir)
     assert len(wallets) == 1
@@ -111,7 +112,7 @@ def test_import_wallet_mnemonic(vault_dir):
         "imported", phrase, vault_path_opt=vault_dir
     )
     assert wallet["name"] == "imported"
-    assert len(wallet["accounts"]) == 12
+    assert len(wallet["accounts"]) == 15
 
     # EVM account should match derived address
     evm_account = next(a for a in wallet["accounts"] if a["chain_id"].startswith("eip155:"))

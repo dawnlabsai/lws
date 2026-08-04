@@ -137,7 +137,13 @@ impl ChainSigner for FilecoinSigner {
         self.sign(private_key, &hash)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // Hash with Blake2b-256 and sign
         let hash = Self::blake2b(message, 32);
         self.sign(private_key, &hash)
@@ -240,7 +246,9 @@ mod tests {
             hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
                 .unwrap();
         let signer = FilecoinSigner;
-        let result = signer.sign_message(&privkey, b"Hello Filecoin").unwrap();
+        let result = signer
+            .sign_message(&privkey, b"Hello Filecoin", None)
+            .unwrap();
         assert_eq!(result.signature.len(), 65);
     }
 }

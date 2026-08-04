@@ -94,7 +94,7 @@ sol_addr = derive_address(mnemonic, "solana")
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `mnemonic` | `str` | &mdash; | BIP-39 mnemonic phrase |
-| `chain` | `str` | &mdash; | `"evm"`, `"solana"`, `"xrpl"`, `"sui"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"ton"`, `"spark"`, `"filecoin"` |
+| `chain` | `str` | &mdash; | `"evm"`, `"solana"`, `"xrpl"`, `"sui"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"ton"`, `"spark"`, `"filecoin"`, `"cardano"` |
 | `index` | `int` | `0` | Account index in derivation path |
 
 ### Wallet Management
@@ -147,7 +147,7 @@ rename_wallet("old-name", "new-name")
 Export a wallet's secret.
 
 - **Mnemonic wallets** return the phrase string.
-- **Private key wallets** return a JSON string with both curve keys.
+- **Private key wallets** return a JSON string with per-curve key material (`secp256k1`, `ed25519`, `ed25519_bip32`).
 
 ```python
 # Mnemonic wallet
@@ -157,60 +157,62 @@ phrase = export_wallet("mn-wallet")
 # Private key wallet
 import json
 keys = json.loads(export_wallet("pk-wallet"))
-# => {"secp256k1": "4c0883a6...", "ed25519": "9d61b19d..."}
+# => {"secp256k1": "4c0883a6...", "ed25519": "9d61b19d...", "ed25519_bip32": "..."}
 ```
 
 ### Import
 
 #### `import_wallet_mnemonic(name, mnemonic, passphrase=None, index=None, vault_path=None)`
 
-Import a wallet from a BIP-39 mnemonic. Derives all 9 chain accounts via HD paths.
+Import a wallet from a BIP-39 mnemonic. Derives all universal-wallet accounts via HD paths (13 chain families plus Cardano Preprod and Preview).
 
 ```python
 wallet = import_wallet_mnemonic("imported", "goose puzzle decorate ...")
 ```
 
-#### `import_wallet_private_key(name, private_key_hex, chain=None, passphrase=None, vault_path=None, secp256k1_key=None, ed25519_key=None)`
+#### `import_wallet_private_key(name, private_key_hex, chain=None, passphrase=None, vault_path=None, secp256k1_key=None, ed25519_key=None, ed25519_bip32_key=None)`
 
-Import a wallet from a hex-encoded private key. All 9 chains are supported: the provided key is used for its curve's chains, and a random key is generated for the other curve.
+Import a wallet from a hex-encoded private key. All chain families are supported (15 accounts, including Cardano Preprod and Preview): the provided key is used for its curve's chains, and random keys are generated for the other curves.
 
 The optional `chain` parameter specifies which chain the key originates from to determine the curve. Defaults to `"evm"` (secp256k1).
 
-Alternatively, provide explicit keys for each curve via `secp256k1_key` and `ed25519_key`. When both are given, `private_key_hex` and `chain` are ignored.
+Alternatively, provide explicit keys for each curve via `secp256k1_key`, `ed25519_key`, and `ed25519_bip32_key`. When all are given, `private_key_hex` and `chain` are ignored.
 
 ```python
-# Import an EVM private key — generates a random Ed25519 key for Solana/Sui/TON
+# Import an EVM private key — generates random Ed25519 and Ed25519-BIP32 keys for other curves
 wallet = import_wallet_private_key("from-evm", "4c0883a691...")
-print(len(wallet["accounts"]))  # => 9
+print(len(wallet["accounts"]))  # => 15
 
-# Import a Solana private key — generates a random secp256k1 key for EVM/BTC/etc.
+# Import a Solana private key — generates a random secp256k1 key for EVM/BTC/etc and Ed25519-BIP32 for Cardano.
 wallet = import_wallet_private_key(
     "from-solana", "9d61b19d...", chain="solana"
 )
-print(len(wallet["accounts"]))  # => 9
+print(len(wallet["accounts"]))  # => 15
 
-# Import explicit keys for both curves
+# Import explicit keys for all curves
 wallet = import_wallet_private_key(
-    "both-keys", "",
+    "all-keys", "",
     secp256k1_key="4c0883a691...",
-    ed25519_key="9d61b19d..."
+    ed25519_key="9d61b19d...",
+    ed25519_bip32_key="cafe..."
 )
-print(len(wallet["accounts"]))  # => 9
+print(len(wallet["accounts"]))  # => 15
 ```
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | `str` | &mdash; | Wallet name |
-| `private_key_hex` | `str` | &mdash; | Hex-encoded private key. Ignored when both curve keys are provided. |
-| `chain` | `str` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) |
+| `private_key_hex` | `str` | &mdash; | Hex-encoded private key. Ignored when all three curve keys (`secp256k1Key`, `ed25519Key`, and `ed25519Bip32Key`) are provided. |
+| `chain` | `str` | `"evm"` | Source chain: `"evm"`, `"bitcoin"`, `"cosmos"`, `"tron"`, `"filecoin"` (secp256k1) or `"solana"`, `"sui"`, `"ton"` (Ed25519) or `"cardano"` (Ed25519-BIP32) |
 | `passphrase` | `str` | `None` | Encryption passphrase |
 | `vault_path` | `str` | `None` | Custom vault directory |
 | `secp256k1_key` | `str` | `None` | Explicit secp256k1 private key (hex) |
 | `ed25519_key` | `str` | `None` | Explicit Ed25519 private key (hex) |
+| `ed25519_bip32_key` | `str` | `None` | Explicit Ed25519-BIP32 private key (hex) |
 
 ### Signing
 
-#### `sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path=None)`
+#### `sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path=None)`
 
 Sign a message with chain-specific formatting.
 
@@ -251,7 +253,7 @@ print(result["signature"])
 print(result["recovery_id"])  # 0 or 1
 ```
 
-#### `sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, vault_path=None)`
+#### `sign_typed_data(wallet, chain, typed_data_json, passphrase=None, index=None, address=None, vault_path=None)`
 
 Sign EIP-712 typed structured data (EVM only).
 

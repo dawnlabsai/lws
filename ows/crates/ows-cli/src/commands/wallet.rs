@@ -47,21 +47,25 @@ pub fn import(
     // Read curve-specific keys from environment variables (cleared immediately after reading)
     let secp256k1_key = ows_signer::process_hardening::clear_env_var("OWS_SECP256K1_KEY");
     let ed25519_key = ows_signer::process_hardening::clear_env_var("OWS_ED25519_KEY");
+    let ed25519_bip32_key = ows_signer::process_hardening::clear_env_var("OWS_ED25519_BIP32_KEY");
     let secp256k1_key = secp256k1_key.as_deref().filter(|s| !s.is_empty());
     let ed25519_key = ed25519_key.as_deref().filter(|s| !s.is_empty());
+    let ed25519_bip32_key = ed25519_bip32_key.as_deref().filter(|s| !s.is_empty());
 
-    let has_curve_keys = secp256k1_key.is_some() || ed25519_key.is_some();
-    let both_curve_keys = secp256k1_key.is_some() && ed25519_key.is_some();
+    let has_some_curve_keys =
+        secp256k1_key.is_some() || ed25519_key.is_some() || ed25519_bip32_key.is_some();
+    let has_all_curve_keys =
+        secp256k1_key.is_some() && ed25519_key.is_some() && ed25519_bip32_key.is_some();
 
-    // Must specify exactly one import mode: --mnemonic, --private-key, or both curve keys (via env)
-    if use_mnemonic && (use_private_key || has_curve_keys) {
+    // Must specify exactly one import mode: --mnemonic, --private-key, or all curve keys (via env)
+    if use_mnemonic && (use_private_key || has_some_curve_keys) {
         return Err(CliError::InvalidArgs(
             "cannot combine --mnemonic with --private-key or curve-specific keys".into(),
         ));
     }
-    if !use_mnemonic && !use_private_key && !both_curve_keys {
+    if !use_mnemonic && !use_private_key && !has_all_curve_keys {
         return Err(CliError::InvalidArgs(
-            "specify --mnemonic, --private-key, or set OWS_SECP256K1_KEY and OWS_ED25519_KEY"
+            "specify --mnemonic, --private-key, or set OWS_SECP256K1_KEY, OWS_ED25519_KEY, and OWS_ED25519_BIP32_KEY"
                 .into(),
         ));
     }
@@ -70,8 +74,8 @@ pub fn import(
         let phrase = super::read_mnemonic()?;
         ows_lib::import_wallet_mnemonic(name, &phrase, None, Some(index), None)?
     } else {
-        // Read from env/stdin only when both curve keys are not already provided
-        let private_key_hex = if both_curve_keys {
+        // Read from env/stdin only when all curve keys are not already provided
+        let private_key_hex = if has_all_curve_keys {
             zeroize::Zeroizing::new(String::new())
         } else {
             super::read_private_key()?
@@ -84,6 +88,7 @@ pub fn import(
             None,
             secp256k1_key,
             ed25519_key,
+            ed25519_bip32_key,
         )?
     };
 

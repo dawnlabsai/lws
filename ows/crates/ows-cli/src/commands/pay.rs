@@ -67,6 +67,7 @@ impl ows_pay::WalletAccess for OwsLibWallet {
                     Some(&self.passphrase),
                     None,
                     None,
+                    None,
                 )
                 .map_err(|e| {
                     ows_pay::PayError::new(ows_pay::PayErrorCode::SigningFailed, e.to_string())

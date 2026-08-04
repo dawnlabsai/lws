@@ -1,6 +1,6 @@
 ---
 name: ows
-description: Secure, local-first multi-chain wallet management — create wallets, derive addresses, sign messages and transactions across EVM, Solana, XRPL, Sui, Bitcoin, Cosmos, Tron, TON, Spark, Filecoin, Nano, and NEAR via CLI, Node.js, or Python.
+description: Secure, local-first multi-chain wallet management — create wallets, derive addresses, sign messages and transactions across EVM, Solana, XRPL, Sui, Bitcoin, Cosmos, Tron, TON, Spark, Filecoin, Nano, NEAR, and Cardano via CLI, Node.js, or Python.
 version: 1.3.2
 metadata:
   openclaw:
@@ -33,7 +33,7 @@ Use this skill when the user asks to:
 
 - Create, import, list, delete, or manage crypto wallets
 - Derive blockchain addresses from a mnemonic
-- Sign messages or transactions for EVM, Solana, XRPL, Sui, Bitcoin, Cosmos, Tron, TON, Spark, Filecoin, Nano, or NEAR
+- Sign messages or transactions for EVM, Solana, XRPL, Sui, Bitcoin, Cosmos, Tron, TON, Spark, Filecoin, Nano, NEAR, or Cardano
 - Broadcast signed transactions to a chain
 - Generate BIP-39 mnemonic phrases
 - Fund a wallet with USDC (MoonPay) or check token balances
@@ -57,6 +57,7 @@ Use this skill when the user asks to:
 | XRPL | `xrpl` | secp256k1 | Base58Check (`r...`) |
 | Filecoin | `filecoin` | secp256k1 | f1 secp256k1 |
 | NEAR | `near`, `near-testnet` | Ed25519 | implicit hex (64 chars) |
+| Cardano | `cardano` | Ed25519-BIP32 (CIP-1852) | Shelley Bech32 base (`addr1…`) |
 
 ## Installation
 
@@ -89,9 +90,9 @@ echo "goose puzzle decorate ..." | ows wallet import --name "imported" --mnemoni
 echo "4c0883a691..." | ows wallet import --name "from-evm" --private-key
 echo "9d61b19d..." | ows wallet import --name "from-sol" --private-key --chain solana
 
-# Import explicit keys for both curves (via env vars)
-OWS_SECP256K1_KEY="4c0883a691..." OWS_ED25519_KEY="9d61b19d..." \
-  ows wallet import --name "both"
+# Import explicit keys for all three curves (via env vars)
+OWS_SECP256K1_KEY="4c0883a691..." OWS_ED25519_KEY="9d61b19d..." OWS_ED25519_BIP32_KEY="cafe..." \
+  ows wallet import --name "all-curves"
 
 # List / info / export / delete / rename
 ows wallet list
@@ -103,7 +104,7 @@ ows wallet rename --wallet "my-wallet" --new-name "treasury"
 
 ### Signing
 
-The `--wallet` flag can also be set via `OWS_WALLET` env var. Use `--json` for structured output, `--index N` to select an HD account index.
+The `--wallet` flag can also be set via `OWS_WALLET` env var. Use `--json` for structured output, `--index N` to select an HD account index, and optional `--address` that will be used to sign the message (e.g. stake/base/enterprise address on Cardano).
 
 ```bash
 # Sign a message

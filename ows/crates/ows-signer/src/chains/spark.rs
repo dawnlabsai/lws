@@ -72,7 +72,13 @@ impl ChainSigner for SparkSigner {
         self.sign(private_key, &hash)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         let hash = Sha256::digest(message);
         self.sign(private_key, &hash)
     }
@@ -125,7 +131,9 @@ mod tests {
     #[test]
     fn test_sign_message() {
         let privkey = test_privkey();
-        let result = SparkSigner.sign_message(&privkey, b"hello spark").unwrap();
+        let result = SparkSigner
+            .sign_message(&privkey, b"hello spark", None)
+            .unwrap();
         assert!(!result.signature.is_empty());
         assert!(result.recovery_id.is_some());
     }

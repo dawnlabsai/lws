@@ -61,10 +61,11 @@ echo "4c0883a691..." | ows wallet import --name "from-evm" --private-key
 # Import an Ed25519 key (e.g. from Solana)
 echo "9d61b19d..." | ows wallet import --name "from-sol" --private-key --chain solana
 
-# Import explicit keys for both curves via environment variables
+# Import explicit keys for all three curves via environment variables
 OWS_SECP256K1_KEY="4c0883a691..." \
 OWS_ED25519_KEY="9d61b19d..." \
-  ows wallet import --name "both"
+OWS_ED25519_BIP32_KEY="cafe..." \
+  ows wallet import --name "all-curves"
 ```
 
 | Flag | Description |
@@ -76,8 +77,9 @@ OWS_ED25519_KEY="9d61b19d..." \
 | `--index <N>` | Account index for HD derivation (mnemonic only, default: 0) |
 | `OWS_SECP256K1_KEY` | Explicit secp256k1 private key via environment variable |
 | `OWS_ED25519_KEY` | Explicit Ed25519 private key via environment variable |
+| `OWS_ED25519_BIP32_KEY` | Explicit Ed25519-BIP32 extended private key (hex) via environment variable |
 
-Private key imports generate all 9 chain accounts: the provided key is used for its curve's chains, and a random key is generated for the other curve. Use `OWS_SECP256K1_KEY` and `OWS_ED25519_KEY` together to supply both keys explicitly.
+Private key imports generate all 13 chain-family accounts: the provided key is used for its curve's chains, and random keys fill the other curves (secp256k1, Ed25519, Ed25519-BIP32). Use `OWS_SECP256K1_KEY`, `OWS_ED25519_KEY`, and `OWS_ED25519_BIP32_KEY` together to supply all three curves explicitly.
 
 ### `ows wallet export`
 
@@ -88,7 +90,7 @@ ows wallet export --wallet "my-wallet"
 ```
 
 - Mnemonic wallets output the phrase.
-- Private key wallets output JSON: `{"secp256k1":"hex...","ed25519":"hex..."}`.
+- Private key wallets output JSON: `{"secp256k1":"hex...","ed25519":"hex...","ed25519_bip32":"hex..."}`.
 
 If the wallet is passphrase-protected, you will be prompted.
 
@@ -270,7 +272,9 @@ ows sign message --wallet "my-wallet" --chain 8453 --message "hello world"
 | `--chain <CHAIN>` | Chain name (`ethereum`, `base`, `arbitrum`, …), CAIP-2 ID (`eip155:8453`), or bare EVM chain ID (`8453`) |
 | `--message <MSG>` | Message to sign |
 | `--encoding <ENC>` | Message encoding: `utf8` (default) or `hex` |
+| `--address <ADDR>` | Address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano) |
 | `--typed-data <JSON>` | EIP-712 typed data JSON (EVM only) |
+| `--index <N>` | Account index (HD derivation; default `0`) |
 | `--json` | Output structured JSON |
 
 ### `ows sign tx`
@@ -371,6 +375,8 @@ ows fund balance --wallet "my-wallet" --chain base
 |------|-------------|
 | `--wallet <NAME>` | Wallet name (required) |
 | `--chain <CHAIN>` | Chain to query (required) |
+
+For **Cardano**, balances use the RPC URL from config
 
 ## System Commands
 

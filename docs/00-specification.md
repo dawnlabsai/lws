@@ -10,7 +10,7 @@ This document defines how to read the rest of the `docs/` set:
 
 - `01-storage-format.md`, `02-signing-interface.md`, `03-policy-engine.md`, `06-wallet-lifecycle.md`, `07-supported-chains.md`, and `08-conformance-and-security.md` are the **normative core**.
 - `04-agent-access-layer.md` and `05-key-isolation.md` define **optional access and deployment profiles**. They describe acceptable implementation patterns, but they do not require a specific package manager, programming language, or transport.
-- `quickstart.md`, `sdk-cli.md`, `sdk-node.md`, `sdk-python.md`, and `policy-engine-implementation.md` are **non-normative reference implementation documentation**.
+- `quickstart.md`, `sdk-cli.md`, `sdk-node.md`, `sdk-python.md`, `policy-engine-implementation.md`, and `cardano.md` are **non-normative reference implementation documentation**.
 
 If there is a conflict between a normative core document and a reference implementation document, the normative core document wins.
 

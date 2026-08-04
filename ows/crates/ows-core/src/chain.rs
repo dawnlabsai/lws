@@ -18,10 +18,11 @@ pub enum ChainType {
     Xrpl,
     Nano,
     Near,
+    Cardano,
 }
 
 /// All supported chain families, used for universal wallet derivation.
-pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
+pub const ALL_CHAIN_TYPES: [ChainType; 13] = [
     ChainType::Evm,
     ChainType::Solana,
     ChainType::Bitcoin,
@@ -34,6 +35,7 @@ pub const ALL_CHAIN_TYPES: [ChainType; 12] = [
     ChainType::Xrpl,
     ChainType::Nano,
     ChainType::Near,
+    ChainType::Cardano,
 ];
 
 /// A specific chain (e.g. "ethereum", "arbitrum") with its family type and CAIP-2 ID.
@@ -183,6 +185,22 @@ pub const KNOWN_CHAINS: &[Chain] = &[
         chain_type: ChainType::Nano,
         chain_id: "nano:mainnet",
     },
+    // Cardano mainnet
+    Chain {
+        name: "cardano",
+        chain_type: ChainType::Cardano,
+        chain_id: "cip34:1-764824073",
+    },
+    Chain {
+        name: "cardano-preprod",
+        chain_type: ChainType::Cardano,
+        chain_id: "cip34:0-1",
+    },
+    Chain {
+        name: "cardano-preview",
+        chain_type: ChainType::Cardano,
+        chain_id: "cip34:0-2",
+    },
     Chain {
         name: "near",
         chain_type: ChainType::Near,
@@ -267,7 +285,7 @@ pub fn parse_chain(s: &str) -> Result<Chain, String> {
            EVM:     ethereum, base, arbitrum, optimism, polygon, bsc, avalanche, plasma, etherlink\n  \
            Solana:  solana\n  \
            Bitcoin: bitcoin\n  \
-           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near\n\n\
+           Other:   cosmos, tron, ton, sui, filecoin, spark, xrpl, nano, near, cardano, cardano-preprod, cardano-preview\n\n\
          Or use a CAIP-2 ID (eip155:8453) or bare EVM chain ID (8453)"
     ))
 }
@@ -275,6 +293,33 @@ pub fn parse_chain(s: &str) -> Result<Chain, String> {
 /// Returns the default `Chain` for a given `ChainType` (first match in registry).
 pub fn default_chain_for_type(ct: ChainType) -> Chain {
     *KNOWN_CHAINS.iter().find(|c| c.chain_type == ct).unwrap()
+}
+
+/// Friendly names in [`KNOWN_CHAINS`] appended after [`ALL_CHAIN_TYPES`] for universal-wallet
+/// derivation (same keys as the family default, different network / CAIP-2 id).
+pub const UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES: &[&str] = &["cardano-preprod", "cardano-preview"];
+
+/// Accounts per universal wallet: one per [`ALL_CHAIN_TYPES`] plus [`UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES`].
+pub const UNIVERSAL_WALLET_ACCOUNT_COUNT: usize =
+    ALL_CHAIN_TYPES.len() + UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES.len();
+
+/// Ordered [`Chain`] rows for universal-wallet derivation and multi-network CLI output.
+pub fn universal_wallet_chains() -> Vec<Chain> {
+    let mut out = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
+    for ct in &ALL_CHAIN_TYPES {
+        out.push(default_chain_for_type(*ct));
+    }
+    for name in UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES {
+        let chain = KNOWN_CHAINS
+            .iter()
+            .copied()
+            .find(|c| c.name == *name)
+            .unwrap_or_else(|| {
+                panic!("KNOWN_CHAINS must define `{name}` (universal wallet extras)")
+            });
+        out.push(chain);
+    }
+    out
 }
 
 impl ChainType {
@@ -293,6 +338,7 @@ impl ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Cardano => "cip34",
         }
     }
 
@@ -311,6 +357,7 @@ impl ChainType {
             ChainType::Xrpl => 144,
             ChainType::Nano => 165,
             ChainType::Near => 397,
+            ChainType::Cardano => 1815,
         }
     }
 
@@ -329,6 +376,7 @@ impl ChainType {
             "xrpl" => Some(ChainType::Xrpl),
             "nano" => Some(ChainType::Nano),
             "near" => Some(ChainType::Near),
+            "cip34" => Some(ChainType::Cardano),
             _ => None,
         }
     }
@@ -349,6 +397,7 @@ impl fmt::Display for ChainType {
             ChainType::Xrpl => "xrpl",
             ChainType::Nano => "nano",
             ChainType::Near => "near",
+            ChainType::Cardano => "cardano",
         };
         write!(f, "{}", s)
     }
@@ -371,6 +420,7 @@ impl FromStr for ChainType {
             "xrpl" => Ok(ChainType::Xrpl),
             "nano" => Ok(ChainType::Nano),
             "near" => Ok(ChainType::Near),
+            "cardano" => Ok(ChainType::Cardano),
             _ => Err(format!("unknown chain type: {}", s)),
         }
     }
@@ -404,6 +454,7 @@ mod tests {
             (ChainType::Xrpl, "\"xrpl\""),
             (ChainType::Nano, "\"nano\""),
             (ChainType::Near, "\"near\""),
+            (ChainType::Cardano, "\"cardano\""),
         ] {
             let json = serde_json::to_string(&chain).unwrap();
             assert_eq!(json, expected);
@@ -426,6 +477,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.namespace(), "xrpl");
         assert_eq!(ChainType::Nano.namespace(), "nano");
         assert_eq!(ChainType::Near.namespace(), "near");
+        assert_eq!(ChainType::Cardano.namespace(), "cip34");
     }
 
     #[test]
@@ -442,6 +494,7 @@ mod tests {
         assert_eq!(ChainType::Xrpl.default_coin_type(), 144);
         assert_eq!(ChainType::Nano.default_coin_type(), 165);
         assert_eq!(ChainType::Near.default_coin_type(), 397);
+        assert_eq!(ChainType::Cardano.default_coin_type(), 1815);
     }
 
     #[test]
@@ -461,6 +514,7 @@ mod tests {
         assert_eq!(ChainType::from_namespace("xrpl"), Some(ChainType::Xrpl));
         assert_eq!(ChainType::from_namespace("nano"), Some(ChainType::Nano));
         assert_eq!(ChainType::from_namespace("near"), Some(ChainType::Near));
+        assert_eq!(ChainType::from_namespace("cip34"), Some(ChainType::Cardano));
         assert_eq!(ChainType::from_namespace("unknown"), None);
     }
 
@@ -559,6 +613,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chain_cardano() {
+        let chain = parse_chain("cardano").unwrap();
+        assert_eq!(chain.name, "cardano");
+        assert_eq!(chain.chain_type, ChainType::Cardano);
+        assert_eq!(chain.chain_id, "cip34:1-764824073");
+
+        let via_caip2 = parse_chain("cip34:1-764824073").unwrap();
+        assert_eq!(via_caip2.chain_type, ChainType::Cardano);
+        assert_eq!(via_caip2.chain_id, "cip34:1-764824073");
+
+        let preprod = parse_chain("cardano-preprod").unwrap();
+        assert_eq!(preprod.chain_id, "cip34:0-1");
+        assert_eq!(parse_chain("cip34:0-1").unwrap().name, "cardano-preprod");
+
+        let preview = parse_chain("cardano-preview").unwrap();
+        assert_eq!(preview.chain_id, "cip34:0-2");
+        assert_eq!(parse_chain("cip34:0-2").unwrap().name, "cardano-preview");
+    }
+
+    #[test]
     fn test_parse_chain_xrpl() {
         let chain = parse_chain("xrpl").unwrap();
         assert_eq!(chain.chain_type, ChainType::Xrpl);
@@ -641,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_all_chain_types() {
-        assert_eq!(ALL_CHAIN_TYPES.len(), 12);
+        assert_eq!(ALL_CHAIN_TYPES.len(), 13);
     }
 
     #[test]
@@ -666,5 +740,23 @@ mod tests {
         let chain = default_chain_for_type(ChainType::Evm);
         assert_eq!(chain.name, "ethereum");
         assert_eq!(chain.chain_id, "eip155:1");
+
+        let ada = default_chain_for_type(ChainType::Cardano);
+        assert_eq!(ada.name, "cardano");
+        assert_eq!(ada.chain_id, "cip34:1-764824073");
+    }
+
+    #[test]
+    fn test_universal_wallet_chains_order_and_count() {
+        let chains = universal_wallet_chains();
+        assert_eq!(chains.len(), UNIVERSAL_WALLET_ACCOUNT_COUNT);
+        assert_eq!(
+            chains.len(),
+            ALL_CHAIN_TYPES.len() + UNIVERSAL_WALLET_EXTRA_CHAIN_NAMES.len()
+        );
+        assert_eq!(chains[12].chain_type, ChainType::Cardano);
+        assert_eq!(chains[12].name, "cardano");
+        assert_eq!(chains[13].name, "cardano-preprod");
+        assert_eq!(chains[14].name, "cardano-preview");
     }
 }

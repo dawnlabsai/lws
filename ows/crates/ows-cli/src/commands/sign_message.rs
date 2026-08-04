@@ -1,8 +1,10 @@
 use ows_signer::chains::EvmSigner;
 use ows_signer::signer_for_chain;
+use ows_signer::ChainSigner;
 
 use crate::{parse_chain, CliError};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     chain_str: &str,
     wallet_name: &str,
@@ -11,6 +13,7 @@ pub fn run(
     typed_data: Option<&str>,
     index: u32,
     json_output: bool,
+    address: Option<&str>,
 ) -> Result<(), CliError> {
     // Check for API token in passphrase — route through library for policy enforcement
     let passphrase = super::peek_passphrase();
@@ -25,6 +28,7 @@ pub fn run(
                 td_json,
                 passphrase.as_deref(),
                 Some(index),
+                address,
                 None,
             )?;
             return print_result(&result.signature, result.recovery_id, json_output);
@@ -36,6 +40,7 @@ pub fn run(
             passphrase.as_deref(),
             Some(encoding),
             Some(index),
+            address,
             None,
         )?;
         return print_result(&result.signature, result.recovery_id, json_output);
@@ -45,7 +50,7 @@ pub fn run(
     let chain = parse_chain(chain_str)?;
     let key = super::resolve_signing_key(wallet_name, chain.chain_type, index)?;
 
-    let signer = signer_for_chain(chain.chain_type);
+    let signer = signer_for_chain(&chain);
 
     let output = if let Some(td_json) = typed_data {
         if chain.chain_type != ows_core::ChainType::Evm {
@@ -53,6 +58,7 @@ pub fn run(
                 "--typed-data is only supported for EVM chains".into(),
             ));
         }
+        ChainSigner::verify_sign_message_address(&*signer, key.expose(), address)?;
         EvmSigner.sign_typed_data(key.expose(), td_json)?
     } else {
         let msg_bytes = match encoding {
@@ -65,7 +71,7 @@ pub fn run(
                 )))
             }
         };
-        signer.sign_message(key.expose(), &msg_bytes)?
+        signer.sign_message(key.expose(), &msg_bytes, address)?
     };
 
     print_result(

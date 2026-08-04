@@ -1,4 +1,5 @@
 pub mod bitcoin;
+pub mod cardano;
 pub mod cosmos;
 pub mod evm;
 pub mod filecoin;
@@ -12,6 +13,7 @@ pub mod tron;
 pub mod xrpl;
 
 pub use self::bitcoin::BitcoinSigner;
+pub use self::cardano::CardanoSigner;
 pub use self::cosmos::CosmosSigner;
 pub use self::evm::EvmSigner;
 pub use self::filecoin::FilecoinSigner;
@@ -25,11 +27,12 @@ pub use self::tron::TronSigner;
 pub use self::xrpl::XrplSigner;
 
 use crate::traits::ChainSigner;
-use ows_core::ChainType;
+use ows_core::{default_chain_for_type, Chain, ChainType};
 
-/// Get a default signer for a given chain type.
-pub fn signer_for_chain(chain: ChainType) -> Box<dyn ChainSigner> {
-    match chain {
+/// Resolve a signer from a parsed CAIP-2 chain. Families whose address format
+/// depends on the network read `chain.chain_id` inside their constructor.
+pub fn signer_for_chain(chain: &Chain) -> Box<dyn ChainSigner> {
+    match chain.chain_type {
         ChainType::Evm => Box::new(EvmSigner),
         ChainType::Solana => Box::new(SolanaSigner),
         ChainType::Bitcoin => Box::new(BitcoinSigner::mainnet()),
@@ -42,5 +45,11 @@ pub fn signer_for_chain(chain: ChainType) -> Box<dyn ChainSigner> {
         ChainType::Xrpl => Box::new(XrplSigner),
         ChainType::Nano => Box::new(NanoSigner),
         ChainType::Near => Box::new(NearSigner),
+        ChainType::Cardano => Box::new(CardanoSigner::from_chain_id(chain.chain_id)),
     }
+}
+
+/// Get a default signer for a given chain family (first registry entry per family).
+pub fn signer_for_chain_type(chain_type: ChainType) -> Box<dyn ChainSigner> {
+    signer_for_chain(&default_chain_for_type(chain_type))
 }
