@@ -81,6 +81,19 @@ impl Config {
             "eip155:999".into(),
             "https://rpc.hyperliquid.xyz/evm".into(),
         );
+        // Cardano mainnet
+        rpc.insert(
+            "cip34:1-764824073".into(),
+            "https://api.koios.rest/api/v1".into(),
+        );
+        rpc.insert(
+            "cip34:0-1".into(),
+            "https://preprod.koios.rest/api/v1".into(),
+        );
+        rpc.insert(
+            "cip34:0-2".into(),
+            "https://preview.koios.rest/api/v1".into(),
+        );
         rpc
     }
 }
@@ -224,6 +237,18 @@ mod tests {
             config.rpc_url("eip155:999"),
             Some("https://rpc.hyperliquid.xyz/evm")
         );
+        assert_eq!(
+            config.rpc_url("cip34:1-764824073"),
+            Some("https://api.koios.rest/api/v1")
+        );
+        assert_eq!(
+            config.rpc_url("cip34:0-1"),
+            Some("https://preprod.koios.rest/api/v1")
+        );
+        assert_eq!(
+            config.rpc_url("cip34:0-2"),
+            Some("https://preview.koios.rest/api/v1")
+        );
     }
 
     #[test]
@@ -266,7 +291,7 @@ mod tests {
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default_from(std::path::Path::new("/nonexistent/config.json"));
         // Should have all default RPCs
-        assert_eq!(config.rpc.len(), 23);
+        assert_eq!(config.rpc.len(), 26);
         assert_eq!(config.rpc_url("eip155:1"), Some("https://eth.llamarpc.com"));
         assert_eq!(
             config.rpc_url("near:mainnet"),

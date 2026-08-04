@@ -1,4 +1,7 @@
 use crate::curve::Curve;
+use crate::hd::DerivedKey;
+use crate::zeroizing::SecretBytes;
+use ows_core::policy::TransactionContext;
 use ows_core::ChainType;
 
 /// Output of a signing operation.
@@ -26,14 +29,40 @@ pub trait ChainSigner: Send + Sync {
     /// The BIP-44 coin type for this chain.
     fn coin_type(&self) -> u32;
 
-    /// Derive an on-chain address from a private key.
+    /// Derive an on-chain address from the key material produced by
+    /// [`ChainSigner::encode_keys`] — the primary key for single-key chains, or
+    /// the full encoded bundle for chains that bind several keys per account
+    /// (e.g. Cardano's payment + staking), which decode it here.
     fn derive_address(&self, private_key: &[u8]) -> Result<String, SignerError>;
 
     /// Sign a pre-hashed message (32 bytes for secp256k1, raw message for ed25519).
     fn sign(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
 
     /// Sign an arbitrary message with chain-specific prefixing/hashing.
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError>;
+    /// When `address` is `Some`, the implementation should call [`ChainSigner::verify_sign_message_address`] first.
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError>;
+
+    fn verify_sign_message_address(
+        &self,
+        private_key: &[u8],
+        address: Option<&str>,
+    ) -> Result<(), SignerError> {
+        let Some(expected) = address else {
+            return Ok(());
+        };
+        let derived = self.derive_address(private_key)?;
+        if derived.trim_start_matches("0x").to_lowercase()
+            != expected.trim_start_matches("0x").to_lowercase()
+        {
+            return Err(SignerError::AddressMismatch);
+        }
+        Ok(())
+    }
 
     /// Sign an unsigned transaction. Each chain hashes the raw transaction
     /// bytes according to its own rules before signing.
@@ -77,8 +106,47 @@ pub trait ChainSigner: Send + Sync {
         )))
     }
 
+    fn make_transaction_context(
+        &self,
+        tx_bytes: &[u8],
+        _rpc_url: Option<&str>,
+    ) -> Result<TransactionContext, SignerError> {
+        Ok(TransactionContext {
+            effects: vec![],
+            raw_hex: hex::encode(tx_bytes),
+            data: None,
+        })
+    }
+
     /// Returns the default BIP-44 derivation path template for this chain.
     fn default_derivation_path(&self, index: u32) -> String;
+
+    /// All derivation paths this chain binds to one account at `index`.
+    ///
+    /// Defaults to the single [`ChainSigner::default_derivation_path`] on this
+    /// chain's [`ChainSigner::curve`]. Chains that derive several keys per
+    /// account (e.g. Midnight's unshielded / shielded / dust roles) override
+    /// this; the first path is the primary (address / signing) key.
+    fn default_derivation_paths(&self, index: u32) -> Vec<String> {
+        vec![self.default_derivation_path(index)]
+    }
+
+    /// Collapse a resolved key bundle into the single key-material blob that the
+    /// signing methods (`sign`, `sign_message`, `sign_transaction`) and
+    /// `derive_address` consume.
+    ///
+    /// Most chains bind one key per account, so the default returns the primary
+    /// (first) key unchanged — `default_derivation_paths[0]` is the contractual
+    /// primary. Chains that bind several keys per account (e.g. Midnight,
+    /// Cardano) override this to pack them into one blob; the matching decode
+    /// lives in that chain's signer, which unpacks it inside its signing and
+    /// address methods. The blob is opaque to the generic path — only the
+    /// producing chain interprets it.
+    fn encode_keys(&self, keys: &[DerivedKey]) -> Result<SecretBytes, SignerError> {
+        keys.first()
+            .map(|k| k.secret.clone())
+            .ok_or_else(|| SignerError::InvalidPrivateKey("no derived keys to encode".into()))
+    }
 }
 
 /// Errors that can occur during signing operations.
@@ -98,4 +166,10 @@ pub enum SignerError {
 
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
+
+    #[error("address does not match derived address")]
+    AddressMismatch,
+
+    #[error("RPC error: {0}")]
+    RpcError(String),
 }

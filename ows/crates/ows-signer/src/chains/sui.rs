@@ -85,7 +85,13 @@ impl ChainSigner for SuiSigner {
         })
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         let signing_key = Self::signing_key(private_key)?;
 
         // Personal message signing: intent scope = 3
@@ -284,7 +290,7 @@ mod tests {
         let privkey = test_privkey();
         let message = b"hello sui";
 
-        let result = signer.sign_message(&privkey, message).unwrap();
+        let result = signer.sign_message(&privkey, message, None).unwrap();
         assert_eq!(result.signature.len(), 64);
         assert!(result.public_key.is_some());
 

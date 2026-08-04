@@ -18,7 +18,7 @@ function owsToViemAccount(walletNameOrId, options = {}) {
       const msg = typeof message === "string" ? message
         : typeof raw === "string" ? (raw.startsWith("0x") ? raw.slice(2) : Buffer.from(raw).toString("hex"))
         : Buffer.from(raw).toString("hex");
-      const result = signMessage(walletNameOrId, chain, msg, options.passphrase, typeof message === "string" ? undefined : "hex", options.index, options.vaultPath);
+      const result = signMessage(walletNameOrId, chain, msg, options.passphrase, typeof message === "string" ? undefined : "hex", options.index, undefined, options.vaultPath);
       return result.signature.startsWith("0x") ? result.signature : `0x${result.signature}`;
     },
     async signTransaction(transaction) {
@@ -33,7 +33,7 @@ function owsToViemAccount(walletNameOrId, options = {}) {
       return serializeTransaction(transaction, { r, s, yParity });
     },
     async signTypedData(typedData) {
-      const result = signTypedData(walletNameOrId, chain, JSON.stringify(typedData), options.passphrase, options.index, options.vaultPath);
+      const result = signTypedData(walletNameOrId, chain, JSON.stringify(typedData), options.passphrase, options.index, undefined, options.vaultPath);
       return result.signature.startsWith("0x") ? result.signature : `0x${result.signature}`;
     },
   });

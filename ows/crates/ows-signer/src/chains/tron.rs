@@ -91,7 +91,13 @@ impl ChainSigner for TronSigner {
         self.sign(private_key, &hash)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // Tron uses the same prefix as Ethereum for personal messages
         let prefix = format!("\x19TRON Signed Message:\n{}", message.len());
         let mut prefixed = Vec::new();

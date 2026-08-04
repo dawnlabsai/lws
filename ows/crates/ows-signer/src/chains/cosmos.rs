@@ -100,7 +100,13 @@ impl ChainSigner for CosmosSigner {
         self.sign(private_key, &hash)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // Cosmos typically signs the SHA256 hash of the message
         let hash = Sha256::digest(message);
         self.sign(private_key, &hash)

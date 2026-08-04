@@ -28,6 +28,7 @@ rand = "0.8"
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 tokio = { version = "1", features = ["rt"] }
+ed25519-bip32 = "0.4.1"
 
 [dev-dependencies]
 tempfile = "3"

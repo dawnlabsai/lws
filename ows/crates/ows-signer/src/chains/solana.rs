@@ -136,7 +136,13 @@ impl ChainSigner for SolanaSigner {
         Ok(signed)
     }
 
-    fn sign_message(&self, private_key: &[u8], message: &[u8]) -> Result<SignOutput, SignerError> {
+    fn sign_message(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+        address: Option<&str>,
+    ) -> Result<SignOutput, SignerError> {
+        self.verify_sign_message_address(private_key, address)?;
         // Solana doesn't use a special prefix for message signing
         self.sign(private_key, message)
     }
@@ -380,7 +386,7 @@ mod tests {
         let signer = SolanaSigner;
         let message = b"hello solana";
         let sig1 = signer.sign(&privkey, message).unwrap();
-        let sig2 = signer.sign_message(&privkey, message).unwrap();
+        let sig2 = signer.sign_message(&privkey, message, None).unwrap();
         assert_eq!(sig1.signature, sig2.signature);
     }
 

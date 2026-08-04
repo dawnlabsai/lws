@@ -38,7 +38,7 @@ All functions return Python dicts:
 from open_wallet_standard import generate_mnemonic, derive_address
 
 phrase = generate_mnemonic(12)         # or 24
-addr = derive_address(phrase, "evm")   # any chain: evm, solana, sui, bitcoin, cosmos, tron, ton, spark, filecoin
+addr = derive_address(phrase, "evm")   # any chain: evm, solana, sui, bitcoin, cosmos, tron, ton, spark, filecoin, xrpl, nano, cardano
 # derive_address(mnemonic, chain, index=None)
 ```
 
@@ -70,10 +70,13 @@ w2 = import_wallet_private_key("from-evm", "4c0883a691...")
 # Import Ed25519 key (solana/sui/ton)
 w3 = import_wallet_private_key("from-sol", "9d61b19d...", chain="solana")
 
-# Import explicit keys for both curves
-w4 = import_wallet_private_key("both", "", secp256k1_key="4c08...", ed25519_key="9d61...")
+# Import Ed25519-Bip32 key (Cardano)
+w3 = import_wallet_private_key("from-cardano", "cafe...", chain="cardano")
+
+# Import explicit keys for all curves
+w5 = import_wallet_private_key("all", "", secp256k1_key="4c08...", ed25519_key="9d61...", ed25519_bip32_key="cafe...")
 # import_wallet_private_key(name, private_key_hex, chain=None, passphrase=None,
-#                           vault_path=None, secp256k1_key=None, ed25519_key=None)
+#                           vault_path=None, secp256k1_key=None, ed25519_key=None, ed25519_bip32_key=None)
 
 # List / get / delete / rename / export
 wallets = list_wallets()                    # list_wallets(vault_path=None)
@@ -81,7 +84,7 @@ w = get_wallet("my-wallet")                 # get_wallet(name_or_id, vault_path=
 delete_wallet("my-wallet")                  # delete_wallet(name_or_id, vault_path=None)
 rename_wallet("old", "new")                 # rename_wallet(name_or_id, new_name, vault_path=None)
 secret = export_wallet("my-wallet")         # export_wallet(name_or_id, passphrase=None, vault_path=None)
-# Returns mnemonic string or JSON: {"secp256k1":"hex","ed25519":"hex"}
+# Returns mnemonic string or JSON: {"secp256k1":"hex","ed25519":"hex","ed25519_bip32":"hex"}
 ```
 
 ## Signing
@@ -93,7 +96,7 @@ from open_wallet_standard import sign_message, sign_transaction, sign_and_send
 sig = sign_message("my-wallet", "evm", "hello world")
 # sig["signature"] => hex string
 # sig["recovery_id"] => 0 or 1 (EVM/Tron only)
-# sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, vault_path=None)
+# sign_message(wallet, chain, message, passphrase=None, encoding=None, index=None, address=None, vault_path=None)
 
 # Sign transaction
 tx_sig = sign_transaction("my-wallet", "evm", "02f8...")

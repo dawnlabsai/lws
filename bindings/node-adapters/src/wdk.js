@@ -67,7 +67,7 @@ function owsToWdkAccount(walletNameOrId, chain, options = {}) {
         ? Buffer.from(message).toString("hex")
         : message;
       const encoding = Buffer.isBuffer(message) || message instanceof Uint8Array ? "hex" : "utf8";
-      const result = signMessage(walletNameOrId, caipChain, msg, options.passphrase, encoding, idx, options.vaultPath);
+      const result = signMessage(walletNameOrId, caipChain, msg, options.passphrase, encoding, idx, undefined, options.vaultPath);
       return Uint8Array.from(Buffer.from(result.signature, "hex"));
     },
 

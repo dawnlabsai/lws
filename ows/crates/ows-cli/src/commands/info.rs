@@ -8,17 +8,21 @@ pub fn run() -> Result<(), CliError> {
     println!("Vault path: {}", config.vault_path.display());
     println!();
     println!("Supported chains:");
-    println!("{:<12} {:<10} {:<10}", "Chain", "Namespace", "Coin Type");
-    println!("{:<12} {:<10} {:<10}", "-----", "---------", "---------");
+    println!(
+        "{:<22} {:<12} {:<10}",
+        "Chain name", "Namespace", "Coin Type"
+    );
+    println!(
+        "{:<22} {:<12} {:<10}",
+        "----------", "---------", "---------"
+    );
 
-    let chains = ows_core::ALL_CHAIN_TYPES;
-
-    for chain in chains {
+    for chain in ows_core::universal_wallet_chains() {
         println!(
-            "{:<12} {:<10} {:<10}",
-            chain,
-            chain.namespace(),
-            chain.default_coin_type()
+            "{:<22} {:<12} {:<10}",
+            chain.name,
+            chain.chain_type.namespace(),
+            chain.chain_type.default_coin_type()
         );
     }
 

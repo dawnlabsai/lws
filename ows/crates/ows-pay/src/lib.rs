@@ -14,6 +14,8 @@ pub(crate) mod discovery;
 pub mod error;
 pub mod fund;
 pub mod types;
+
+mod cardano;
 pub mod wallet;
 
 // Protocol implementations (internal).

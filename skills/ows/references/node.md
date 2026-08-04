@@ -44,7 +44,7 @@ interface ApiKeyResult {
 import { generateMnemonic, deriveAddress } from "@open-wallet-standard/core";
 
 const phrase = generateMnemonic(12);       // or 24
-const addr = deriveAddress(phrase, "evm"); // any chain: evm, solana, sui, bitcoin, cosmos, tron, ton, spark, filecoin
+const addr = deriveAddress(phrase, "evm"); // any chain: evm, solana, sui, bitcoin, cosmos, tron, ton, spark, filecoin, xrpl, nano, cardano
 ```
 
 ## Wallet Management
@@ -75,9 +75,9 @@ const w2 = importWalletPrivateKey("from-evm", "4c0883a691...");
 // Import Ed25519 key (solana/sui/ton)
 const w3 = importWalletPrivateKey("from-sol", "9d61b19d...", undefined, undefined, "solana");
 
-// Import explicit keys for both curves
-const w4 = importWalletPrivateKey("both", "", undefined, undefined, undefined, "4c08...", "9d61...");
-// importWalletPrivateKey(name, privateKeyHex, passphrase?, vaultPath?, chain?, secp256k1Key?, ed25519Key?)
+// Import explicit keys for all curves
+const w4 = importWalletPrivateKey("all", "", undefined, undefined, undefined, "4c08...", "9d61...", "cafe...");
+// importWalletPrivateKey(name, privateKeyHex, passphrase?, vaultPath?, chain?, secp256k1Key?, ed25519Key?, ed25519Bip32Key?)
 
 // List / get / delete / rename / export
 const wallets = listWallets();           // listWallets(vaultPath?)
@@ -85,7 +85,7 @@ const w = getWallet("my-wallet");        // getWallet(nameOrId, vaultPath?)
 deleteWallet("my-wallet");               // deleteWallet(nameOrId, vaultPath?)
 renameWallet("old", "new");              // renameWallet(nameOrId, newName, vaultPath?)
 const secret = exportWallet("my-wallet"); // exportWallet(nameOrId, passphrase?, vaultPath?)
-// Returns mnemonic string or JSON: {"secp256k1":"hex","ed25519":"hex"}
+// Returns mnemonic string or JSON: {"secp256k1":"hex","ed25519":"hex","ed25519_bip32":"hex"}
 ```
 
 ## Signing
@@ -97,7 +97,7 @@ import { signMessage, signTransaction, signAndSend } from "@open-wallet-standard
 const sig = signMessage("my-wallet", "evm", "hello world");
 // sig.signature => hex string
 // sig.recoveryId => 0 or 1 (EVM/Tron only)
-// signMessage(wallet, chain, message, passphrase?, encoding?, index?, vaultPath?)
+// signMessage(wallet, chain, message, passphrase?, encoding?, index?, address?, vaultPath?)
 
 // Sign transaction
 const txSig = signTransaction("my-wallet", "evm", "02f8...");
@@ -117,7 +117,7 @@ import { signTypedData } from "@open-wallet-standard/core";
 const sig = signTypedData("my-wallet", "evm", '{"types":...}');
 // sig.signature => hex string
 // sig.recoveryId => 0 or 1
-// signTypedData(wallet, chain, typedDataJson, passphrase?, index?, vaultPath?)
+// signTypedData(wallet, chain, typedDataJson, passphrase?, index?, address?, vaultPath?)
 ```
 
 ## Policy Management

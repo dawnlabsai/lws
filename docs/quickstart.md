@@ -20,7 +20,7 @@ pip install open-wallet-standard           # Python
 
 ## Create a wallet
 
-A single command derives addresses for every supported chain — EVM, Solana, Sui, Bitcoin, Cosmos, Tron, and TON.
+A single command derives addresses for every chain family the implementation registers (15 accounts in the reference build — EVM through Cardano).
 
 ```bash
 ows wallet create --name "agent-treasury"
@@ -35,6 +35,9 @@ Created wallet 3198bc9c-...
   tron:mainnet    TKLm...    m/44'/195'/0'/0/0
   ton:mainnet     UQ...      m/44'/607'/0'
   sui:mainnet     0x...      m/44'/784'/0'/0'/0'
+  cip34:1-764824073 addr1...       payment m/1852'/1815'/0'/0/0 + stake m/1852'/1815'/0'/2/0
+  cip34:0-1         addr_test1...  same paths; Pre-production testnet
+  cip34:0-2         addr_test1...  same paths; Preview testnet
 ```
 
 ## Fund the wallet

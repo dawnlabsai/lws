@@ -159,6 +159,9 @@ enum SignCommands {
         /// Output structured JSON instead of raw hex
         #[arg(long)]
         json: bool,
+        /// Address that will be used to sign the message (e.g. stake/base/enterprise address on Cardano)
+        #[arg(long)]
+        address: Option<String>,
     },
     /// Sign a transaction (accepts hex-encoded unsigned transaction bytes)
     Tx {
@@ -429,6 +432,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 typed_data,
                 index,
                 json,
+                address,
             } => commands::sign_message::run(
                 &chain,
                 &wallet,
@@ -437,6 +441,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 typed_data.as_deref(),
                 index,
                 json,
+                address.as_deref(),
             ),
             SignCommands::Tx {
                 chain,

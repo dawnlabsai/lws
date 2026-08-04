@@ -1,3 +1,6 @@
+use ows_core::{parse_chain, ChainType};
+
+use crate::cardano::get_cardano_balances;
 use crate::error::{PayError, PayErrorCode};
 use crate::types::{
     FundResult, MoonPayBalanceRequest, MoonPayBalanceResponse, MoonPayDepositRequest,
@@ -152,10 +155,35 @@ pub async fn fund(
 }
 
 /// Check token balances for a wallet address via MoonPay.
+/// If the chain is Cardano, rpc+url is required and it's used to fetch the token balances instead of MoonPay.
 pub async fn get_balances(
     wallet_address: &str,
     chain: Option<&str>,
+    rpc_url: Option<&str>,
 ) -> Result<Vec<TokenBalance>, PayError> {
+    if let Some(c) = chain {
+        let chain = parse_chain(c).map_err(|e| {
+            PayError::new(
+                PayErrorCode::UnsupportedChain,
+                format!("unknown chain: {e}"),
+            )
+        })?;
+
+        if chain.chain_type == ChainType::Cardano {
+            let rpc_url = rpc_url.map_or_else(
+                || {
+                    Err(PayError::new(
+                        PayErrorCode::InvalidInput,
+                        "RPC URL is required for Cardano",
+                    ))
+                },
+                Ok,
+            )?;
+
+            return get_cardano_balances(wallet_address, rpc_url).await;
+        }
+    }
+
     let mapping = resolve_moonpay_chain(chain)?;
     let client = reqwest::Client::new();
 
