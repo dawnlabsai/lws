@@ -35,7 +35,7 @@
 //! its zswap legs pool in `fallible_coins` — but that saves nothing (only the guaranteed *unshielded*
 //! offer loads the segment-0 `time_to_dismiss` budget) and weakens the swap's all-or-nothing atomicity,
 //! so makeIntent keeps every leg guaranteed. The maker's intent still keys at a fallible segment
-//! (`intentSegment`); only the coins settle guaranteed. See [`GUARANTEED_SEGMENT`].
+//! (`intentId`); only the coins settle guaranteed. See [`GUARANTEED_SEGMENT`].
 
 use std::collections::BTreeMap;
 use std::ops::Deref as _;
@@ -73,14 +73,16 @@ use super::build::{
 use crate::parse_token_type;
 use ows_core::policy::TransactionEffect;
 
-/// The connector convention default when a request omits `intentSegment`.
+/// The segment a maker's intent keys at when the request omits `intentId`. The spec's own guidance for
+/// picking one: segment 1 "ensures no transaction merging will result in actions executed before created
+/// intent in the same transaction".
 const DEFAULT_INTENT_SEGMENT: u16 = 1;
 
 /// Segment 0 is the transaction's guaranteed section. A swap offer's shielded coins ride it — like
 /// `makeTransfer` and `mip6` place theirs — so both legs of the swap sit in **one** segment. The ledger
 /// applies each segment atomically (a segment-0 failure reverts the whole tx; a fallible segment fails
 /// alone), so a swap split across the guaranteed and a fallible section could settle one leg and drop
-/// the other. The intent itself still keys at a fallible segment (`intentSegment`); only the coins move.
+/// the other. The intent itself still keys at a fallible segment (`intentId`); only the coins move.
 /// The merge path reuses this for the taker complement's own coins, which settle guaranteed the same way.
 pub(super) const GUARANTEED_SEGMENT: u16 = 0;
 
@@ -96,10 +98,11 @@ pub struct DesiredInput {
     pub value: u128,
 }
 
-/// A parsed `makeIntent` request: the maker's inputs and desired outputs, the intent segment, and the
-/// offer's expiry. Unlike the balancing methods, makeIntent builds a deliberately imbalanced maker offer
-/// and never pays fees — the taker completes and balances the swap — so there is no `payFees` option here.
-/// `ttl` is `None` when the request names no expiry, leaving the wallet's [`default_intent_ttl`].
+/// A parsed `makeIntent` request: the maker's inputs and desired outputs, the resolved intent segment
+/// (`intentId`, with `"random"` already drawn), and the offer's expiry. `ttl` is `None` when the request
+/// names no expiry, leaving the wallet's [`default_intent_ttl`]. Unlike the balancing methods, makeIntent
+/// builds a deliberately imbalanced maker offer and never pays fees — the taker completes and balances the
+/// swap — so no `payFees` is carried.
 #[derive(Debug, Clone)]
 pub struct MakeIntentRequest {
     pub desired_inputs: Vec<DesiredInput>,
@@ -108,16 +111,22 @@ pub struct MakeIntentRequest {
     pub ttl: Option<Timestamp>,
 }
 
-fn default_intent_segment() -> u16 {
-    DEFAULT_INTENT_SEGMENT
-}
-
-/// The `options` bag of a `makeIntent` request. Only `ttl` is read here: `payFees` does not apply to a
-/// maker offer (the taker pays), and the segment is taken from the top-level `intentSegment`.
+/// The `options` bag of a `makeIntent` request: the connector spec's `intentId`, plus the `ttl`
+/// extension. `payFees` does not apply to a fee-free maker offer and is ignored.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MakeIntentOptions {
+    intent_id: Option<IntentIdJson>,
     ttl: Option<u64>,
+}
+
+/// The spec's `intentId: number | "random"` — the segment the maker's intent keys at, or a request that
+/// the wallet pick one.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IntentIdJson {
+    Segment(u64),
+    Keyword(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,15 +136,13 @@ struct MakeIntentJson {
     desired_inputs: Vec<DesiredInput>,
     #[serde(default)]
     desired_outputs: Vec<DesiredOutput>,
-    #[serde(default = "default_intent_segment")]
-    intent_segment: u16,
     #[serde(default)]
     options: Option<MakeIntentOptions>,
 }
 
-/// Parse a stringified DApp Connector `makeIntent` request. `intentSegment` defaults to the connector
-/// convention (segment 1) and must be >= 1; `options.ttl` defaults to the wallet's own
-/// [`default_intent_ttl`] and must name an instant the ledger will still accept (see
+/// Parse a stringified DApp Connector `makeIntent` request. `options.intentId` names the maker intent's
+/// segment (see [`resolve_intent_segment`]) and defaults to segment 1; `options.ttl` defaults to the
+/// wallet's own [`default_intent_ttl`] and must name an instant the ledger will still accept (see
 /// [`parse_intent_ttl`]).
 pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::Error> {
     let req: MakeIntentJson = serde_json::from_str(json)
@@ -145,21 +152,46 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
             "makeIntent requires at least one desired input or output",
         ));
     }
-    // The ledger reserves segment 0 for the guaranteed section and rejects any intent declared there
-    // (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error: 167`), so the maker's
-    // intent must key at a fallible segment >= 1. makeTransfer hardcodes segment 1; makeIntent lets the
-    // dapp choose, so guard the lower bound here rather than build an offer the node will reject.
-    if req.intent_segment == 0 {
-        return Err(std::io::Error::other(
-            "makeIntent intentSegment must be >= 1: segment 0 is the guaranteed section, where the ledger rejects an intent",
-        ));
-    }
+    let (intent_id, ttl) = match req.options {
+        Some(o) => (o.intent_id, o.ttl),
+        None => (None, None),
+    };
     Ok(MakeIntentRequest {
         desired_inputs: req.desired_inputs,
         desired_outputs: req.desired_outputs,
-        intent_segment: req.intent_segment,
-        ttl: parse_intent_ttl(req.options.and_then(|o| o.ttl), now_secs())?,
+        intent_segment: resolve_intent_segment(intent_id)?,
+        ttl: parse_intent_ttl(ttl, now_secs())?,
     })
+}
+
+/// Resolve the spec's `intentId` to the segment the maker's intent keys at: a number is taken as given,
+/// `"random"` is drawn by the wallet (the spec's suggested mode for swaps), and an absent option falls
+/// back to [`DEFAULT_INTENT_SEGMENT`].
+///
+/// Two bounds are the ledger's. Segment ids are 16-bit, and segment 0 is the guaranteed section, where an
+/// intent is rejected outright (`IntentAtGuaranteedSegmentId`, surfaced by the node as `Custom error:
+/// 167`) — the spec's "within ledger limitations". Rejecting here beats building an offer the node will
+/// throw away.
+fn resolve_intent_segment(intent_id: Option<IntentIdJson>) -> Result<u16, std::io::Error> {
+    match intent_id {
+        None => Ok(DEFAULT_INTENT_SEGMENT),
+        Some(IntentIdJson::Segment(0)) => Err(std::io::Error::other(
+            "makeIntent options.intentId must be >= 1: segment 0 is the guaranteed section, where the ledger rejects an intent",
+        )),
+        Some(IntentIdJson::Segment(n)) => u16::try_from(n).map_err(|_| {
+            std::io::Error::other(format!(
+                "makeIntent options.intentId {n} is out of range: a segment id is at most {}",
+                u16::MAX
+            ))
+        }),
+        // Any fallible segment will do for a lone maker intent, so draw from the whole space rather than
+        // the low end: a wide draw is what keeps two independently-built intents from colliding
+        // (`IntentSegmentIdCollision`) when a taker merges its own into the same transaction.
+        Some(IntentIdJson::Keyword(k)) if k == "random" => Ok(OsRng.gen_range(1..=u16::MAX)),
+        Some(IntentIdJson::Keyword(k)) => Err(std::io::Error::other(format!(
+            "makeIntent options.intentId must be a segment number or \"random\", not \"{k}\""
+        ))),
+    }
 }
 
 /// Validate a requested expiry (Unix epoch seconds) against the window the ledger will accept for an
@@ -220,7 +252,7 @@ pub(super) fn request_effects(
 
 /// The `makeIntent` maker offer's wallet-relative effects as [`request_effects`] computes them, all in
 /// the transaction's guaranteed section ([`GUARANTEED_SEGMENT`]): a swap keeps every leg guaranteed — the
-/// maker's coins settle in segment 0 even though its intent keys at a fallible `intentSegment` — so the
+/// maker's coins settle in segment 0 even though its intent keys at a fallible `intentId` — so the
 /// movement a policy sees is a guaranteed one. An offer that nets nothing yields no segment entry.
 pub(super) fn request_segment_effects(
     chain_id: &str,
@@ -346,7 +378,7 @@ pub(super) fn mock_authorize(
 
 /// Construct the `proof-preimage` maker frame: the maker's unshielded inputs (with change back to the
 /// maker) + unshielded/shielded outputs, deliberately imbalanced. The intent keys at `segment`
-/// (`intentSegment`), but the shielded outputs ride the guaranteed section (see [`GUARANTEED_SEGMENT`]).
+/// (`intentId`), but the shielded outputs ride the guaranteed section (see [`GUARANTEED_SEGMENT`]).
 /// Shielded *inputs* are authorized separately, after proving, so `has_shielded_in` keeps the empty-offer
 /// guard from firing when the maker's only contribution is shielded inputs.
 #[allow(clippy::too_many_arguments)]
@@ -750,24 +782,45 @@ mod tests {
     }
 
     #[test]
-    fn honours_intent_segment_and_ignores_legacy_options() {
-        // makeIntent no longer honours `options.payFees` (the maker never pays fees); a legacy request
-        // that still carries it must be accepted with the field ignored, not rejected.
+    fn honours_intent_id() {
         let req = parse_make_intent_json(
-            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":3,"options":{"payFees":false}}"#,
+            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":3,"payFees":false}}"#,
         )
         .unwrap();
         assert_eq!(req.intent_segment, 3);
     }
 
     #[test]
-    fn rejects_intent_segment_zero() {
+    fn draws_a_fallible_segment_for_random_intent_id() {
+        for _ in 0..32 {
+            let req = parse_make_intent_json(
+                r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":"random"}}"#,
+            )
+            .unwrap();
+            assert!(req.intent_segment >= 1);
+        }
+    }
+
+    #[test]
+    fn rejects_intent_id_zero_and_out_of_range() {
         // Segment 0 is the transaction's guaranteed section; the ledger rejects an intent declared
-        // there, so the parse must reject it up front instead of building a doomed offer.
-        assert!(parse_make_intent_json(
-            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"intentSegment":0}"#
-        )
-        .is_err());
+        // there, so the parse must reject it up front instead of building a doomed offer. Above the
+        // 16-bit segment space there is no segment to key at at all.
+        assert!(resolve_intent_segment(Some(IntentIdJson::Segment(0))).is_err());
+        assert!(resolve_intent_segment(Some(IntentIdJson::Segment(u16::MAX as u64 + 1))).is_err());
+        assert_eq!(
+            resolve_intent_segment(Some(IntentIdJson::Segment(u16::MAX as u64))).unwrap(),
+            u16::MAX
+        );
+        assert_eq!(
+            resolve_intent_segment(None).unwrap(),
+            DEFAULT_INTENT_SEGMENT
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_intent_id_keyword() {
+        assert!(resolve_intent_segment(Some(IntentIdJson::Keyword("any".into()))).is_err());
     }
 
     #[test]
