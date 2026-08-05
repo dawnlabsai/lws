@@ -39,13 +39,30 @@ pub(super) fn err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
 
-/// A TTL an hour past the current wall clock — a stand-in until the balancer re-aligns it to the tip.
-pub(super) fn far_future_ttl() -> Timestamp {
-    let now = std::time::SystemTime::now()
+/// Seconds since the Unix epoch on the wallet host's clock.
+pub(super) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    Timestamp::from_secs(now.saturating_add(3600))
+        .as_secs()
+}
+
+/// How far past the block it lands in an intent's TTL may sit: the ledger rejects
+/// `ttl > tblock + global_ttl` as `IntentTtlTooFarInFuture`. A ledger parameter (currently an hour),
+/// not a protocol constant, so read it rather than hardcode it.
+pub(super) fn max_ttl_secs() -> u64 {
+    INITIAL_PARAMETERS
+        .global_ttl
+        .as_seconds()
+        .clamp(0, u64::MAX as i128) as u64
+}
+
+/// The TTL the wallet picks when the request names none: the widest window the ledger accepts for a
+/// transaction submitted now, matching the reference wallet SDK's own default. The balancing methods
+/// overwrite this with a tip-aligned TTL once they know the chain time; `makeIntent` does not balance,
+/// so for a maker offer this is the value that gets sealed.
+pub(super) fn default_intent_ttl() -> Timestamp {
+    Timestamp::from_secs(now_secs().saturating_add(max_ttl_secs()))
 }
 
 /// Whether a desired input/output moves value in the unshielded (Night) or shielded (Zswap) domain.

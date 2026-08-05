@@ -23,7 +23,7 @@ use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
-    decode_shielded_recipient, decode_unshielded_recipient, err, far_future_ttl,
+    decode_shielded_recipient, decode_unshielded_recipient, default_intent_ttl, err,
     mock_prove_unsealed, prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded,
     DesiredOutput, PreimageTx, TransferKind,
 };
@@ -148,9 +148,9 @@ fn build_make_transfer_preimage(
         fallible_unshielded_offer: unshielded_offer.map(Sp::new),
         actions: vec![].into(),
         dust_actions: None,
-        // The balancer re-aligns the TTL on the intent it owns (this one); a far-future stand-in avoids
-        // a spuriously-expired intent in the meantime.
-        ttl: far_future_ttl(),
+        // The balancer re-aligns the TTL on the intent it owns (this one); the wallet default avoids a
+        // spuriously-expired intent in the meantime.
+        ttl: default_intent_ttl(),
         binding_commitment: rng.r#gen(),
     };
     let intents: MnHashMap<u16, _, InMemoryDB> =

@@ -15,6 +15,14 @@
 //! and the proved fragment is merged into the proved maker frame, so the bearer preimage never leaves the
 //! signer.
 //!
+//! The offer's **expiry** is load-bearing in a way it is not for the other methods. `Intent.ttl` sits
+//! inside the seal cover, and makeIntent runs no balancing tail, so nothing after this module can move
+//! it — not the taker, not a service relaying the offer. It is also the maker's only unilateral way out:
+//! a sealed offer is a bearer artifact, cancellable only by letting it expire or by double-spending one
+//! of its inputs. Left at the wallet default it is the widest window the ledger allows, which is a free
+//! option written against the maker's quoted price; `options.ttl` lets a maker that re-quotes often say
+//! how long its price stands.
+//!
 //! Both the shielded and unshielded legs ride the transaction's **guaranteed section** (segment 0),
 //! and — unlike `makeTransfer` — a swap keeps its NIGHT there rather than steering it to a fallible
 //! segment. The ledger balances value **per segment**: every `(token, segment)` cell must net on its
@@ -33,6 +41,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref as _;
 
 use midnight_base_crypto::signatures::{Signature as MnSig, VerifyingKey};
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::{
     Info as CoinInfo, QualifiedInfo, ShieldedTokenType, UserAddress,
 };
@@ -56,8 +65,8 @@ use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::proofs::ProofPreimage;
 
 use super::build::{
-    decode_shielded_recipient, decode_unshielded_recipient, deserialize_u128,
-    effects_from_movements, err, far_future_ttl, mock_prove_unsealed, prove_preimage,
+    decode_shielded_recipient, decode_unshielded_recipient, default_intent_ttl, deserialize_u128,
+    effects_from_movements, err, max_ttl_secs, mock_prove_unsealed, now_secs, prove_preimage,
     prove_to_unsealed_bytes, wire_type_to_shielded, wire_type_to_unshielded, DesiredOutput,
     Movement, PreimageTx, TransferKind,
 };
@@ -87,18 +96,28 @@ pub struct DesiredInput {
     pub value: u128,
 }
 
-/// A parsed `makeIntent` request: the maker's inputs and desired outputs and the intent segment. Unlike
-/// the balancing methods, makeIntent builds a deliberately imbalanced maker offer and never pays fees —
-/// the taker completes and balances the swap — so there is no `payFees` option here.
+/// A parsed `makeIntent` request: the maker's inputs and desired outputs, the intent segment, and the
+/// offer's expiry. Unlike the balancing methods, makeIntent builds a deliberately imbalanced maker offer
+/// and never pays fees — the taker completes and balances the swap — so there is no `payFees` option here.
+/// `ttl` is `None` when the request names no expiry, leaving the wallet's [`default_intent_ttl`].
 #[derive(Debug, Clone)]
 pub struct MakeIntentRequest {
     pub desired_inputs: Vec<DesiredInput>,
     pub desired_outputs: Vec<DesiredOutput>,
     pub intent_segment: u16,
+    pub ttl: Option<Timestamp>,
 }
 
 fn default_intent_segment() -> u16 {
     DEFAULT_INTENT_SEGMENT
+}
+
+/// The `options` bag of a `makeIntent` request. Only `ttl` is read here: `payFees` does not apply to a
+/// maker offer (the taker pays), and the segment is taken from the top-level `intentSegment`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MakeIntentOptions {
+    ttl: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,10 +129,14 @@ struct MakeIntentJson {
     desired_outputs: Vec<DesiredOutput>,
     #[serde(default = "default_intent_segment")]
     intent_segment: u16,
+    #[serde(default)]
+    options: Option<MakeIntentOptions>,
 }
 
 /// Parse a stringified DApp Connector `makeIntent` request. `intentSegment` defaults to the connector
-/// convention (segment 1) and must be >= 1.
+/// convention (segment 1) and must be >= 1; `options.ttl` defaults to the wallet's own
+/// [`default_intent_ttl`] and must name an instant the ledger will still accept (see
+/// [`parse_intent_ttl`]).
 pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::Error> {
     let req: MakeIntentJson = serde_json::from_str(json)
         .map_err(|e| std::io::Error::other(format!("invalid makeIntent request JSON: {e}")))?;
@@ -135,7 +158,33 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
         desired_inputs: req.desired_inputs,
         desired_outputs: req.desired_outputs,
         intent_segment: req.intent_segment,
+        ttl: parse_intent_ttl(req.options.and_then(|o| o.ttl), now_secs())?,
     })
+}
+
+/// Validate a requested expiry (Unix epoch seconds) against the window the ledger will accept for an
+/// offer built *now*. Both bounds are the ledger's own, measured against the block the offer lands in
+/// (`tblock`): it rejects `ttl < tblock` (`IntentTtlExpired`) and `ttl > tblock + global_ttl`
+/// (`IntentTtlTooFarInFuture`). `tblock` is unknowable at build time but is never earlier than now, so
+/// `now` is the conservative stand-in — an offer inside this window is acceptable whenever it settles,
+/// and one outside it is rejected at build rather than after the maker has paid to prove it.
+fn parse_intent_ttl(ttl: Option<u64>, now: u64) -> Result<Option<Timestamp>, std::io::Error> {
+    let Some(ttl) = ttl else {
+        return Ok(None);
+    };
+    if ttl <= now {
+        return Err(std::io::Error::other(format!(
+            "makeIntent options.ttl {ttl} is not in the future (now {now}): the offer would be born expired"
+        )));
+    }
+    let max = now.saturating_add(max_ttl_secs());
+    if ttl > max {
+        return Err(std::io::Error::other(format!(
+            "makeIntent options.ttl {ttl} is further ahead than the ledger's global_ttl ({}s) allows: at most {max}",
+            max_ttl_secs()
+        )));
+    }
+    Ok(Some(Timestamp::from_secs(ttl)))
 }
 
 /// The wallet-relative effects a `makeIntent` maker offer will have, derived from the request alone: the
@@ -214,6 +263,7 @@ pub(super) fn authorize(
         &unshielded_out,
         &shielded_out,
         !shielded_in.is_empty(),
+        req.ttl,
     )?;
 
     // No shielded inputs: the frame is the whole maker offer; prove and return it.
@@ -273,6 +323,7 @@ pub(super) fn mock_authorize(
         &unshielded_out,
         &shielded_out,
         !shielded_in.is_empty(),
+        req.ttl,
     )?;
     // Mock-prove into the *unsealed* proven form: `mock_prove` would seal the taker, but the merge fee
     // sizing seals the taker itself (once the DUST section is spliced in), so it needs the unsealed taker.
@@ -308,6 +359,7 @@ fn build_make_intent_frame(
     unshielded_out: &[&DesiredOutput],
     shielded_out: &[&DesiredOutput],
     has_shielded_in: bool,
+    ttl: Option<Timestamp>,
 ) -> Result<PreimageTx, std::io::Error> {
     let sender_vk = crypto_provider
         .unshielded_verifying_key()
@@ -335,7 +387,10 @@ fn build_make_intent_frame(
         fallible_unshielded_offer: None,
         actions: vec![].into(),
         dust_actions: None,
-        ttl: far_future_ttl(),
+        // Unlike the balancing methods, makeIntent never runs the balancing tail, so nothing downstream
+        // re-aligns this TTL to the chain tip — and it is inside the seal cover, so no later holder of
+        // the offer can change it either. Whatever is chosen here is the offer's real expiry.
+        ttl: ttl.unwrap_or_else(default_intent_ttl),
         binding_commitment: rng.r#gen(),
     };
     let intents: MnHashMap<u16, _, InMemoryDB> = MnHashMap::new().insert(segment, intent);
@@ -652,6 +707,46 @@ mod tests {
         assert_eq!(req.desired_inputs[0].kind, TransferKind::Unshielded);
         assert_eq!(req.desired_outputs.len(), 1);
         assert_eq!(req.intent_segment, DEFAULT_INTENT_SEGMENT);
+        assert_eq!(req.ttl, None);
+    }
+
+    #[test]
+    fn honours_requested_ttl() {
+        let ttl = now_secs() + 30;
+        let req = parse_make_intent_json(&format!(
+            r#"{{"desiredInputs":[{{"kind":"unshielded","type":"night","value":1}}],"options":{{"ttl":{ttl}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(req.ttl, Some(Timestamp::from_secs(ttl)));
+    }
+
+    #[test]
+    fn rejects_ttl_at_or_before_now() {
+        // The ledger rejects an intent whose ttl is behind the block it lands in, and that block is never
+        // earlier than now — so an already-past ttl can only ever produce a dead offer.
+        let now = 1_000_000;
+        assert!(parse_intent_ttl(Some(now), now).is_err());
+        assert!(parse_intent_ttl(Some(now - 1), now).is_err());
+        assert!(parse_intent_ttl(Some(now + 1), now).is_ok());
+    }
+
+    #[test]
+    fn rejects_ttl_beyond_the_ledger_window() {
+        // `ttl > tblock + global_ttl` is IntentTtlTooFarInFuture; measured from now, the furthest expiry
+        // guaranteed to be accepted whenever the offer settles is now + global_ttl.
+        let now = 1_000_000;
+        let max = now + max_ttl_secs();
+        assert!(parse_intent_ttl(Some(max), now).is_ok());
+        assert!(parse_intent_ttl(Some(max + 1), now).is_err());
+    }
+
+    #[test]
+    fn omitted_ttl_leaves_the_wallet_default() {
+        // A spec-shaped request that names no ttl must behave exactly as before the option existed.
+        assert_eq!(parse_intent_ttl(None, now_secs()).unwrap(), None);
+        let default = default_intent_ttl().to_secs();
+        let now = now_secs();
+        assert!(default >= now + max_ttl_secs() && default <= now + max_ttl_secs() + 2);
     }
 
     #[test]

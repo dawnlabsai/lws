@@ -211,6 +211,9 @@ pub(super) fn complement_from_balance(
         desired_inputs,
         desired_outputs,
         intent_segment: first_disjoint_segment(maker_segments),
+        // The complement's own expiry never reaches the chain: the merge path rebuilds the taker's intent
+        // with a tip-aligned TTL. Only the maker's sealed TTL bounds when the merged tx can still land.
+        ttl: None,
     }
 }
 
