@@ -100,9 +100,8 @@ pub struct DesiredInput {
 
 /// A parsed `makeIntent` request: the maker's inputs and desired outputs, the resolved intent segment
 /// (`intentId`, with `"random"` already drawn), and the offer's expiry. `ttl` is `None` when the request
-/// names no expiry, leaving the wallet's [`default_intent_ttl`]. Unlike the balancing methods, makeIntent
-/// builds a deliberately imbalanced maker offer and never pays fees — the taker completes and balances the
-/// swap — so no `payFees` is carried.
+/// names no expiry, leaving the wallet's [`default_intent_ttl`]. `payFees` is not carried: a maker offer
+/// is fee-free by construction here, and a request asking otherwise is rejected at parse.
 #[derive(Debug, Clone)]
 pub struct MakeIntentRequest {
     pub desired_inputs: Vec<DesiredInput>,
@@ -111,12 +110,13 @@ pub struct MakeIntentRequest {
     pub ttl: Option<Timestamp>,
 }
 
-/// The `options` bag of a `makeIntent` request: the connector spec's `intentId`, plus the `ttl`
-/// extension. `payFees` does not apply to a fee-free maker offer and is ignored.
+/// The `options` bag of a `makeIntent` request: the connector spec's `intentId` and `payFees`, plus the
+/// `ttl` extension.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MakeIntentOptions {
     intent_id: Option<IntentIdJson>,
+    pay_fees: Option<bool>,
     ttl: Option<u64>,
 }
 
@@ -141,7 +141,8 @@ struct MakeIntentJson {
 }
 
 /// Parse a stringified DApp Connector `makeIntent` request. `options.intentId` names the maker intent's
-/// segment (see [`resolve_intent_segment`]) and defaults to segment 1; `options.ttl` defaults to the
+/// segment (see [`resolve_intent_segment`]) and defaults to segment 1; `options.payFees` may only ask for
+/// the fee-free maker offer this wallet builds (see [`check_pay_fees`]); `options.ttl` defaults to the
 /// wallet's own [`default_intent_ttl`] and must name an instant the ledger will still accept (see
 /// [`parse_intent_ttl`]).
 pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::Error> {
@@ -152,10 +153,11 @@ pub fn parse_make_intent_json(json: &str) -> Result<MakeIntentRequest, std::io::
             "makeIntent requires at least one desired input or output",
         ));
     }
-    let (intent_id, ttl) = match req.options {
-        Some(o) => (o.intent_id, o.ttl),
-        None => (None, None),
+    let (intent_id, pay_fees, ttl) = match req.options {
+        Some(o) => (o.intent_id, o.pay_fees, o.ttl),
+        None => (None, None, None),
     };
+    check_pay_fees(pay_fees)?;
     Ok(MakeIntentRequest {
         desired_inputs: req.desired_inputs,
         desired_outputs: req.desired_outputs,
@@ -192,6 +194,20 @@ fn resolve_intent_segment(intent_id: Option<IntentIdJson>) -> Result<u16, std::i
             "makeIntent options.intentId must be a segment number or \"random\", not \"{k}\""
         ))),
     }
+}
+
+/// Reject a request asking the wallet to pay the maker's fees. `makeIntent` here builds a fee-free maker
+/// offer — the taker funds the DUST when it completes and balances the swap — so `payFees: true` is a
+/// thing this wallet cannot do, and saying so beats returning an offer that silently does the opposite of
+/// what was asked. An absent option is read as the fee-free offer, which is also what the reference wallet
+/// SDK's `initSwap` defaults to.
+fn check_pay_fees(pay_fees: Option<bool>) -> Result<(), std::io::Error> {
+    if pay_fees == Some(true) {
+        return Err(std::io::Error::other(
+            "makeIntent options.payFees: true is not supported: a maker offer is imbalanced and fee-free, and the taker funds the DUST fee when it completes the swap",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a requested expiry (Unix epoch seconds) against the window the ledger will accept for an
@@ -782,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn honours_intent_id() {
+    fn honours_intent_id_and_fee_free_pay_fees() {
         let req = parse_make_intent_json(
             r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":3,"payFees":false}}"#,
         )
@@ -821,6 +837,18 @@ mod tests {
     #[test]
     fn rejects_an_unknown_intent_id_keyword() {
         assert!(resolve_intent_segment(Some(IntentIdJson::Keyword("any".into()))).is_err());
+    }
+
+    #[test]
+    fn rejects_pay_fees_true() {
+        // This wallet's maker offer is fee-free by construction, so the honest answer to a request that
+        // asks it to pay is an error, not an offer that quietly does something else.
+        assert!(parse_make_intent_json(
+            r#"{"desiredInputs":[{"kind":"unshielded","type":"night","value":1}],"options":{"intentId":1,"payFees":true}}"#
+        )
+        .is_err());
+        assert!(check_pay_fees(Some(false)).is_ok());
+        assert!(check_pay_fees(None).is_ok());
     }
 
     #[test]
