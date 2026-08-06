@@ -168,7 +168,7 @@ enum SignCommands {
         /// Wallet name or ID (uses stored encrypted mnemonic)
         #[arg(long, env = "OWS_WALLET")]
         wallet: String,
-        /// Hex-encoded unsigned transaction bytes
+        /// Hex transaction bytes; for Midnight also a zswapoffer bech32 (MIP-0005) offer or a DApp Connector request JSON
         #[arg(long)]
         tx: String,
         /// Account index
@@ -186,7 +186,7 @@ enum SignCommands {
         /// Wallet name or ID (uses stored encrypted mnemonic)
         #[arg(long, env = "OWS_WALLET")]
         wallet: String,
-        /// Hex-encoded unsigned transaction bytes
+        /// Hex transaction bytes; for Midnight also a zswapoffer bech32 (MIP-0005) offer or a DApp Connector request JSON
         #[arg(long)]
         tx: String,
         /// Account index

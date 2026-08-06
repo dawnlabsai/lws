@@ -40,6 +40,7 @@ OWS groups chains into families that share a cryptographic curve and address der
 | Spark | secp256k1 | 8797555 | `m/84'/0'/0'/0/{index}` | `spark:` + compressed pubkey hex | `spark` |
 | Filecoin | secp256k1 | 461 | `m/44'/461'/0'/0/{index}` | `f1` + base32(blake2b-160) | `fil` |
 | NEAR | ed25519 | 397 | `m/44'/397'/{index}'` | 64-char lowercase hex of pubkey (implicit account) | `near` |
+| Midnight (unshielded/Night) | secp256k1 (Schnorr) | [2400](https://github.com/satoshilabs/slips/blob/master/slip-0044.md) (BIP-44) | `m/44'/2400'/0'/0/{index}` (unshielded); shielded `.../3/{index}`; dust `.../2/{index}` | Bech32m `mn_addr1...` (mainnet), `mn_addr_<network>1...` otherwise, e.g. `mn_addr_preview1...` (SHA-256 of x-only pubkey) | `midnight` |
 
 ## Known Networks
 
@@ -76,6 +77,19 @@ Each network has a canonical chain identifier. Endpoint discovery and transport 
 | Filecoin | `fil:mainnet` |
 | NEAR | `near:mainnet` |
 | NEAR (testnet) | `near:testnet` |
+| Midnight | `midnight:mainnet` |
+| Midnight Preview | `midnight:preview` |
+| Midnight Preprod | `midnight:preprod` |
+
+Midnight is not limited to these three networks: **any `midnight:<network>` chain id is addressable**, so ad-hoc feature testnets and private deployments work without registering anything. The `<network>` reference is carried verbatim into the Bech32m HRP of every Midnight address — mainnet uses the bare HRP (`mn_addr`, `mn_shield-addr`, `mn_dust`) while every other network appends `_<network>` (`mn_addr_preview`, `mn_addr_my-feature`, …), so an address on one network can never be mistaken for one on another. The reference MUST be a valid Bech32m HRP fragment: lowercase letters, digits, and hyphens only, not starting or ending with a hyphen. A malformed or mixed-case reference is rejected — never coerced to lowercase and never cast to mainnet.
+
+### Midnight indexer sync (OWS)
+
+`ows fund balance --chain midnight:*` replays indexer state (unshielded UTXOs, shielded balances, and the DUST fee ledger on any network whose dust ledger is live — detected at run time by probing the indexer, so mainnet lights up automatically once its dust ledger is active). OWS caches snapshots under `{vault}/chains/midnight/cache/{unshielded|shielded|dust}/{wallet_id}/` per network (`chain_id` in the cache key), when a wallet id is known.
+
+Configure the GraphQL indexer in `~/.ows/config.json` (`rpc["midnight:preview"]`, etc.); the WebSocket URL is derived from it. The relevant environment variable (`OWS_MIDNIGHT_SYNC_CACHE`) and the full output are documented in [`midnight/fund-balance.md`](./midnight/fund-balance.md); the disk-cache layout lives on [`cache_io`](../../ows/crates/ows-midnight/src/cache_io.rs) in `ows-midnight`.
+
+Universal wallets store one Midnight account (`midnight:mainnet`, mainnet Bech32m HRP). Preview, Preprod, and future networks use the same unshielded key; network-specific addresses are derived at operation time (different Bech32m HRP), matching how XRPL testnet shares a key with mainnet. **Imported private-key wallets** only store the unshielded Night key; shielded/DUST paths and Preview/Preprod unsealed signing require a mnemonic wallet.
 
 Implementations MAY ship convenience endpoint defaults, but those defaults are deployment choices rather than OWS interoperability requirements.
 
@@ -109,6 +123,9 @@ spark     → spark:mainnet
 filecoin  → fil:mainnet
 near          → near:mainnet
 near-testnet  → near:testnet
+midnight  → midnight:mainnet
+midnight-preview → midnight:preview
+midnight-preprod → midnight:preprod
 ```
 
 Aliases MUST be resolved to full CAIP-2 identifiers before any processing. They MUST NOT appear in wallet files, policy files, or audit logs.
@@ -133,7 +150,8 @@ Master Seed (512 bits via PBKDF2)
     ├── m/44'/144'/0'/0/0   → XRPL Account 0
     ├── m/84'/0'/0'/0/0     → Spark Account 0
     ├── m/44'/461'/0'/0/0   → Filecoin Account 0
-    └── m/44'/397'/0'       → NEAR Account 0
+    ├── m/44'/397'/0'       → NEAR Account 0
+    └── m/44'/2400'/0'/0/0  → Midnight Account 0 (unshielded/Night; shielded …/3/0, dust …/2/0)
 ```
 
 For mnemonic-based wallets, a single mnemonic derives accounts across all supported chains. Those wallet files store the encrypted mnemonic, and the signer derives the appropriate private key using each chain's coin type and derivation path. Wallets imported from raw private keys instead store encrypted curve-key material directly.
