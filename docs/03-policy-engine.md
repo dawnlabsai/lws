@@ -244,7 +244,7 @@ The base JSON object available to policy evaluation:
 | `chain_id` | string | yes | CAIP-2 chain identifier |
 | `wallet_id` | string | yes | Wallet ID in scope for this request |
 | `api_key_id` | string | yes | The ID of the API key making this request |
-| `transaction` | object | yes | Transaction context. EVM includes parsed `to`, `value`, and `data` when available. All chains include `raw_hex`. |
+| `transaction` | object | no | Present for `sign_transaction`, `sign_message`, and `sign_hash` (the latter two surface their payload through `raw_hex`). Omitted for `sign_typed_data`, which exposes its payload via `typed_data.raw_json` instead. EVM tx flows include parsed `to`, `value`, and `data` when available. |
 | `spending` | object | yes | Lightweight spending metadata currently exposed by the engine |
 | `timestamp` | string | yes | ISO 8601 timestamp of the signing request |
 
