@@ -6,14 +6,16 @@ fn find_account_for_chain<'a>(
     accounts: &'a [AccountInfo],
     chain: &str,
 ) -> Result<&'a AccountInfo, CliError> {
-    let chain_prefix = match chain {
-        "solana" => "solana:",
-        _ => "eip155:",
+    // CAIP-2 namespace from the chain registry; funding aliases that aren't
+    // registered chain names settle on EVM.
+    let chain_prefix = match crate::parse_chain(chain) {
+        Ok(c) => format!("{}:", c.chain_type.namespace()),
+        Err(_) => "eip155:".to_string(),
     };
 
     accounts
         .iter()
-        .find(|a| a.chain_id.starts_with(chain_prefix))
+        .find(|a| a.chain_id.starts_with(&chain_prefix))
         .ok_or_else(|| {
             CliError::InvalidArgs(format!("wallet has no account for chain \"{chain}\""))
         })
@@ -85,6 +87,62 @@ pub fn run(wallet_name: &str, chain: Option<&str>, token: Option<&str>) -> Resul
 pub fn balance(wallet_name: &str, chain: Option<&str>) -> Result<(), CliError> {
     let wallet = ows_lib::get_wallet(wallet_name, None)?;
     let chain_name = chain.unwrap_or("base");
+
+    // Midnight balances come from the Midnight indexer, not MoonPay.
+    if let Ok(parsed) = crate::parse_chain(chain_name) {
+        if parsed.chain_type == ows_core::ChainType::Midnight {
+            let account = find_account_for_chain(&wallet.accounts, chain_name)?;
+
+            // OWS_PASSPHRASE is either an api-key token (→ policy-enforcing channel, as in
+            // sign-message/-transaction) or the owner envelope passphrase (→ packed role seeds).
+            // The resolved credential builds the crypto provider; without either, unshielded only.
+            let passphrase = crate::commands::peek_passphrase();
+            let credential = match passphrase.as_deref() {
+                Some(p) if p.starts_with(ows_lib::key_store::TOKEN_PREFIX) => {
+                    let (key_file, wallet) =
+                        ows_lib::key_ops::load_authorized_wallet(p, wallet_name, None)?;
+                    let (key, _) = ows_lib::key_ops::enforce_policies_and_decrypt_key(
+                        p,
+                        key_file,
+                        wallet,
+                        &parsed,
+                        None,
+                        None,
+                        Some(0),
+                        None,
+                    )?;
+                    Some(key)
+                }
+                Some(p) => Some(ows_lib::decrypt_signing_key(
+                    wallet_name,
+                    ows_core::ChainType::Midnight,
+                    p,
+                    Some(0),
+                    None,
+                )?),
+                None => {
+                    eprintln!("note: set OWS_PASSPHRASE to read Midnight shielded/dust balances");
+                    None
+                }
+            };
+            // A raw imported key carries no packed Midnight roles: degrade to no provider
+            // (shielded/dust show as unavailable) rather than erroring.
+            let crypto_provider = credential.as_ref().and_then(|cred| {
+                ows_signer::chains::MidnightSigner::from_chain_id(parsed.chain_id)
+                    .crypto_provider(cred)
+                    .ok()
+            });
+
+            let config = ows_core::Config::load_or_default();
+            return Ok(ows_midnight::print_fund_balance(
+                &wallet.id,
+                &account.address,
+                &parsed,
+                Some(config.vault_path.as_path()),
+                crypto_provider.as_ref(),
+            )?);
+        }
+    }
 
     let account = find_account_for_chain(&wallet.accounts, chain_name)?;
     let address = &account.address;

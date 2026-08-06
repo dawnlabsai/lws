@@ -4,6 +4,7 @@ pub mod chain;
 pub mod config;
 pub mod error;
 pub mod policy;
+pub mod sync_cache;
 pub mod types;
 pub mod wallet_file;
 
