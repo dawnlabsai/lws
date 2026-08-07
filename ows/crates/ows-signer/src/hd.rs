@@ -85,6 +85,50 @@ impl HdDeriver {
         Ok(key)
     }
 
+    /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
+    ///
+    /// The non-cached sibling of [`Self::derive_keys_from_mnemonic_cached`]:
+    /// every path goes through the non-cached singular, so no derived secret is
+    /// retained in the global key cache. Address derivation uses this — it only
+    /// needs the public address, not to warm the cache — while the signing path
+    /// uses the cached variant.
+    pub fn derive_keys_from_mnemonic(
+        mnemonic: &Mnemonic,
+        passphrase: &str,
+        paths: Vec<String>,
+        curve: Curve,
+    ) -> Result<Vec<DerivedKey>, HdError> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let secret = Self::derive_from_mnemonic(mnemonic, passphrase, &path, curve)?;
+                Ok(DerivedKey { path, secret })
+            })
+            .collect()
+    }
+
+    /// Derive one [`DerivedKey`] per path on the given `curve`, preserving order.
+    ///
+    /// Same interface as [`Self::derive_from_mnemonic_cached`] but plural in the
+    /// path: every path goes through the cached singular under the hood, and the
+    /// returned bundle pairs each secret with the path it came from so chains
+    /// that bind several keys per account (e.g. Midnight) can tell roles apart
+    /// by path instead of position.
+    pub fn derive_keys_from_mnemonic_cached(
+        mnemonic: &Mnemonic,
+        passphrase: &str,
+        paths: Vec<String>,
+        curve: Curve,
+    ) -> Result<Vec<DerivedKey>, HdError> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let secret = Self::derive_from_mnemonic_cached(mnemonic, passphrase, &path, curve)?;
+                Ok(DerivedKey { path, secret })
+            })
+            .collect()
+    }
+
     /// Validate a derivation path. Must start with "m/" and contain valid indices.
     pub fn validate_path(path: &str) -> Result<(), HdError> {
         if !path.starts_with("m/") && path != "m" {
@@ -190,6 +234,18 @@ impl HdDeriver {
         chain_code.zeroize();
         Ok(SecretBytes::new(key))
     }
+}
+
+/// A derived secret paired with the path it was derived from.
+///
+/// Most chains bind one key per account; chains that bind several (e.g.
+/// Midnight's unshielded / shielded / dust roles) get one `DerivedKey` per
+/// path, and the carried `path` is what tells them apart — callers select a
+/// key by its path, not by position in the bundle. The first entry is the
+/// primary (address / signing) key.
+pub struct DerivedKey {
+    pub path: String,
+    pub secret: SecretBytes,
 }
 
 #[cfg(test)]

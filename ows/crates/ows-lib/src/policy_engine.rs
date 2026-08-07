@@ -15,6 +15,23 @@ pub fn evaluate_policies(policies: &[Policy], context: &PolicyContext) -> Policy
     PolicyResult::allowed()
 }
 
+/// Evaluate only the executable policies against a context — the consumers of
+/// `context.transaction.effects`. The declarative rules are deliberately skipped: they gate the
+/// transaction's shape and were already evaluated in the first pass, whereas only the executable
+/// programs read the wallet-relative effects a later pass fills in. Same AND semantics — short-circuits
+/// on the first denial, allows when no executable policy objects.
+pub fn evaluate_executable_policies(policies: &[Policy], context: &PolicyContext) -> PolicyResult {
+    for policy in policies {
+        if let Some(ref exe) = policy.executable {
+            let result = evaluate_executable(exe, policy.config.as_ref(), &policy.id, context);
+            if !result.allow {
+                return result;
+            }
+        }
+    }
+    PolicyResult::allowed()
+}
+
 /// Evaluate a single policy: declarative rules first, then executable (if any).
 fn evaluate_one(policy: &Policy, context: &PolicyContext) -> PolicyResult {
     // Declarative rules — fast, in-process
@@ -228,7 +245,9 @@ fn wait_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ows_core::policy::{SpendingContext, TransactionContext, TypedDataContext};
+    use ows_core::policy::{
+        SpendingContext, TransactionContext, TransactionEffect, TypedDataContext,
+    };
     use ows_core::PolicyAction;
 
     fn base_context() -> PolicyContext {
@@ -236,12 +255,15 @@ mod tests {
             chain_id: "eip155:8453".to_string(),
             wallet_id: "wallet-1".to_string(),
             api_key_id: "key-1".to_string(),
-            transaction: TransactionContext {
-                to: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".to_string()),
-                value: Some("100000000000000000".to_string()), // 0.1 ETH
+            transaction: Some(TransactionContext {
+                effects: vec![TransactionEffect {
+                    address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into(),
+                    diff: vec![("ETH".into(), 100000000000000000)], // 0.1 ETH
+                }],
                 raw_hex: "0x02f8...".to_string(),
                 data: None,
-            },
+                chain_extra: None,
+            }),
             spending: SpendingContext {
                 daily_total: "50000000000000000".to_string(), // 0.05 ETH already spent
                 date: "2026-03-22".to_string(),
@@ -262,6 +284,24 @@ mod tests {
             config: None,
             action: PolicyAction::Deny,
         }
+    }
+
+    // --- evaluate_executable_policies: only the executable programs, declarative rules skipped ---
+
+    #[test]
+    fn executable_policies_skip_declarative_only() {
+        // A declarative rule that WOULD deny (chain not in the allowlist), with no executable. The full
+        // pass denies it; the executable-only pass must skip it and allow, because declarative rules are
+        // gated in the first pass — not re-run over effects in a later, executable-only pass.
+        let ctx = base_context(); // chain_id = eip155:8453
+        let policy = policy_with_rules(
+            "decl-only",
+            vec![PolicyRule::AllowedChains {
+                chain_ids: vec!["eip155:1".to_string()],
+            }],
+        );
+        assert!(!evaluate_policies(std::slice::from_ref(&policy), &ctx).allow);
+        assert!(evaluate_executable_policies(std::slice::from_ref(&policy), &ctx).allow);
     }
 
     // --- AllowedChains ---
