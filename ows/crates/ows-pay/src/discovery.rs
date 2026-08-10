@@ -56,6 +56,17 @@ async fn discover_with_query(
     limit: u64,
     offset: u64,
 ) -> Result<DiscoverResult, PayError> {
+    discover_with_query_at(CDP_DISCOVERY_URL, query, limit, offset).await
+}
+
+/// Same as [`discover_with_query`] but against an explicit feed URL, so tests
+/// can point it at a local mock server instead of the live CDP endpoint.
+async fn discover_with_query_at(
+    base_url: &str,
+    query: &str,
+    limit: u64,
+    offset: u64,
+) -> Result<DiscoverResult, PayError> {
     const PAGE_SIZE: u64 = 500;
     const MAX_PAGES: u64 = 30; // safety cap: don't fetch more than 15 000 items
 
@@ -65,9 +76,17 @@ async fn discover_with_query(
     let mut total: u64 = 0;
 
     for _ in 0..MAX_PAGES {
-        let resp = fetch_x402(PAGE_SIZE, api_offset).await?;
+        let resp = fetch_x402_at(base_url, PAGE_SIZE, api_offset).await?;
         total = resp.total;
-        let page_len = resp.items.len() as u64;
+        // Advance by the RAW number of records the feed returned for this
+        // page, not by `resp.items.len()` (the number that survived
+        // `parse_items_tolerant`). Malformed records are dropped from
+        // `items` but were still consumed from the feed's own offset space;
+        // advancing by the parsed count under-advances whenever a page has
+        // a skipped record, which re-visits already-seen records on the
+        // next request and can stop before `total` is reached, silently
+        // omitting matches that strict paging would eventually find.
+        let page_len = resp.raw_count;
 
         let matches = filter_services(resp.items, Some(query));
         for svc in matches {
@@ -164,12 +183,23 @@ fn filter_services(
 struct FetchResult {
     items: Vec<crate::types::DiscoveredService>,
     total: u64,
+    /// The number of records the feed returned on this page, before any
+    /// were dropped for failing to parse. This is what pagination must
+    /// advance the offset by; `items.len()` is the post-filter count and
+    /// undercounts whenever a record was skipped (see `discover_with_query_at`).
+    raw_count: u64,
 }
 
 async fn fetch_x402(limit: u64, offset: u64) -> Result<FetchResult, PayError> {
+    fetch_x402_at(CDP_DISCOVERY_URL, limit, offset).await
+}
+
+/// Same as [`fetch_x402`] but against an explicit feed URL, so tests can
+/// point it at a local mock server instead of the live CDP endpoint.
+async fn fetch_x402_at(base_url: &str, limit: u64, offset: u64) -> Result<FetchResult, PayError> {
     let client = reqwest::Client::new();
     let resp = client
-        .get(CDP_DISCOVERY_URL)
+        .get(base_url)
         .query(&[("limit", limit.to_string()), ("offset", offset.to_string())])
         .send()
         .await?;
@@ -198,6 +228,7 @@ async fn fetch_x402(limit: u64, offset: u64) -> Result<FetchResult, PayError> {
     })?;
 
     let total = raw.pagination.map(|p| p.total).unwrap_or(0);
+    let raw_count = raw.items.len() as u64;
     let (items, skipped) = parse_items_tolerant(raw.items);
     if skipped > 0 {
         eprintln!(
@@ -206,7 +237,11 @@ async fn fetch_x402(limit: u64, offset: u64) -> Result<FetchResult, PayError> {
         );
     }
 
-    Ok(FetchResult { items, total })
+    Ok(FetchResult {
+        items,
+        total,
+        raw_count,
+    })
 }
 
 /// Convert each raw discovery item independently so that a single
@@ -655,5 +690,114 @@ mod tests {
         let resources: Vec<&str> = items.iter().map(|i| i.resource.as_str()).collect();
         assert!(resources.contains(&"https://api.example.com/good1"));
         assert!(resources.contains(&"https://api.example.com/good2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // search pagination must advance by the raw feed page size, not by how
+    // many records survived parsing (regression test for the Bugbot finding
+    // on PR #251: skipped records must not shrink the offset step, or
+    // search pagination overlaps pages and can stop before `total`,
+    // silently omitting matches strict paging would eventually reach).
+    // -----------------------------------------------------------------------
+
+    fn item_json(resource: &str, asset: Option<&str>) -> serde_json::Value {
+        let mut accept = serde_json::json!({
+            "scheme": "exact",
+            "network": "eip155:8453",
+            "amount": "1000",
+            "payTo": "0x0000000000000000000000000000000000000001",
+        });
+        if let Some(a) = asset {
+            accept["asset"] = serde_json::json!(a);
+        }
+        // `asset` is a required field on `PaymentRequirements` with no
+        // default, so omitting it makes this record fail item-level parsing
+        // - the same class of real-world malformed record documented in
+        // `MALFORMED_PAGE_FIXTURE` above.
+        serde_json::json!({
+            "resource": resource,
+            "type": "http",
+            "x402Version": 1,
+            "accepts": [accept],
+        })
+    }
+
+    const ASSET: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+    #[tokio::test]
+    async fn discover_with_query_advances_offset_by_raw_page_size_not_parsed_count() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Page 1 (feed offset 0): 3 RAW records, but the middle one is
+        // malformed (no `asset`) and gets dropped by `parse_items_tolerant`,
+        // leaving only 2 parsed items. `total` (4) requires a second page.
+        let page1 = serde_json::json!({
+            "items": [
+                item_json("https://api.example.com/widget-a", Some(ASSET)),
+                item_json("https://api.example.com/widget-b-broken", None),
+                item_json("https://api.example.com/widget-c", Some(ASSET)),
+            ],
+            "pagination": {"limit": 500, "offset": 0, "total": 4},
+        })
+        .to_string();
+
+        // Page 2 must be requested at feed offset 3 (the RAW count of page
+        // 1). The pre-fix code advanced by the PARSED count (2) instead,
+        // which would request offset 2 here and get no matching mock.
+        let page2 = serde_json::json!({
+            "items": [item_json("https://api.example.com/widget-d", Some(ASSET))],
+            "pagination": {"limit": 500, "offset": 3, "total": 4},
+        })
+        .to_string();
+
+        let page1_mock = server
+            .mock("GET", "/discovery")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "500".into()),
+                mockito::Matcher::UrlEncoded("offset".into(), "0".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page1)
+            .create_async()
+            .await;
+
+        let page2_mock = server
+            .mock("GET", "/discovery")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), "500".into()),
+                mockito::Matcher::UrlEncoded("offset".into(), "3".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(page2)
+            .create_async()
+            .await;
+
+        let base_url = format!("{}/discovery", server.url());
+        let result = discover_with_query_at(&base_url, "widget", 100, 0)
+            .await
+            .unwrap();
+
+        // Confirms the second request actually landed at offset=3, not
+        // offset=2: if it didn't, this mock never matched and the call
+        // above would have failed with a discovery error instead.
+        page1_mock.assert_async().await;
+        page2_mock.assert_async().await;
+
+        let urls: Vec<&str> = result.services.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls.len(),
+            3,
+            "expected exactly the 3 well-formed widget records, no duplicates, no omissions: {urls:?}"
+        );
+        assert!(urls.contains(&"https://api.example.com/widget-a"));
+        assert!(urls.contains(&"https://api.example.com/widget-c"));
+        assert!(
+            urls.contains(&"https://api.example.com/widget-d"),
+            "widget-d lives on page 2 at the correct raw offset; under-advancing the \
+             offset would either skip it or fetch page 2 at the wrong offset and \
+             error out: {urls:?}"
+        );
     }
 }
