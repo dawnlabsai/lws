@@ -195,6 +195,22 @@ pub struct DiscoveryResponse {
     pub pagination: Option<Pagination>,
 }
 
+/// Same shape as [`DiscoveryResponse`], but each item is left as raw JSON
+/// instead of being deserialized into [`DiscoveredService`] up front.
+///
+/// The live x402 discovery feed aggregates records from many independent
+/// providers, and some of them do not match the expected schema (an object
+/// where a string is expected, a required field missing entirely). Parsing
+/// `items` eagerly means one bad record fails the whole page. Parsing this
+/// tolerant shape first, then converting each item independently, lets a
+/// single malformed record be skipped instead.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawDiscoveryResponse {
+    pub items: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pagination: Option<Pagination>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pagination {
     pub limit: u64,
