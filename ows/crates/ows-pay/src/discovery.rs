@@ -1,5 +1,5 @@
 use crate::error::{PayError, PayErrorCode};
-use crate::types::{DiscoverResult, DiscoveryResponse, Protocol, Service};
+use crate::types::{DiscoverResult, DiscoveredService, Protocol, RawDiscoveryResponse, Service};
 
 const CDP_DISCOVERY_URL: &str = "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 
@@ -183,19 +183,51 @@ async fn fetch_x402(limit: u64, offset: u64) -> Result<FetchResult, PayError> {
         ));
     }
 
-    let body: DiscoveryResponse = resp.json().await.map_err(|e| {
+    // Parse the envelope (items array + pagination) without eagerly
+    // deserializing each item. The x402 discovery feed aggregates records
+    // from many independent third-party providers, and some do not match
+    // the expected schema. Deserializing straight into
+    // `Vec<DiscoveredService>` means one malformed record fails the whole
+    // page; parsing the envelope first and converting each item on its own
+    // (see `parse_items_tolerant`) means only that record is skipped.
+    let raw: RawDiscoveryResponse = resp.json().await.map_err(|e| {
         PayError::new(
             PayErrorCode::DiscoveryFailed,
             format!("failed to parse x402 discovery: {e}"),
         )
     })?;
 
-    let total = body.pagination.map(|p| p.total).unwrap_or(0);
+    let total = raw.pagination.map(|p| p.total).unwrap_or(0);
+    let (items, skipped) = parse_items_tolerant(raw.items);
+    if skipped > 0 {
+        eprintln!(
+            "warning: skipped {skipped} malformed x402 discovery record(s) out of {}",
+            items.len() + skipped
+        );
+    }
 
-    Ok(FetchResult {
-        items: body.items,
-        total,
-    })
+    Ok(FetchResult { items, total })
+}
+
+/// Convert each raw discovery item independently so that a single
+/// malformed record (unexpected field type, missing required field, etc.)
+/// does not fail the whole page. Returns the successfully parsed services
+/// and a count of how many raw records were skipped.
+fn parse_items_tolerant(raw_items: Vec<serde_json::Value>) -> (Vec<DiscoveredService>, usize) {
+    let mut items = Vec::with_capacity(raw_items.len());
+    let mut skipped = 0usize;
+
+    for value in raw_items {
+        match serde_json::from_value::<DiscoveredService>(value) {
+            Ok(item) => items.push(item),
+            Err(e) => {
+                skipped += 1;
+                eprintln!("warning: skipping malformed x402 discovery record: {e}");
+            }
+        }
+    }
+
+    (items, skipped)
 }
 
 // ===========================================================================
@@ -497,5 +529,131 @@ mod tests {
                 svc.url
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // tolerant item-level parsing (regression test for malformed CDP records)
+    // -----------------------------------------------------------------------
+
+    /// A synthetic discovery page containing two well-formed synthetic
+    /// records plus two REAL, verbatim records captured from the live CDP
+    /// x402 discovery feed
+    /// (https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources)
+    /// on 2026-08-10, which fail strict `PaymentRequirements` deserialization:
+    ///
+    /// - offset 0, limit 500: the `api.interzoid.com/translatetoany` record's
+    ///   `accepts[0].resource` is a JSON OBJECT ({description, mimeType, url})
+    ///   but `PaymentRequirements.resource` is typed `Option<String>`.
+    /// - offset 14000, limit 500: the `ez-qr-generator.com/a2a/generate`
+    ///   record's second `accepts` entry (network `solana:...`) has no
+    ///   `asset` field at all, but `PaymentRequirements.asset` is a required
+    ///   `String` with no default.
+    const MALFORMED_PAGE_FIXTURE: &str = r##"{
+  "items": [
+    {
+      "resource": "https://api.example.com/good1",
+      "type": "http",
+      "x402Version": 1,
+      "accepts": [
+        {
+          "scheme": "exact",
+          "network": "eip155:8453",
+          "amount": "1000",
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "payTo": "0x0000000000000000000000000000000000000001"
+        }
+      ]
+    },
+    {
+      "resource": "https://api.interzoid.com/translatetoany",
+      "type": "http",
+      "x402Version": 2,
+      "accepts": [
+        {
+          "scheme": "exact",
+          "network": "eip155:8453",
+          "amount": "10000",
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "payTo": "0xdCEca23FF8A7145e1b5B35427C9886CF21A67566",
+          "resource": {
+            "description": "Detect the language of input text and translate it to any specified target language. AI-powered translation supporting numerous world languages.",
+            "mimeType": "application/json",
+            "url": "https://api.interzoid.com/translatetoany"
+          }
+        }
+      ]
+    },
+    {
+      "resource": "https://ez-qr-generator.com/a2a/generate",
+      "type": "http",
+      "x402Version": 2,
+      "accepts": [
+        {
+          "scheme": "exact",
+          "network": "eip155:8453",
+          "amount": "1000",
+          "payTo": "0x67CE366B323b47561C6a1154Bc633440822497b4",
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        },
+        {
+          "scheme": "exact",
+          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "amount": "1000",
+          "payTo": "7V7wYJ2CP1p57fi9L6MoomQsJTXVyrYRc7QAnFtRm8FQ"
+        }
+      ]
+    },
+    {
+      "resource": "https://api.example.com/good2",
+      "type": "http",
+      "x402Version": 1,
+      "accepts": [
+        {
+          "scheme": "exact",
+          "network": "eip155:8453",
+          "amount": "2000",
+          "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "payTo": "0x0000000000000000000000000000000000000002"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "limit": 500,
+    "offset": 0,
+    "total": 14445
+  }
+}"##;
+
+    #[test]
+    fn baseline_strict_page_deserialize_fails_on_real_malformed_records() {
+        // Documents the bug this file fixes: strictly deserializing the
+        // whole `items` array fails because of two malformed records, even
+        // though the other two records in the same page are perfectly
+        // valid.
+        let raw: RawDiscoveryResponse = serde_json::from_str(MALFORMED_PAGE_FIXTURE).unwrap();
+        let strict: Result<Vec<DiscoveredService>, _> =
+            raw.items.into_iter().map(serde_json::from_value).collect();
+        assert!(
+            strict.is_err(),
+            "strict per-page deserialization should fail on this fixture"
+        );
+    }
+
+    #[test]
+    fn parse_items_tolerant_skips_malformed_records_not_whole_page() {
+        let raw: RawDiscoveryResponse = serde_json::from_str(MALFORMED_PAGE_FIXTURE).unwrap();
+        assert_eq!(raw.items.len(), 4, "fixture should carry 4 raw records");
+
+        let (items, skipped) = parse_items_tolerant(raw.items);
+
+        // Only the 2 good synthetic records should have parsed; the 2 live
+        // malformed records should have been skipped, not failed the page.
+        assert_eq!(items.len(), 2, "expected 2 valid records to parse");
+        assert_eq!(skipped, 2, "expected 2 malformed records to be skipped");
+
+        let resources: Vec<&str> = items.iter().map(|i| i.resource.as_str()).collect();
+        assert!(resources.contains(&"https://api.example.com/good1"));
+        assert!(resources.contains(&"https://api.example.com/good2"));
     }
 }
